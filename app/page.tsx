@@ -51,6 +51,8 @@ export default function Home() {
     setLogs((value) => [...value, { time: new Date().toLocaleTimeString("zh-CN", { hour12: false }), actor: "AI 协同代理", text: `已通知${item.department}：${item.title}` }]);
   }
 
+  if (terminalMode) return <VoiceTerminal city={city} />;
+
   return (
     <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]">
       <aside className="fixed inset-y-0 left-0 hidden w-64 flex-col border-r border-[#d9e2ec] bg-[#0b2942] px-5 py-6 text-white lg:flex">
@@ -130,12 +132,11 @@ function Node({ icon, title, detail, status }: { icon: React.ReactNode; title: s
 
 function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
   const flow = [
-    { label: "身份证已读取", detail: "订单匹配完成", voice: "身份证读取完成，正在为您核对入住订单。", icon: <CreditCard size={18} /> },
-    { label: "登记信息提交", detail: "模拟公安登记回执", voice: "入住登记信息已提交，正在等待系统确认。", icon: <ShieldCheck size={18} /> },
-    { label: "订单与支付核验", detail: "房费状态确认", voice: "订单和支付状态核验完成。", icon: <WalletCards size={18} /> },
-    { label: "房间自动分配", detail: "1208 房已锁定", voice: "已为您分配十二零八房。", icon: <BedDouble size={18} /> },
-    { label: "制作房卡", detail: "发卡机正在写卡", voice: "正在为您制作房卡，请稍候。", icon: <KeyRound size={18} /> },
-    { label: "请取走房卡", detail: "入住办理完成", voice: "入住办理完成，请从发卡机取走您的房卡，祝您入住愉快。", icon: <CircleCheck size={18} /> },
+    { label: "身份读取", voice: "身份证读取完成，正在为您核对入住订单。" },
+    { label: "信息核验", voice: "入住信息核验完成。" },
+    { label: "分配房间", voice: "已为您分配十二零八房。" },
+    { label: "制作房卡", voice: "正在为您制作房卡，请稍候。" },
+    { label: "请取房卡", voice: "入住办理完成，请从发卡机取走您的房卡，祝您入住愉快。" },
   ];
   const [started, setStarted] = useState(false);
   const [flowIndex, setFlowIndex] = useState(-1);
@@ -169,20 +170,18 @@ function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
     setFlowIndex(-1);
   }
 
-  return <div className="min-h-[calc(100vh-5rem)] bg-[#07131f] p-3 md:p-7">
-    <div className="mx-auto min-h-[calc(100vh-8.5rem)] max-w-7xl overflow-hidden rounded-[2rem] border border-white/10 bg-[radial-gradient(circle_at_50%_8%,#153f55_0%,#071923_45%,#07131f_100%)] shadow-2xl">
-      <div className="flex items-center justify-between border-b border-white/10 px-5 py-4 text-sm text-[#b7ccd8] md:px-8"><span className="inline-flex items-center gap-2"><span className="h-2 w-2 animate-pulse rounded-full bg-[#55e1d0]" />{city} 自助入住终端</span><span>演示模式 · 不连接真实系统</span></div>
-      <div className="grid min-h-[calc(100vh-12rem)] lg:grid-cols-[minmax(0,1.35fr)_minmax(330px,.65fr)]">
-        <section className="flex flex-col items-center justify-center px-6 py-12 text-center md:px-12">
-          <p className="text-sm tracking-[.25em] text-[#73e9dc]">AI 语音前台</p>
-          <div className="mt-8 flex h-40 w-40 items-center justify-center rounded-full border border-[#5de9d8]/35 bg-[#5de9d8]/10 text-[#7cf4e5] shadow-[0_0_0_18px_rgba(93,233,216,.05),0_0_90px_rgba(93,233,216,.15)]"><Volume2 size={62} /></div>
-          <div className="mt-9 flex h-12 items-center justify-center gap-1.5" aria-label="AI 语音波形">{[16, 29, 42, 24, 36, 48, 30, 18, 39, 26, 44, 20, 34].map((height, index) => <span key={index} className={`w-1.5 rounded-full bg-[#75efe0] ${started ? "animate-pulse" : "opacity-35"}`} style={{ height: `${height}px`, animationDelay: `${index * 70}ms` }} />)}</div>
-          <div className="mt-7 max-w-xl"><p className="text-2xl font-semibold leading-9 text-white md:text-3xl">“{spoken}”</p><p className="mt-4 text-base leading-7 text-[#b7ccd8]">{started ? "AI 正在自动执行入住流程，您无需再操作终端。" : "请把身份证放在读卡器上，之后等待系统自动发卡。"}</p></div>
-          <div className="mt-9 flex flex-wrap items-center justify-center gap-3"><button onClick={started ? resetDemo : startDemo} className="inline-flex items-center gap-2 rounded-full bg-[#68eadb] px-6 py-3.5 font-medium text-[#06202b] hover:bg-[#a1fff1]">{started ? <><Mic size={18} />重新演示</> : <><ScanLine size={18} />模拟放置身份证</>}</button><button onClick={() => setVoiceOn((value) => !value)} className="rounded-full border border-white/20 px-5 py-3.5 text-sm text-white hover:bg-white/10">{voiceOn ? "语音已开启" : "语音已静音"}</button></div>
-          <p className="mt-6 text-xs text-[#7899aa]">语音由浏览器演示播放；展示流程中的登记、支付与发卡均为模拟状态。</p>
-        </section>
-        <aside className="border-t border-white/10 bg-[#06121b]/55 p-6 lg:border-l lg:border-t-0 md:p-8"><p className="text-sm tracking-[.18em] text-[#73e9dc]">AI 自动办理进度</p><h2 className="mt-3 text-2xl font-semibold text-white">客人只需读身份证</h2><p className="mt-2 text-sm leading-6 text-[#a9c3d0]">读卡成功后，AI 按固定受控顺序完成后续步骤。</p><div className="mt-8 space-y-3">{flow.map((item, index) => { const done = flowIndex > index; const current = flowIndex === index; return <div key={item.label} className={`flex gap-3 rounded-2xl border p-4 ${done ? "border-[#55e1d0]/35 bg-[#55e1d0]/10" : current ? "border-[#75efe0]/70 bg-white/10" : "border-white/10 bg-white/[.03]"}`}><div className={`grid h-9 w-9 shrink-0 place-items-center rounded-full ${done || current ? "bg-[#55e1d0] text-[#07202a]" : "bg-white/10 text-[#95adba]"}`}>{done ? <CircleCheck size={18} /> : item.icon}</div><div><p className="font-medium text-white">{item.label}</p><p className="mt-1 text-sm text-[#9eb8c5]">{item.detail}</p></div>{current && <span className="ml-auto mt-1 h-2 w-2 animate-pulse rounded-full bg-[#75efe0]" />}</div>})}</div><div className="mt-7 rounded-2xl border border-[#55e1d0]/20 bg-[#55e1d0]/5 p-4 text-sm leading-6 text-[#c1f4ed]"><span className="font-medium">演示边界：</span>不写入真实身份信息，不连接公安、支付、PMS 或发卡设备。</div></aside>
-      </div>
-    </div>
-  </div>;
+  return <main className="min-h-screen bg-[#f5f5f7] px-6 py-7 text-[#1d1d1f] md:px-12 md:py-9">
+    <header className="mx-auto flex max-w-6xl items-center justify-between text-sm"><span className="font-semibold tracking-tight">入住</span><button onClick={() => setVoiceOn((value) => !value)} className="inline-flex items-center gap-2 text-[#6e6e73]"><span className={`h-2 w-2 rounded-full ${voiceOn ? "bg-[#30d158]" : "bg-[#a1a1a6]"}`} />{voiceOn ? "语音开启" : "静音"}</button></header>
+    <section className="mx-auto flex min-h-[calc(100vh-8rem)] max-w-4xl flex-col items-center justify-center text-center">
+      <p className="text-sm font-medium text-[#6e6e73]">{city} · AI 自助入住</p>
+      <h1 className="mt-5 text-5xl font-semibold tracking-[-.06em] md:text-7xl">把身份证放上来。</h1>
+      <p className="mt-4 text-2xl tracking-[-.03em] text-[#6e6e73] md:text-3xl">剩下的，交给 AI。</p>
+      <button onClick={started ? resetDemo : startDemo} aria-label={started ? "重新开始演示" : "模拟放置身份证"} className={`mt-14 grid h-28 w-28 place-items-center rounded-full text-white shadow-[0_20px_50px_rgba(0,0,0,.14)] transition ${started ? "bg-[#007aff]" : "bg-[#1d1d1f] hover:scale-105"}`}>{started ? <Volume2 size={39} /> : <Mic size={39} />}</button>
+      <p className="mt-6 text-lg font-medium">{started ? "AI 正在为您办理" : "点按开始语音演示"}</p>
+      <p className="mt-3 max-w-xl text-lg leading-8 text-[#6e6e73]">“{spoken}”</p>
+      <div className="mt-10 flex h-8 items-center justify-center gap-1" aria-label="语音播放状态">{[13, 22, 30, 19, 35, 24, 14, 28, 18].map((height, index) => <span key={index} className={`w-1 rounded-full bg-[#007aff] ${started ? "animate-pulse" : "opacity-30"}`} style={{ height: `${height}px`, animationDelay: `${index * 90}ms` }} />)}</div>
+      <div className="mt-14 flex max-w-full items-start justify-center gap-0 overflow-x-auto px-2 pb-2">{flow.map((item, index) => { const complete = flowIndex > index; const current = flowIndex === index; return <div key={item.label} className="flex items-center"><div className="w-20 text-center sm:w-28"><div className={`mx-auto grid h-7 w-7 place-items-center rounded-full text-xs ${complete ? "bg-[#1d1d1f] text-white" : current ? "bg-[#007aff] text-white" : "bg-[#d2d2d7] text-[#6e6e73]"}`}>{complete ? <CircleCheck size={15} /> : index + 1}</div><p className={`mt-3 whitespace-nowrap text-xs ${current || complete ? "font-medium text-[#1d1d1f]" : "text-[#86868b]"}`}>{item.label}</p></div>{index < flow.length - 1 && <span className={`mb-6 h-px w-8 sm:w-14 ${complete ? "bg-[#1d1d1f]" : "bg-[#d2d2d7]"}`} />}</div>})}</div>
+    </section>
+    <p className="mx-auto max-w-4xl text-center text-xs text-[#86868b]">演示模式：语音、身份读取、登记、支付、分房与发卡均为模拟。</p>
+  </main>;
 }
