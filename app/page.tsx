@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BedDouble, BellRing, Bot, Building2, ChevronRight, CircleCheck, CreditCard, DoorOpen, FileText, KeyRound, Landmark, Mic, MonitorCog, ScanLine, ShieldCheck, Sparkles, UserRoundCheck, Volume2, WalletCards, Wrench } from "lucide-react";
 
 type CaseState = "IDENTITY_READ" | "POLICE_REGISTERING" | "POLICE_REGISTERED" | "PAYMENT_SUCCESS" | "ROOM_ASSIGNED" | "CARD_ISSUED" | "IN_HOUSE";
@@ -23,7 +23,7 @@ const initialLogs = [
 
 export default function Home() {
   const [step, setStep] = useState(0);
-  const [terminalMode, setTerminalMode] = useState(false);
+  const [terminalMode, setTerminalMode] = useState(true);
   const [logs, setLogs] = useState(initialLogs);
   const [city, setCity] = useState<"广州" | "珠海">("广州");
   const [departmentTasks, setDepartmentTasks] = useState([
@@ -129,32 +129,60 @@ function Node({ icon, title, detail, status }: { icon: React.ReactNode; title: s
 }
 
 function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
-  const [terminalState, setTerminalState] = useState<"welcome" | "reading" | "processing" | "handoff">("welcome");
-  const copy = {
-    welcome: { eyebrow: "欢迎来到", title: "我来帮您快速办理入住", subtitle: "请准备好您的居民身份证。您也可以点击屏幕选择服务。", action: "开始办理入住", icon: <ScanLine size={18} /> },
-    reading: { eyebrow: "身份核验", title: "请将身份证放在读卡区域", subtitle: "读取完成后，我会继续为您核对订单与房间。证件原始信息仅在本机受控服务中处理。", action: "模拟读取完成", icon: <CreditCard size={18} /> },
-    processing: { eyebrow: "正在为您办理", title: "登记与订单核验中", subtitle: "请稍候。我会实时告诉您下一步；如遇验证码或设备异常，将立即通知值班人员。", action: "模拟遇到异常", icon: <Sparkles size={18} /> },
-    handoff: { eyebrow: "已通知服务人员", title: "请稍候，工作人员正在处理", subtitle: "我已把本次异常和终端编号发送给前台与安全岗，您无需重复描述问题。", action: "重新开始", icon: <BellRing size={18} /> },
-  }[terminalState];
-  const next = () => setTerminalState((value) => value === "welcome" ? "reading" : value === "reading" ? "processing" : value === "processing" ? "handoff" : "welcome");
-  return <div className="min-h-[calc(100vh-5rem)] bg-[#061c31] p-4 md:p-8">
-    <div className="mx-auto grid max-w-6xl overflow-hidden rounded-[2rem] border border-white/15 bg-[radial-gradient(circle_at_70%_20%,#147b80_0%,#0a3954_35%,#061c31_72%)] shadow-2xl lg:grid-cols-[1.05fr_.95fr]">
-      <div className="relative min-h-[540px] overflow-hidden px-7 pb-7 pt-8 md:px-12 md:pt-12">
-        <div className="absolute inset-0 bg-[linear-gradient(120deg,rgba(42,221,205,.18),transparent_45%)]" />
-        <div className="relative z-10 flex items-center justify-between text-sm text-white/75"><span className="inline-flex items-center gap-2"><span className="h-2 w-2 animate-pulse rounded-full bg-[#4ee5d5]" />{city} · 自助服务终端</span><span>Hotel Agent OS</span></div>
-        <div className="relative z-10 mt-12 max-w-md"><p className="text-sm tracking-[.28em] text-[#76f2e4]">{copy.eyebrow}</p><h2 className="mt-4 text-4xl font-semibold leading-tight text-white md:text-5xl">{copy.title}</h2><p className="mt-5 max-w-sm text-base leading-7 text-[#c5e5e9]">{copy.subtitle}</p></div>
-        <div className="relative z-10 mt-10 flex flex-wrap gap-3"><button onClick={next} className="inline-flex items-center gap-2 rounded-xl bg-[#4ee5d5] px-5 py-3 font-medium text-[#062033] hover:bg-[#8af8ec]">{copy.icon}{copy.action}<ChevronRight size={18} /></button><button className="inline-flex items-center gap-2 rounded-xl border border-white/20 px-5 py-3 text-sm text-white hover:bg-white/10"><Mic size={17} />语音说“办理入住”</button></div>
-        <div className="relative z-10 mt-14 grid max-w-lg grid-cols-3 gap-3 text-center text-xs text-[#bde5e9]"><TerminalStep active={terminalState !== "welcome"} label="身份证" /><TerminalStep active={terminalState === "processing" || terminalState === "handoff"} label="订单核验" /><TerminalStep active={terminalState === "handoff"} label="人工协助" /></div>
-      </div>
-      <div className="relative grid min-h-[540px] place-items-center overflow-hidden border-t border-white/10 bg-[#082840]/45 px-7 py-10 lg:border-l lg:border-t-0">
-        <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between px-6 py-5 text-sm text-white/70"><span className="inline-flex items-center gap-2"><Volume2 size={17} className="text-[#76f2e4]" />语音前台在线</span><span className="rounded-full bg-white/10 px-3 py-1 text-xs">可随时打断</span></div>
-        <div className="relative z-10 w-full max-w-sm text-center"><div className="mx-auto grid h-28 w-28 place-items-center rounded-full border border-[#76f2e4]/35 bg-[#4ee5d5]/15 text-[#76f2e4] shadow-[0_0_0_16px_rgba(78,229,213,.06),0_0_60px_rgba(78,229,213,.20)]"><Volume2 size={42} /></div><p className="mt-9 text-sm tracking-[.24em] text-[#76f2e4]">VOICE FEEDBACK</p><h3 className="mt-3 text-2xl font-semibold text-white">语音引导已开启</h3><p className="mt-3 text-sm leading-7 text-[#c5e5e9]">终端播放当前业务状态与下一步指引；无需形象渲染，也不依赖云端视频生成。</p><div className="mt-8 flex h-10 items-center justify-center gap-1.5" aria-label="语音播放状态">{[18, 32, 23, 40, 28, 18, 34, 22, 38, 20, 29].map((height, index) => <span key={index} className="w-1.5 animate-pulse rounded-full bg-[#76f2e4]" style={{ height: `${height}px`, animationDelay: `${index * 80}ms` }} />)}</div><div className="mt-8 rounded-2xl border border-white/15 bg-[#052038]/80 p-4 text-left backdrop-blur"><p className="text-sm font-medium text-white">正在播报</p><p className="mt-1 text-sm leading-6 text-[#c5e5e9]">“您好，我会一步一步引导您完成入住。”</p></div></div>
+  const flow = [
+    { label: "身份证已读取", detail: "订单匹配完成", voice: "身份证读取完成，正在为您核对入住订单。", icon: <CreditCard size={18} /> },
+    { label: "登记信息提交", detail: "模拟公安登记回执", voice: "入住登记信息已提交，正在等待系统确认。", icon: <ShieldCheck size={18} /> },
+    { label: "订单与支付核验", detail: "房费状态确认", voice: "订单和支付状态核验完成。", icon: <WalletCards size={18} /> },
+    { label: "房间自动分配", detail: "1208 房已锁定", voice: "已为您分配十二零八房。", icon: <BedDouble size={18} /> },
+    { label: "制作房卡", detail: "发卡机正在写卡", voice: "正在为您制作房卡，请稍候。", icon: <KeyRound size={18} /> },
+    { label: "请取走房卡", detail: "入住办理完成", voice: "入住办理完成，请从发卡机取走您的房卡，祝您入住愉快。", icon: <CircleCheck size={18} /> },
+  ];
+  const [started, setStarted] = useState(false);
+  const [flowIndex, setFlowIndex] = useState(-1);
+  const [voiceOn, setVoiceOn] = useState(true);
+  const active = flowIndex >= 0 ? flow[flowIndex] : null;
+  const spoken = active?.voice ?? "您好，请将您的居民身份证放在读卡器上，我将为您自动办理入住。";
+
+  useEffect(() => {
+    if (!started || flowIndex < 0) return;
+    if (voiceOn && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(spoken);
+      utterance.lang = "zh-CN";
+      utterance.rate = 1;
+      window.speechSynthesis.speak(utterance);
+    }
+    if (flowIndex < flow.length - 1) {
+      const timer = window.setTimeout(() => setFlowIndex((value) => value + 1), 1800);
+      return () => window.clearTimeout(timer);
+    }
+  }, [flowIndex, started, voiceOn, spoken, flow.length]);
+
+  function startDemo() {
+    setStarted(true);
+    setFlowIndex(0);
+  }
+
+  function resetDemo() {
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    setStarted(false);
+    setFlowIndex(-1);
+  }
+
+  return <div className="min-h-[calc(100vh-5rem)] bg-[#07131f] p-3 md:p-7">
+    <div className="mx-auto min-h-[calc(100vh-8.5rem)] max-w-7xl overflow-hidden rounded-[2rem] border border-white/10 bg-[radial-gradient(circle_at_50%_8%,#153f55_0%,#071923_45%,#07131f_100%)] shadow-2xl">
+      <div className="flex items-center justify-between border-b border-white/10 px-5 py-4 text-sm text-[#b7ccd8] md:px-8"><span className="inline-flex items-center gap-2"><span className="h-2 w-2 animate-pulse rounded-full bg-[#55e1d0]" />{city} 自助入住终端</span><span>演示模式 · 不连接真实系统</span></div>
+      <div className="grid min-h-[calc(100vh-12rem)] lg:grid-cols-[minmax(0,1.35fr)_minmax(330px,.65fr)]">
+        <section className="flex flex-col items-center justify-center px-6 py-12 text-center md:px-12">
+          <p className="text-sm tracking-[.25em] text-[#73e9dc]">AI 语音前台</p>
+          <div className="mt-8 flex h-40 w-40 items-center justify-center rounded-full border border-[#5de9d8]/35 bg-[#5de9d8]/10 text-[#7cf4e5] shadow-[0_0_0_18px_rgba(93,233,216,.05),0_0_90px_rgba(93,233,216,.15)]"><Volume2 size={62} /></div>
+          <div className="mt-9 flex h-12 items-center justify-center gap-1.5" aria-label="AI 语音波形">{[16, 29, 42, 24, 36, 48, 30, 18, 39, 26, 44, 20, 34].map((height, index) => <span key={index} className={`w-1.5 rounded-full bg-[#75efe0] ${started ? "animate-pulse" : "opacity-35"}`} style={{ height: `${height}px`, animationDelay: `${index * 70}ms` }} />)}</div>
+          <div className="mt-7 max-w-xl"><p className="text-2xl font-semibold leading-9 text-white md:text-3xl">“{spoken}”</p><p className="mt-4 text-base leading-7 text-[#b7ccd8]">{started ? "AI 正在自动执行入住流程，您无需再操作终端。" : "请把身份证放在读卡器上，之后等待系统自动发卡。"}</p></div>
+          <div className="mt-9 flex flex-wrap items-center justify-center gap-3"><button onClick={started ? resetDemo : startDemo} className="inline-flex items-center gap-2 rounded-full bg-[#68eadb] px-6 py-3.5 font-medium text-[#06202b] hover:bg-[#a1fff1]">{started ? <><Mic size={18} />重新演示</> : <><ScanLine size={18} />模拟放置身份证</>}</button><button onClick={() => setVoiceOn((value) => !value)} className="rounded-full border border-white/20 px-5 py-3.5 text-sm text-white hover:bg-white/10">{voiceOn ? "语音已开启" : "语音已静音"}</button></div>
+          <p className="mt-6 text-xs text-[#7899aa]">语音由浏览器演示播放；展示流程中的登记、支付与发卡均为模拟状态。</p>
+        </section>
+        <aside className="border-t border-white/10 bg-[#06121b]/55 p-6 lg:border-l lg:border-t-0 md:p-8"><p className="text-sm tracking-[.18em] text-[#73e9dc]">AI 自动办理进度</p><h2 className="mt-3 text-2xl font-semibold text-white">客人只需读身份证</h2><p className="mt-2 text-sm leading-6 text-[#a9c3d0]">读卡成功后，AI 按固定受控顺序完成后续步骤。</p><div className="mt-8 space-y-3">{flow.map((item, index) => { const done = flowIndex > index; const current = flowIndex === index; return <div key={item.label} className={`flex gap-3 rounded-2xl border p-4 ${done ? "border-[#55e1d0]/35 bg-[#55e1d0]/10" : current ? "border-[#75efe0]/70 bg-white/10" : "border-white/10 bg-white/[.03]"}`}><div className={`grid h-9 w-9 shrink-0 place-items-center rounded-full ${done || current ? "bg-[#55e1d0] text-[#07202a]" : "bg-white/10 text-[#95adba]"}`}>{done ? <CircleCheck size={18} /> : item.icon}</div><div><p className="font-medium text-white">{item.label}</p><p className="mt-1 text-sm text-[#9eb8c5]">{item.detail}</p></div>{current && <span className="ml-auto mt-1 h-2 w-2 animate-pulse rounded-full bg-[#75efe0]" />}</div>})}</div><div className="mt-7 rounded-2xl border border-[#55e1d0]/20 bg-[#55e1d0]/5 p-4 text-sm leading-6 text-[#c1f4ed]"><span className="font-medium">演示边界：</span>不写入真实身份信息，不连接公安、支付、PMS 或发卡设备。</div></aside>
       </div>
     </div>
-    <p className="mx-auto mt-5 max-w-6xl text-center text-xs leading-5 text-[#9dc3cc]">首版仅使用语音和文字反馈；公安登记、支付和发卡由带回执校验的受控业务工具执行。识别到验证码、证书或设备异常时，终端自动转为人工协助。</p>
   </div>;
-}
-
-function TerminalStep({ active, label }: { active: boolean; label: string }) {
-  return <div className={`rounded-lg border px-2 py-3 ${active ? "border-[#4ee5d5]/50 bg-[#4ee5d5]/15 text-[#8af8ec]" : "border-white/10 bg-white/5"}`}>{active && <CircleCheck className="mx-auto mb-1" size={15} />}{label}</div>;
 }
