@@ -21,6 +21,13 @@
 # misc
 .DS_Store
 *.pem
+*.key
+*.p12
+*.pfx
+*.secret
+.ssh/
+SSHgit.txt
+NUL
 
 # debug
 npm-debug.log*
