@@ -176,6 +176,18 @@ async function postDemo<T>(action: string, body: Record<string, unknown>): Promi
   return data;
 }
 
+async function postSimulator<T extends { ok?: boolean; status?: string; error_code?: string }>(path: string, body: Record<string, unknown>): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = (await response.json()) as T & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "simulator_request_failed");
+  if (data.status !== "SUCCEEDED") throw new Error(data.error_code ?? `simulator_${data.status ?? "failed"}`);
+  return data;
+}
+
 function speak(text: string, enabled: boolean) {
   if (!enabled || typeof window === "undefined" || !("speechSynthesis" in window)) return;
   window.speechSynthesis.cancel();
@@ -417,6 +429,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       speak("已检测到身份证，正在确认不是上一位客人遗留的证件。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       setFlowStep(2);
+      await postSimulator("/api/device/reader", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `reader:${checkinCase.id}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" });
       result = await postDemo<{ checkinCase: CheckinCase }>("verify-identity", { session_id: sessionId, case_id: checkinCase.id });
       setCheckinCase(result.checkinCase);
       speak("身份证已自动读取并核验通过，正在锁定房间。", voiceEnabled);
@@ -426,6 +439,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       setCheckinCase(result.checkinCase);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       setFlowStep(4);
+      await postSimulator("/api/police/submit", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `police:${checkinCase.id}`, expected_state: "ROOM_HELD", device_id: "police-browser-demo-01", operation: "submit_registration", actual_identity_verified: true, identity_token: "DEMO-ID-TOKEN" });
       result = await postDemo<{ checkinCase: CheckinCase }>("browser-start", { session_id: sessionId, case_id: checkinCase.id });
       setCheckinCase(result.checkinCase);
       speak("正在广州隔离演示环境中模拟住宿登记。", voiceEnabled);
@@ -442,6 +456,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       result = await postDemo<{ checkinCase: CheckinCase }>("keycard-start", { session_id: sessionId, case_id: checkinCase.id });
       setCheckinCase(result.checkinCase);
       await new Promise((resolve) => window.setTimeout(resolve, 950));
+      await postSimulator("/api/device/encoder", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `encoder:${checkinCase.id}`, expected_state: "PMS_CHECKIN_CONFIRMED", device_id: "encoder-demo-01", operation: "issue_keycard", room_number: result.checkinCase.room_number ?? "1208" });
       result = await postDemo<{ checkinCase: CheckinCase }>("keycard-complete", { session_id: sessionId, case_id: checkinCase.id });
       setCheckinCase(result.checkinCase);
       setMatchedOrder((current) => current ? { ...current, status: "in_house", room_number: result.checkinCase.room_number } : current);
