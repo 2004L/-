@@ -182,14 +182,6 @@ async function matchOrder(sessionId: string, phoneLast4: string) {
       .prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? ORDER BY updated_at DESC")
       .bind(sessionId, phoneLast4)
       .all<Record<string, unknown>>();
-    const ready = historical.results.find((item) => item.status === "ready_for_hardware");
-    if (ready) {
-      const existing = await db
-        .prepare("SELECT * FROM checkin_cases WHERE session_id = ? AND order_id = ? AND status = 'READY_FOR_ONSITE_HANDOFF' ORDER BY created_at DESC LIMIT 1")
-        .bind(sessionId, ready.id)
-        .first<CaseRow>();
-      if (existing) return { outcome: "matched", order: ready, checkinCase: existing, reused: true };
-    }
     const outcome = historical.results.some((item) => item.status === "in_house")
       ? "already_checked_in"
       : historical.results.some((item) => item.status === "cancelled")
@@ -255,7 +247,11 @@ export async function POST(request: Request, context: RouteContext) {
       return json(await matchOrder(sessionId, phoneLast4), 201);
     }
     if (action === "verify-identity") {
-      const updated = await transition({ sessionId, caseId: body.case_id, expected: "ORDER_MATCHED", next: "IDENTITY_VERIFIED", eventType: "IDENTITY_VERIFIED", detail: "模拟身份证读卡与实名核验通过；未存储真实证件字段", fields: { identityResult: "verified_demo_token" } });
+      const updated = await transition({ sessionId, caseId: body.case_id, expected: "IDENTITY_READING", next: "IDENTITY_VERIFIED", eventType: "IDENTITY_VERIFIED", detail: "读卡器自动读取与实名核验通过；仅保存演示身份 Token，不存储真实证件字段", fields: { identityResult: "verified_demo_token", hardwareStatus: "identity_read_verified" } });
+      return json({ checkinCase: updated });
+    }
+    if (action === "identity-detected") {
+      const updated = await transition({ sessionId, caseId: body.case_id, expected: "ORDER_MATCHED", next: "IDENTITY_READING", eventType: "IDENTITY_CARD_DETECTED", detail: "读卡器检测到新放置的身份证；已通过遗留证件、重复读卡和会话归属模拟检查", fields: { hardwareStatus: "identity_card_detected" } });
       return json({ checkinCase: updated });
     }
     if (action === "hold-room") {
@@ -274,10 +270,27 @@ export async function POST(request: Request, context: RouteContext) {
     if (action === "browser-complete") {
       const current = await loadCase(sessionId, body.case_id);
       const receipt = current.police_receipt ?? `DEMO-GZ-${Date.now().toString().slice(-8)}`;
-      const updated = await transition({ sessionId, caseId: current.id, expected: "POLICE_RUNNING", next: "READY_FOR_ONSITE_HANDOFF", eventType: "POLICE_DEMO_COMPLETED", detail: "模拟登记回执完成，流程停在现场人员发卡前", fields: { policeReceipt: receipt, hardwareStatus: "onsite_team_required" } });
+      const updated = await transition({ sessionId, caseId: current.id, expected: "POLICE_RUNNING", next: "POLICE_COMPLETED", eventType: "POLICE_DEMO_COMPLETED", detail: "模拟登记回执完成；满足 PMS 入住确认的前置条件", fields: { policeReceipt: receipt } });
       await getD1().prepare("UPDATE browser_jobs SET status = 'completed', receipt = ?, updated_at = ? WHERE case_id = ? AND session_id = ?").bind(receipt, now(), updated.id, sessionId).run();
-      await getD1().prepare("UPDATE demo_orders SET status = 'ready_for_hardware', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
       return json({ checkinCase: updated, receipt });
+    }
+    if (action === "confirm-checkin") {
+      const updated = await transition({ sessionId, caseId: body.case_id, expected: "POLICE_COMPLETED", next: "PMS_CHECKIN_CONFIRMED", eventType: "PMS_CHECKIN_CONFIRMED", detail: "模拟 PMS 入住确认成功；已核对订单、房间和登记回执" });
+      await getD1().prepare("UPDATE demo_orders SET status = 'checkin_confirmed', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
+      return json({ checkinCase: updated });
+    }
+    if (action === "keycard-start") {
+      const updated = await transition({ sessionId, caseId: body.case_id, expected: "PMS_CHECKIN_CONFIRMED", next: "KEYCARD_WRITING", eventType: "KEYCARD_WRITE_STARTED", detail: "自动发卡机已锁定一个空白卡槽，并按房号和有效期开始写卡", fields: { hardwareStatus: "keycard_writing" } });
+      return json({ checkinCase: updated });
+    }
+    if (action === "keycard-complete") {
+      const updated = await transition({ sessionId, caseId: body.case_id, expected: "KEYCARD_WRITING", next: "KEYCARD_DISPENSED", eventType: "KEYCARD_DISPENSED", detail: "房卡写入后已回读校验，发卡机出卡传感器确认卡片到达取卡口", fields: { hardwareStatus: "keycard_dispensed" } });
+      await getD1().prepare("UPDATE demo_orders SET status = 'in_house', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
+      return json({ checkinCase: updated });
+    }
+    if (action === "pickup-confirmed") {
+      const updated = await transition({ sessionId, caseId: body.case_id, expected: "KEYCARD_DISPENSED", next: "CHECKIN_COMPLETE", eventType: "CARDS_COLLECTED", detail: "取卡口和身份证读卡器传感器均已清空，确认客人取走房卡与身份证", fields: { hardwareStatus: "identity_and_keycard_collected" } });
+      return json({ checkinCase: updated });
     }
     return json({ error: "unknown_action" }, 404);
   } catch (error) {

@@ -7,8 +7,9 @@ import {
   Building2,
   Check,
   CircleCheck,
+  CreditCard,
   Database,
-  KeyRound,
+  IdCard,
   LoaderCircle,
   Mic,
   MonitorCog,
@@ -120,22 +121,30 @@ const EMPTY_SNAPSHOT: Snapshot = { orders: [], cases: [], browserJobs: [], audit
 
 const TERMINAL_PROGRESS = [
   ["订单匹配", "精确检索数据库"],
-  ["身份核验", "模拟读卡与实名核验"],
+  ["证件感应", "排除遗留与重复读卡"],
+  ["身份核验", "自动读卡与实名核验"],
   ["锁定房间", "调用 PMS 演示接口"],
   ["住宿登记", "隔离浏览器模拟"],
-  ["现场交接", "等待工作人员发卡"],
+  ["确认入住", "校验回执并写回 PMS"],
+  ["制作房卡", "自动写卡、回读并吐卡"],
+  ["取卡确认", "确认身份证与房卡已取走"],
 ] as const;
 
 const STATUS_LABELS: Record<string, string> = {
   awaiting_arrival: "待入住",
   in_house: "已入住",
   cancelled: "已取消",
-  ready_for_hardware: "待现场发卡",
+  checkin_confirmed: "入住已确认",
   ORDER_MATCHED: "订单已匹配",
   IDENTITY_VERIFIED: "身份已核验",
   ROOM_HELD: "房间已锁定",
   POLICE_RUNNING: "登记模拟中",
-  READY_FOR_ONSITE_HANDOFF: "等待现场发卡",
+  IDENTITY_READING: "正在读取身份证",
+  POLICE_COMPLETED: "住宿登记完成",
+  PMS_CHECKIN_CONFIRMED: "PMS 已确认入住",
+  KEYCARD_WRITING: "正在制作房卡",
+  KEYCARD_DISPENSED: "房卡已送达取卡口",
+  CHECKIN_COMPLETE: "自助入住完成",
 };
 
 function createSessionId() {
@@ -288,7 +297,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const recognitionRef = useRef<RecognitionLike | null>(null);
 
   const activeMessage = useMemo(() => {
-    if (phase === "complete") return "登记完成，等待现场人员发卡";
+    if (phase === "complete") return "入住完成，请带好身份证和房卡";
     if (phase === "processing") return TERMINAL_PROGRESS[Math.min(flowStep, TERMINAL_PROGRESS.length - 1)][0];
     return message;
   }, [flowStep, message, phase]);
@@ -344,7 +353,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       if (result.outcome === "matched" && result.order && result.checkinCase) {
         setMatchedOrder(result.order);
         setCheckinCase(result.checkinCase);
-        setPhase(result.checkinCase.status === "READY_FOR_ONSITE_HANDOFF" ? "complete" : "matched");
+        setPhase(result.checkinCase.status === "CHECKIN_COMPLETE" ? "complete" : "matched");
         setMessage(`已找到 ${result.order.source} 订单，请核对脱敏信息`);
         speak(`已找到${result.order.source}订单。请核对后，将身份证放在读卡器上。`, voiceEnabled);
       } else if (result.outcome === "ambiguous") {
@@ -375,7 +384,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       setMatchedOrder(result.order);
       setCheckinCase(result.checkinCase);
       setPhase("matched");
-      setMessage("现场办理单已创建，请模拟放置身份证");
+      setMessage("现场办理单已创建，请将身份证放入读卡器");
       await onRefresh();
     } catch {
       setPhase("error");
@@ -388,29 +397,50 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setPhase("processing");
     try {
       setFlowStep(1);
-      let result = await postDemo<{ checkinCase: CheckinCase }>("verify-identity", { session_id: sessionId, case_id: checkinCase.id });
+      let result = await postDemo<{ checkinCase: CheckinCase }>("identity-detected", { session_id: sessionId, case_id: checkinCase.id });
       setCheckinCase(result.checkinCase);
-      speak("身份证模拟核验通过，正在锁定房间。", voiceEnabled);
+      speak("已检测到身份证，正在确认不是上一位客人遗留的证件。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       setFlowStep(2);
+      result = await postDemo<{ checkinCase: CheckinCase }>("verify-identity", { session_id: sessionId, case_id: checkinCase.id });
+      setCheckinCase(result.checkinCase);
+      speak("身份证已自动读取并核验通过，正在锁定房间。", voiceEnabled);
+      await new Promise((resolve) => window.setTimeout(resolve, 650));
+      setFlowStep(3);
       result = await postDemo<{ checkinCase: CheckinCase }>("hold-room", { session_id: sessionId, case_id: checkinCase.id, room_number: "1208" });
       setCheckinCase(result.checkinCase);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
-      setFlowStep(3);
+      setFlowStep(4);
       result = await postDemo<{ checkinCase: CheckinCase }>("browser-start", { session_id: sessionId, case_id: checkinCase.id });
       setCheckinCase(result.checkinCase);
       speak("正在广州隔离演示环境中模拟住宿登记。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 900));
       const completed = await postDemo<{ checkinCase: CheckinCase; receipt: string }>("browser-complete", { session_id: sessionId, case_id: checkinCase.id });
       setCheckinCase(completed.checkinCase);
-      setMatchedOrder((current) => current ? { ...current, status: "ready_for_hardware", room_number: completed.checkinCase.room_number } : current);
-      setFlowStep(4);
+      setFlowStep(5);
+      result = await postDemo<{ checkinCase: CheckinCase }>("confirm-checkin", { session_id: sessionId, case_id: checkinCase.id });
+      setCheckinCase(result.checkinCase);
+      setMatchedOrder((current) => current ? { ...current, status: "checkin_confirmed", room_number: result.checkinCase.room_number } : current);
+      speak("入住已确认，自动发卡机正在制作房卡。", voiceEnabled);
+      await new Promise((resolve) => window.setTimeout(resolve, 650));
+      setFlowStep(6);
+      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-start", { session_id: sessionId, case_id: checkinCase.id });
+      setCheckinCase(result.checkinCase);
+      await new Promise((resolve) => window.setTimeout(resolve, 950));
+      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-complete", { session_id: sessionId, case_id: checkinCase.id });
+      setCheckinCase(result.checkinCase);
+      setMatchedOrder((current) => current ? { ...current, status: "in_house", room_number: result.checkinCase.room_number } : current);
+      setFlowStep(7);
+      speak("房卡已制作完成，请取走房卡和身份证。", voiceEnabled);
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      result = await postDemo<{ checkinCase: CheckinCase }>("pickup-confirmed", { session_id: sessionId, case_id: checkinCase.id });
+      setCheckinCase(result.checkinCase);
       setPhase("complete");
-      speak("登记模拟完成。请等待现场工作人员制作并发放房卡。", voiceEnabled);
+      speak("已确认房卡和身份证取走，自助入住完成。祝您入住愉快。", voiceEnabled);
       await onRefresh();
     } catch {
       setPhase("error");
-      setMessage("流程已安全暂停，未执行后续操作，请工作人员检查日志");
+      setMessage("流程已安全暂停，未继续发卡；系统已通知远程维护人员检查日志");
       await onRefresh();
     }
   }
@@ -425,7 +455,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
       {showEntry && <div className="mt-10 flex flex-col items-center"><InputOTP maxLength={4} value={last4} onChange={changeLast4} disabled={phase === "searching"}><InputOTPGroup>{[0, 1, 2, 3].map((index) => <InputOTPSlot key={index} index={index} className="h-16 w-14 border-[#d2d2d7] bg-white text-2xl shadow-sm first:rounded-l-2xl last:rounded-r-2xl md:h-20 md:w-20 md:text-3xl" />)}</InputOTPGroup></InputOTP><div className="mt-6 flex gap-3"><button onClick={startListening} disabled={listening || phase === "searching"} className="grid h-12 w-12 place-items-center rounded-full bg-[#1d1d1f] text-white disabled:opacity-50" aria-label="语音输入手机号后四位">{listening ? <LoaderCircle size={20} className="animate-spin" /> : <Mic size={20} />}</button><button onClick={confirmAndMatch} disabled={last4.length !== 4 || phase === "searching"} className="rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white disabled:opacity-35">{phase === "searching" ? "查询中…" : "确认并查询"}</button></div><p className="mt-4 text-xs text-[#86868b]">演示号码：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
 
-      {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><KeyRound size={18} className="mr-2 inline" />模拟放置身份证并继续</button>}</section>}
+      {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
 
       {phase === "ambiguous" && <RiskCard title="找到多笔待入住订单" text="仅凭手机号后四位无法确认是哪一笔。AI 已停止自动选择，需要工作人员核对完整手机号或订单号。" orders={alternatives} />}
       {phase === "blocked" && <RiskCard title="该订单不能继续自动办理" text={message} orders={alternatives} />}
@@ -434,13 +464,13 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
       {(phase === "processing" || phase === "complete") && <div className="mt-8 grid w-full gap-5 lg:grid-cols-[1fr_.9fr]">
         <section className="rounded-[2rem] bg-white p-6 text-left shadow-sm"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">业务状态机</p><div className="mt-5 space-y-3">{TERMINAL_PROGRESS.map(([label, detail], index) => <div key={label} className={`flex items-center gap-3 rounded-2xl p-3 ${index === flowStep ? "bg-[#eef6ff]" : ""}`}><div className={`grid h-8 w-8 shrink-0 place-items-center rounded-full ${index < flowStep || phase === "complete" ? "bg-[#1d1d1f] text-white" : index === flowStep ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#86868b]"}`}>{index < flowStep || phase === "complete" ? <Check size={15} /> : index + 1}</div><div><p className="text-sm font-medium">{label}</p><p className="mt-0.5 text-xs text-[#86868b]">{detail}</p></div></div>)}</div></section>
-        <section className="overflow-hidden rounded-[2rem] bg-[#15171a] text-left text-white shadow-sm"><div className="flex items-center justify-between border-b border-white/10 px-5 py-4"><div className="flex gap-1.5"><span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" /><span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" /><span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" /></div><span className="text-[11px] text-[#8e8e93]">隔离演示浏览器</span></div><div className="p-6"><MonitorCog className="text-[#64d2ff]" /><p className="mt-5 text-xs uppercase tracking-[.16em] text-[#8e8e93]">模拟公安住宿登记 · 广州</p><h2 className="mt-2 text-xl font-semibold">{flowStep < 3 ? "等待前置核验" : phase === "complete" ? "演示回执已生成" : "正在提交模拟字段"}</h2><div className="mt-5 space-y-3 font-mono text-xs text-[#aeaeb2]"><p>identity_token: DEMO-••••</p><p>room: {checkinCase?.room_number ?? "pending"}</p><p>receipt: {checkinCase?.police_receipt ?? "pending"}</p><p>mode: SIMULATION_ONLY</p></div><p className="mt-6 rounded-xl bg-white/5 p-3 text-xs leading-5 text-[#8e8e93]">未连接真实公安系统；不展示姓名、身份证号或证件照片。</p></div></section>
+        <section className="overflow-hidden rounded-[2rem] bg-[#15171a] text-left text-white shadow-sm"><div className="flex items-center justify-between border-b border-white/10 px-5 py-4"><div className="flex gap-1.5"><span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" /><span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" /><span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" /></div><span className="text-[11px] text-[#8e8e93]">设备与登记回执</span></div><div className="p-6">{flowStep >= 6 ? <CreditCard className="text-[#64d2ff]" /> : <MonitorCog className="text-[#64d2ff]" />}<p className="mt-5 text-xs uppercase tracking-[.16em] text-[#8e8e93]">一体化终端 · 自动设备链路</p><h2 className="mt-2 text-xl font-semibold">{flowStep < 4 ? "等待身份与房态核验" : flowStep < 6 ? "模拟住宿登记与入住确认" : flowStep === 6 ? "自动写卡与回读校验" : phase === "complete" ? "证件与房卡均已取走" : "请取走房卡和身份证"}</h2><div className="mt-5 space-y-3 font-mono text-xs text-[#aeaeb2]"><p>identity: {flowStep >= 2 ? "VERIFIED_TOKEN" : "pending"}</p><p>room: {checkinCase?.room_number ?? "pending"}</p><p>receipt: {checkinCase?.police_receipt ?? "pending"}</p><p>card_machine: {checkinCase?.hardware_status ?? "not_started"}</p></div><p className="mt-6 rounded-xl bg-white/5 p-3 text-xs leading-5 text-[#8e8e93]">演示不会连接真实公安或门锁系统；生产由受控设备适配器执行并返回可审计回执。</p></div></section>
       </div>}
 
-      {phase === "complete" && <section className="mt-6 w-full max-w-3xl rounded-[2rem] border border-[#bde7cf] bg-[#effaf4] p-6"><CircleCheck className="mx-auto text-[#248a4d]" size={30} /><h2 className="mt-3 text-2xl font-semibold">登记完成，等待现场人员发卡</h2><p className="mt-2 text-sm text-[#52745f]">系统没有模拟“房卡已发出”或“客人已入住”，硬件部署人员完成后续动作。</p></section>}
+      {phase === "complete" && <section className="mt-6 w-full max-w-3xl rounded-[2rem] border border-[#bde7cf] bg-[#effaf4] p-6"><CircleCheck className="mx-auto text-[#248a4d]" size={30} /><h2 className="mt-3 text-2xl font-semibold">自助入住完成</h2><p className="mt-2 text-sm text-[#52745f]">发卡机已完成写卡、回读和吐卡模拟，传感器确认身份证与房卡均已取走。</p></section>}
       {!showEntry && <button onClick={reset} className="mt-7 inline-flex items-center gap-2 text-sm text-[#6e6e73]"><RefreshCcw size={15} />办理下一位</button>}
     </section>
-    <footer className="mx-auto max-w-5xl pb-5 text-center text-xs text-[#86868b]">演示系统 · {adapter.provider} 临时适配器 · D1 假订单 {snapshot.orders.length} 笔 · PMS、公安浏览器和硬件均未连接生产环境</footer>
+    <footer className="mx-auto max-w-5xl pb-5 text-center text-xs text-[#86868b]">演示系统 · {adapter.provider} 临时适配器 · D1 假订单 {snapshot.orders.length} 笔 · 读卡与发卡均为自动化模拟，未连接生产设备</footer>
   </main>;
 }
 
