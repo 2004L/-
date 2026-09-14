@@ -1,0 +1,13 @@
+{"id":"ambiguous-last4","utterances":["我在网上订了房","手机号后四位1188"],"expected_terminal":"MANUAL_SELECTION_REQUIRED","expected_events":["ORDER_MATCH_AMBIGUOUS"],"forbidden_events":["ROOM_HELD","KEYCARD_DISPENSED"]}
+{"id":"already-in-house","utterances":["我来入住，手机号后四位7366"],"expected_terminal":"ALREADY_CHECKED_IN","expected_events":["ORDER_MATCH_BLOCKED"]}
+{"id":"cancelled-order","utterances":["查一下4402的订单"],"expected_terminal":"CANCELLED","expected_events":["ORDER_MATCH_BLOCKED"]}
+{"id":"not-found-walk-in","utterances":["没有预订，我现场办理","手机号后四位9053"],"expected_terminal":"ORDER_MATCHED","expected_events":["WALK_IN_CREATED"]}
+{"id":"relation-clarification","utterances":["我老婆的手机号"],"expected_terminal":"WAITING_FOR_PHONE_LAST4","expected_events":["INTENT_NEEDS_INFO"]}
+{"id":"change-mind","utterances":["查询4821","不是这个订单"],"expected_terminal":"CANCELLED_BY_GUEST","expected_events":["INTENT_RECOGNIZED"]}
+{"id":"two-rooms","utterances":["手机号后四位6395，一次订两间"],"expected_terminal":"ORDER_MATCHED","expected_room_count":2}
+{"id":"idempotent-retry","utterances":["查询4821","查询4821"],"expected_terminal":"ORDER_MATCHED","expected_audit_max_delta":1}
+{"id":"concurrent-hold","utterances":["锁定1208","锁定1208"],"expected_terminal":"ONE_SUCCESS_ONE_409"}
+{"id":"invalid-tool","utterances":["执行不存在的工具"],"expected_terminal":"CLARIFICATION","expected_events":["INTENT_NEEDS_INFO"]}
+{"id":"reader-timeout","fault":{"target":"reader","fault_type":"reader_timeout"},"expected_terminal":"UNKNOWN","expected_events":["MANUAL_TASK_CREATED","READER_FAULT_INJECTED"]}
+{"id":"encoder-offline","fault":{"target":"encoder","fault_type":"encoder_offline"},"expected_terminal":"MANUAL_REQUIRED","expected_events":["MANUAL_TASK_CREATED"]}
+{"id":"police-captcha","fault":{"target":"police","fault_type":"captcha_required"},"expected_terminal":"MANUAL_REQUIRED","expected_events":["POLICE_FAULT_INJECTED"]}

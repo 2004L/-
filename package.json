@@ -15,7 +15,10 @@
     "security:secrets": "node scripts/check-secrets.mjs",
     "security:check": "node scripts/check-secrets.mjs && eslint . --ignore-pattern dist --ignore-pattern .next",
     "hooks:install": "git config core.hooksPath .githooks",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "test:cases": "node scripts/test-cases.mjs",
+    "test:contracts": "node scripts/test-contracts.mjs",
+    "test:security": "node scripts/check-secrets.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

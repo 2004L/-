@@ -61,7 +61,13 @@ pnpm start
 ```bash
 pnpm lint
 pnpm build
+pnpm test:cases
+pnpm test:contracts
 ```
+
+## 第一阶段仿真器验收
+
+管理后台的“设备与公安仿真器故障开关”可以注入读卡器超时/离线、发卡机离线/回读不一致、公安验证码/维护/回执丢失等情况。每个外部动作都生成唯一命令和幂等键；结果未知时不会自动重复登记或发卡，而是创建人工任务。详细字段和调用示例见 [`docs/simulator-contracts.md`](docs/simulator-contracts.md)。
 
 ## PMS 适配器配置
 
@@ -135,7 +141,11 @@ PMS_API_KEY=TEMP_PMS_API_KEY_REPLACE_ME
 - `app/page.tsx`：语音终端、适配器首次配置和管理后台界面。
 - `app/api/pms/[operation]/route.ts`：PMS 模拟 API。
 - `app/api/demo/[action]/route.ts`：数据库演示 API、状态机与审计入口。
+- `app/api/device/reader`、`app/api/device/encoder`、`app/api/police/submit`：第一阶段的外部系统仿真器，支持故障注入与人工接管。
+- `app/api/simulator/faults`：管理后台使用的故障开关；故障会落到命令、人工任务和审计记录。
 - `db/schema.ts`：D1/SQLite 表结构；`drizzle/` 保存追加式迁移。
+- `lib/contracts.ts`、`lib/simulator.ts`：统一命令契约、幂等处理和仿真器公共逻辑。
+- `fixtures/cases.jsonl`：可重放验收场景清单。
 - `docs/pms-integration.md`：PMS 适配与真实接入注意事项。
 - `docs/hardware-integration.md`：身份证读卡器、门锁编码器和自动发卡机的接口、安全状态机与验收要求。
 - `docs/model-resource-benchmark.md`：大模型、语音、RAG、GPU 与完整入住压测量化方案。

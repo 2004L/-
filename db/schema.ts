@@ -111,3 +111,61 @@ export const auditEvents = sqliteTable(
     index("audit_events_case_id_idx").on(table.caseId, table.id),
   ]
 );
+
+export const externalCommands = sqliteTable(
+  "external_commands",
+  {
+    id: text("id").primaryKey(),
+    sessionId: text("session_id").notNull().references(() => demoSessions.id, { onDelete: "cascade" }),
+    caseId: text("case_id"),
+    target: text("target").notNull(),
+    operation: text("operation").notNull(),
+    idempotencyKey: text("idempotency_key").notNull().unique(),
+    status: text("status").notNull(),
+    requestJson: text("request_json").notNull(),
+    resultJson: text("result_json"),
+    errorCode: text("error_code"),
+    retryable: integer("retryable").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("external_commands_session_idx").on(table.sessionId, table.createdAt),
+    index("external_commands_case_idx").on(table.caseId, table.createdAt),
+  ]
+);
+
+export const simulatorFaults = sqliteTable(
+  "simulator_faults",
+  {
+    id: text("id").primaryKey(),
+    sessionId: text("session_id").notNull().references(() => demoSessions.id, { onDelete: "cascade" }),
+    caseId: text("case_id"),
+    target: text("target").notNull(),
+    faultType: text("fault_type").notNull(),
+    triggerOnCall: integer("trigger_on_call").notNull().default(1),
+    repeatCount: integer("repeat_count").notNull().default(1),
+    callCount: integer("call_count").notNull().default(0),
+    enabled: integer("enabled").notNull().default(1),
+    autoReset: integer("auto_reset").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("simulator_faults_lookup_idx").on(table.sessionId, table.target, table.enabled)]
+);
+
+export const manualTasks = sqliteTable(
+  "manual_tasks",
+  {
+    id: text("id").primaryKey(),
+    sessionId: text("session_id").notNull().references(() => demoSessions.id, { onDelete: "cascade" }),
+    caseId: text("case_id"),
+    commandId: text("command_id"),
+    department: text("department").notNull(),
+    reason: text("reason").notNull(),
+    status: text("status").notNull().default("open"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("manual_tasks_session_status_idx").on(table.sessionId, table.status, table.createdAt)]
+);
