@@ -1,0 +1,11 @@
+title = "Hotel Agent OS Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Documented non-secret PMS placeholder"
+regexTarget = "match"
+regexes = [
+  '''TEMP_PMS_API_KEY_REPLACE_ME''',
+]

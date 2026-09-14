@@ -109,8 +109,28 @@ PMS_API_KEY=TEMP_PMS_API_KEY_REPLACE_ME
 - `app/page.tsx`：语音终端、适配器首次配置和管理后台界面。
 - `app/api/pms/[operation]/route.ts`：PMS 模拟 API。
 - `docs/pms-integration.md`：PMS 适配与真实接入注意事项。
+- `.openai/hosting.json`：当前在线演示站点的项目绑定和存储配置，不包含业务 API Key；迁移托管平台后才能连同相关构建配置一起删除。
 - `components/`：可复用 UI 组件。
 - `scripts/`：本地开发与构建脚本。
+
+## 安全检查
+
+首次克隆后启用仓库自带的提交前钩子：
+
+```bash
+pnpm hooks:install
+```
+
+之后每次提交都会检查暂存文件的空白错误、敏感文件名、私钥/Token 特征和身份证号码，并运行 ESLint。也可以手动运行：
+
+```bash
+pnpm security:secrets
+pnpm security:check
+```
+
+GitHub Actions 会在推送、Pull Request 和手动触发时运行 Gitleaks，扫描完整 Git 历史，并执行同一套代码检查。`TEMP_PMS_API_KEY_REPLACE_ME` 是唯一允许的演示占位符；真实密钥必须存入受控的密钥管理服务或 GitHub Secrets，不能写进源码、文档或提交历史。
+
+发现漏洞或疑似密钥泄漏时，请遵循 [安全策略](SECURITY.md)，不要在公开 Issue 中粘贴证件信息、支付数据或有效凭据。
 
 ## 路线图
 
@@ -122,4 +142,4 @@ PMS_API_KEY=TEMP_PMS_API_KEY_REPLACE_ME
 
 ## 贡献与许可证
 
-欢迎通过 Issue 或 Pull Request 提交适配器、测试和文档改进。当前仓库暂未附带正式开源许可证；在对外发布或商业化前，请先补充经确认的许可证和第三方依赖声明。
+欢迎通过 Issue 或 Pull Request 提交适配器、测试和文档改进。本项目采用 [Apache License 2.0](LICENSE)，允许使用、修改、分发和商业化，但必须遵守许可证中的版权、声明和专利条款。第三方依赖仍分别适用其自身许可证。

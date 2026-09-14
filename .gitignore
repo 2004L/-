@@ -28,6 +28,7 @@
 .ssh/
 SSHgit.txt
 NUL
+gitleaks-report.*
 
 # debug
 npm-debug.log*

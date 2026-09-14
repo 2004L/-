@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+git diff --cached --check
+node scripts/check-secrets.mjs --staged
+node node_modules/eslint/bin/eslint.js . --ignore-pattern dist --ignore-pattern .next

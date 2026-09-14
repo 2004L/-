@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, BedDouble, BellRing, Bot, Building2, ChevronRight, CircleCheck, CreditCard, DoorOpen, FileText, KeyRound, Landmark, Mic, MonitorCog, ScanLine, ShieldCheck, Sparkles, UserRoundCheck, Volume2, WalletCards, Wrench } from "lucide-react";
+import { AlertTriangle, BedDouble, BellRing, Bot, Building2, ChevronRight, CircleCheck, CreditCard, DoorOpen, FileText, KeyRound, Landmark, Mic, MonitorCog, ShieldCheck, Sparkles, UserRoundCheck, Volume2, WalletCards, Wrench } from "lucide-react";
 
 type CaseState = "IDENTITY_READ" | "POLICE_REGISTERING" | "POLICE_REGISTERED" | "PAYMENT_SUCCESS" | "ROOM_ASSIGNED" | "CARD_ISSUED" | "IN_HOUSE";
 
@@ -232,10 +232,13 @@ function VoiceTerminal({ city, adapter, onOpenAdmin, onReconfigure }: { city: "�
   const [flowIndex, setFlowIndex] = useState(-1);
   const [voiceOn, setVoiceOn] = useState(true);
   const [scenario, setScenario] = useState<DemoScenario>("normal");
-  const [blocked, setBlocked] = useState(false);
   const [apiEvents, setApiEvents] = useState<ApiEvent[]>([]);
   const active = flowIndex >= 0 ? flow[flowIndex] : null;
   const spoken = active?.voice ?? "您好，请将您的居民身份证放在读卡器上，我将为您自动办理入住。";
+  const blocked = started && (
+    (scenario === "leftBehind" && flowIndex === 0) ||
+    (scenario === "mismatch" && flowIndex === 2)
+  );
   const blockedReason = scenario === "leftBehind"
     ? "读卡器仍感应到上一位客人的证件，无法确认当前证件归属。"
     : "证件姓名与当前订单实名不一致，已暂停自动办理。";
@@ -260,12 +263,6 @@ function VoiceTerminal({ city, adapter, onOpenAdmin, onReconfigure }: { city: "�
 
   useEffect(() => {
     if (!started || flowIndex < 0) return;
-    if (scenario === "leftBehind" && flowIndex === 0) {
-      setBlocked(true);
-    }
-    if (scenario === "mismatch" && flowIndex === 2) {
-      setBlocked(true);
-    }
     if (voiceOn && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(spoken);
@@ -273,30 +270,33 @@ function VoiceTerminal({ city, adapter, onOpenAdmin, onReconfigure }: { city: "�
       utterance.rate = 1;
       window.speechSynthesis.speak(utterance);
     }
-    setApiEvents((events) => events.some((event) => event.step === flowIndex)
-      ? events
-      : [...events, {
-        step: flowIndex,
-        endpoint: active?.api ?? "POST /api/checkin/session",
-        status: scenario === "mismatch" && flowIndex === 2 ? "409" : "200",
-        detail: scenario === "leftBehind" && flowIndex === 0
-          ? "card.present · readerOccupied=true"
-          : scenario === "mismatch" && flowIndex === 2
-            ? "identity.orderMatch=false · manualReviewRequired=true"
-            : flowIndex === 0
-              ? "card.present · readerOccupied=false"
-              : "accepted · auditId=CI-20260913-0087",
-      }]);
-    if (blocked || (scenario === "leftBehind" && flowIndex === 0) || (scenario === "mismatch" && flowIndex === 2)) return;
-    if (flowIndex < flow.length - 1) {
-      const timer = window.setTimeout(() => setFlowIndex((value) => value + 1), 1000);
-      return () => window.clearTimeout(timer);
-    }
+    const eventTimer = window.setTimeout(() => {
+      setApiEvents((events) => events.some((event) => event.step === flowIndex)
+        ? events
+        : [...events, {
+          step: flowIndex,
+          endpoint: active?.api ?? "POST /api/checkin/session",
+          status: scenario === "mismatch" && flowIndex === 2 ? "409" : "200",
+          detail: scenario === "leftBehind" && flowIndex === 0
+            ? "card.present · readerOccupied=true"
+            : scenario === "mismatch" && flowIndex === 2
+              ? "identity.orderMatch=false · manualReviewRequired=true"
+              : flowIndex === 0
+                ? "card.present · readerOccupied=false"
+                : "accepted · auditId=CI-20260913-0087",
+        }]);
+    }, 0);
+    const advanceTimer = !blocked && flowIndex < flow.length - 1
+      ? window.setTimeout(() => setFlowIndex((value) => value + 1), 1000)
+      : null;
+    return () => {
+      window.clearTimeout(eventTimer);
+      if (advanceTimer !== null) window.clearTimeout(advanceTimer);
+    };
   }, [active?.api, blocked, flowIndex, started, voiceOn, spoken, scenario, flow.length]);
 
   function startDemo() {
     setStarted(true);
-    setBlocked(false);
     setFlowIndex(0);
     setApiEvents([{
       step: -1,
@@ -309,20 +309,17 @@ function VoiceTerminal({ city, adapter, onOpenAdmin, onReconfigure }: { city: "�
   function resetDemo() {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     setStarted(false);
-    setBlocked(false);
     setFlowIndex(-1);
     setApiEvents([]);
   }
 
   function resolveRisk() {
     if (scenario === "leftBehind") {
-      setBlocked(false);
       setScenario("normal");
       setApiEvents((events) => [...events, { step: 0.5, endpoint: "POST /api/device/id-reader/clear", status: "200", detail: "readerOccupied=false · previousCardRemoved=true" }]);
       setFlowIndex(1);
     } else {
       setApiEvents((events) => [...events, { step: 1.5, endpoint: "POST /api/manual-review/tasks", status: "202", detail: "人工复核工单已创建 · AI 不代替放行" }]);
-      setBlocked(false);
       setStarted(false);
       setFlowIndex(-1);
     }
