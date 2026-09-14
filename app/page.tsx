@@ -21,11 +21,32 @@ const initialLogs = [
   { time: "20:18:10", actor: "广州公安 Worker", text: "浏览器会话可用，已进入住宿登记页面" },
 ];
 
+type AdapterConfig = {
+  provider: string;
+  version: string;
+  baseUrl: string;
+  apiKey: string;
+  propertyCode: string;
+  hotelName: string;
+};
+
+const DEFAULT_ADAPTER: AdapterConfig = {
+  provider: "QloApps",
+  version: "1.6.1",
+  baseUrl: "https://pms.example.local/api",
+  apiKey: "TEMP_PMS_API_KEY_REPLACE_ME",
+  propertyCode: "GZ-HAOS-001",
+  hotelName: "Hotel Agent OS 广州示范店",
+};
+
 export default function Home() {
   const [step, setStep] = useState(0);
   const [terminalMode, setTerminalMode] = useState(true);
+  const [setupComplete, setSetupComplete] = useState(false);
+  const [adminMode, setAdminMode] = useState(false);
   const [logs, setLogs] = useState(initialLogs);
   const [city, setCity] = useState<"广州" | "珠海">("广州");
+  const [adapterConfig, setAdapterConfig] = useState<AdapterConfig>(DEFAULT_ADAPTER);
   const [departmentTasks, setDepartmentTasks] = useState([
     { department: "保洁部", title: "退房后清洁任务", detail: "退房事件触发后自动推送房号和优先级", icon: <BedDouble size={18} />, color: "text-[#087f73]" },
     { department: "工程部", title: "门锁与发卡机故障", detail: "设备异常时附带设备编号和错误码", icon: <Wrench size={18} />, color: "text-[#b35c00]" },
@@ -51,7 +72,9 @@ export default function Home() {
     setLogs((value) => [...value, { time: new Date().toLocaleTimeString("zh-CN", { hour12: false }), actor: "AI 协同代理", text: `已通知${item.department}：${item.title}` }]);
   }
 
-  if (terminalMode) return <VoiceTerminal city={city} />;
+  if (!setupComplete) return <AdapterWizard city={city} onCityChange={setCity} onComplete={(config) => { setAdapterConfig(config); setSetupComplete(true); }} />;
+  if (adminMode) return <AdminConsole city={city} adapter={adapterConfig} onBack={() => setAdminMode(false)} onReconfigure={() => { setAdminMode(false); setSetupComplete(false); }} />;
+  if (terminalMode) return <VoiceTerminal city={city} adapter={adapterConfig} onOpenAdmin={() => setAdminMode(true)} onReconfigure={() => setSetupComplete(false)} />;
 
   return (
     <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]">
@@ -130,6 +153,64 @@ function Node({ icon, title, detail, status }: { icon: React.ReactNode; title: s
   return <div className="flex items-center gap-3 rounded-xl bg-[#f8fbfd] p-4"><div className="rounded-lg bg-white p-2 text-[#1769aa] shadow-sm">{icon}</div><div className="min-w-0 flex-1"><p className="text-sm font-medium">{title}</p><p className="mt-1 truncate text-xs text-[#627d98]">{detail}</p></div><span className="rounded-full bg-[#e7f7f4] px-2 py-1 text-xs text-[#087f73]">{status}</span></div>;
 }
 
+function AdapterWizard({ city, onCityChange, onComplete }: { city: "广州" | "珠海"; onCityChange: (city: "广州" | "珠海") => void; onComplete: (config: AdapterConfig) => void }) {
+  const [stage, setStage] = useState(0);
+  const [draft, setDraft] = useState<AdapterConfig>({ ...DEFAULT_ADAPTER, propertyCode: city === "珠海" ? "ZH-HAOS-001" : DEFAULT_ADAPTER.propertyCode, hotelName: `Hotel Agent OS ${city}示范店` });
+  const [checking, setChecking] = useState(false);
+  const [checks, setChecks] = useState<{ label: string; status: string; detail: string }[]>([]);
+  const [adapted, setAdapted] = useState(false);
+
+  function update(field: keyof AdapterConfig, value: string) {
+    setDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  async function runChecks() {
+    setChecking(true);
+    const operations = [
+      ["订单查询", "orders", "GET"],
+      ["房态查询", "rooms", "GET"],
+      ["临时锁房", "hold", "POST"],
+      ["入住确认", "checkin", "POST"],
+      ["退房确认", "checkout", "POST"],
+    ] as const;
+    const result = await Promise.all(operations.map(async ([label, operation, method]) => {
+      try {
+        const response = await fetch(`/api/pms/${operation}`, { method });
+        return { label, status: response.ok ? "通过" : "失败", detail: response.ok ? "适配器响应正常" : "请检查接口映射" };
+      } catch {
+        return { label, status: "待确认", detail: "当前环境无法访问接口" };
+      }
+    }));
+    setChecks(result);
+    setChecking(false);
+    setStage(2);
+  }
+
+  function autoAdapt() {
+    setAdapted(true);
+    setDraft((current) => ({ ...current, baseUrl: current.baseUrl || DEFAULT_ADAPTER.baseUrl, propertyCode: current.propertyCode || (city === "珠海" ? "ZH-HAOS-001" : DEFAULT_ADAPTER.propertyCode), hotelName: current.hotelName || `Hotel Agent OS ${city}示范店` }));
+  }
+
+  return <main className="min-h-screen bg-[#f5f5f7] px-6 py-8 text-[#1d1d1f] md:px-12 md:py-12"><section className="mx-auto max-w-4xl"><div className="flex items-center justify-between"><div><p className="text-sm font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-2 text-sm text-[#6e6e73]">首次启动 · 创建独立酒店实例</p></div><span className="rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm">适配向导 {stage + 1}/3</span></div><div className="mt-10 grid gap-8 lg:grid-cols-[1.25fr_.75fr]"><section className="rounded-3xl bg-white p-6 shadow-sm md:p-8"><p className="text-xs font-medium uppercase tracking-[.18em] text-[#86868b]">{stage === 0 ? "创建实例" : stage === 1 ? "填写适配器" : "检测与确认"}</p><h1 className="mt-3 text-3xl font-semibold tracking-[-.04em] md:text-4xl">{stage === 0 ? "先把酒店接入。" : stage === 1 ? "填写 PMS 连接信息。" : "确认适配结果。"}</h1><p className="mt-3 text-base leading-7 text-[#6e6e73]">{stage === 0 ? "每个酒店实例都有独立的管理后台、配置和审计记录。" : stage === 1 ? "API Key 先使用临时占位符，接入真实 PMS 前再替换。" : "普通字段可以自动补齐，涉及订单、房态和放行的关键字段需要管理员确认。"}</p>{stage === 0 && <div className="mt-8 space-y-5"><label className="block text-sm font-medium">酒店所在城市<select value={city} onChange={(event) => { const value = event.target.value as "广州" | "珠海"; onCityChange(value); update("propertyCode", value === "珠海" ? "ZH-HAOS-001" : "GZ-HAOS-001"); update("hotelName", `Hotel Agent OS ${value}示范店`); }} className="mt-2 w-full rounded-xl border border-[#d9d9df] bg-white px-3 py-3 text-sm outline-none focus:border-[#007aff]"><option>广州</option><option>珠海</option></select></label><label className="block text-sm font-medium">酒店名称<input value={draft.hotelName} onChange={(event) => update("hotelName", event.target.value)} className="mt-2 w-full rounded-xl border border-[#d9d9df] px-3 py-3 text-sm outline-none focus:border-[#007aff]" /></label></div>}{stage === 1 && <div className="mt-8 grid gap-5 sm:grid-cols-2"><label className="text-sm font-medium">PMS<select value={draft.provider} onChange={(event) => update("provider", event.target.value)} className="mt-2 w-full rounded-xl border border-[#d9d9df] bg-white px-3 py-3 text-sm"><option>QloApps</option><option>Kamra PMS</option><option>inPMS</option><option>自定义 PMS</option></select></label><label className="text-sm font-medium">版本<input value={draft.version} onChange={(event) => update("version", event.target.value)} className="mt-2 w-full rounded-xl border border-[#d9d9df] px-3 py-3 text-sm" /></label><label className="text-sm font-medium sm:col-span-2">PMS API 地址<input value={draft.baseUrl} onChange={(event) => update("baseUrl", event.target.value)} className="mt-2 w-full rounded-xl border border-[#d9d9df] px-3 py-3 text-sm" /></label><label className="text-sm font-medium sm:col-span-2">API Key<input value={draft.apiKey} onChange={(event) => update("apiKey", event.target.value)} className="mt-2 w-full rounded-xl border border-[#d9d9df] px-3 py-3 font-mono text-xs" /><span className="mt-1 block text-xs text-[#8a6400]">临时占位：替换前不会向外部 PMS 发起真实写入</span></label><label className="text-sm font-medium sm:col-span-2">酒店编码<input value={draft.propertyCode} onChange={(event) => update("propertyCode", event.target.value)} className="mt-2 w-full rounded-xl border border-[#d9d9df] px-3 py-3 font-mono text-sm" /></label></div>}{stage === 2 && <div className="mt-8 space-y-5"><div className="rounded-2xl bg-[#f6f6f8] p-4"><div className="flex items-center justify-between"><p className="text-sm font-medium">{draft.provider} {draft.version}</p><span className="rounded-full bg-[#fff1c7] px-2.5 py-1 text-xs text-[#8a6400]">临时占位模式</span></div><p className="mt-2 text-xs text-[#6e6e73]">{draft.baseUrl} · {draft.propertyCode}</p></div><div className="space-y-2">{checks.map((item) => <div key={item.label} className="flex items-center justify-between rounded-xl border border-[#ececf0] px-3 py-3 text-sm"><span>{item.label}</span><span className={item.status === "通过" ? "text-[#248a4d]" : "text-[#8a6400]"}>{item.status} · {item.detail}</span></div>)}</div>{adapted && <div className="rounded-2xl border border-[#bde7d1] bg-[#f1fbf5] p-4 text-sm text-[#248a4d]">已自动补齐普通字段和示范房型映射，关键放行字段仍需管理员在后台确认。</div>}<button onClick={autoAdapt} className="w-full rounded-xl border border-[#d9d9df] bg-white px-4 py-3 text-sm font-medium">自动补齐缺失配置</button></div>}<div className="mt-8 flex justify-between gap-3"><button onClick={() => setStage((value) => Math.max(0, value - 1))} disabled={stage === 0} className="rounded-xl px-4 py-3 text-sm text-[#6e6e73] disabled:opacity-30">上一步</button>{stage < 2 ? <button onClick={() => stage === 0 ? setStage(1) : runChecks()} disabled={checking} className="rounded-xl bg-[#1d1d1f] px-5 py-3 text-sm font-medium text-white">{stage === 0 ? "继续填写适配器" : checking ? "检测中…" : "开始接口检测"}</button> : <button onClick={() => onComplete(draft)} className="rounded-xl bg-[#007aff] px-5 py-3 text-sm font-medium text-white">完成适配，进入系统</button>}</div></section><aside className="space-y-4"><div className="rounded-3xl bg-[#1d1d1f] p-6 text-white"><p className="text-xs uppercase tracking-[.18em] text-[#a1a1a6]">本实例隔离</p><p className="mt-3 text-lg font-medium">独立后台 · 独立密钥 · 独立审计</p><p className="mt-3 text-sm leading-6 text-[#c7c7cc]">后续每个酒店都可以单独配置 PMS、设备、支付规则和人工通知策略。</p></div><div className="rounded-3xl bg-white p-6 shadow-sm"><p className="text-xs uppercase tracking-[.18em] text-[#86868b]">自动适配边界</p><div className="mt-4 space-y-3 text-sm text-[#6e6e73]"><p><span className="mr-2 text-[#248a4d]">●</span>字段名称、房型和房间映射可建议</p><p><span className="mr-2 text-[#248a4d]">●</span>订单来源和手机号匹配可自动检测</p><p><span className="mr-2 text-[#d04a00]">●</span>入住、支付、公安登记不能自动越权</p></div></div></aside></div></section></main>;
+}
+
+function AdminConsole({ city, adapter, onBack, onReconfigure }: { city: "广州" | "珠海"; adapter: AdapterConfig; onBack: () => void; onReconfigure: () => void }) {
+  const [tab, setTab] = useState<"overview" | "mapping" | "policy" | "security">("overview");
+  const [tests, setTests] = useState<Record<string, string>>({});
+  const [phoneFirst, setPhoneFirst] = useState(true);
+  const [manualGate, setManualGate] = useState(true);
+  const interfaces = [["订单查询", "orders", "GET"], ["房态查询", "rooms", "GET"], ["临时锁房", "hold", "POST"], ["入住确认", "checkin", "POST"], ["退房确认", "checkout", "POST"]] as const;
+  async function test(operation: string, method: string) {
+    try {
+      const response = await fetch(`/api/pms/${operation}`, { method });
+      setTests((current) => ({ ...current, [operation]: response.ok ? "通过" : "失败" }));
+    } catch {
+      setTests((current) => ({ ...current, [operation]: "待确认" }));
+    }
+  }
+  return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="flex flex-wrap items-center justify-between gap-4 border-b border-[#d9e2ec] bg-white px-5 py-4 md:px-9"><div><p className="text-sm text-[#627d98]">独立管理后台 / {city}</p><h1 className="mt-1 text-xl font-semibold">{adapter.hotelName}</h1></div><div className="flex items-center gap-2"><span className="rounded-full bg-[#fff1c7] px-3 py-1.5 text-xs text-[#8a6400]">API Key 临时占位</span><button onClick={onBack} className="rounded-lg border border-[#cbd9e5] bg-white px-3 py-2 text-sm">返回语音终端</button></div></header><div className="mx-auto max-w-6xl p-5 md:p-9"><div className="grid gap-4 md:grid-cols-3"><div className="rounded-2xl border border-[#d9e2ec] bg-white p-5 shadow-sm"><p className="text-sm text-[#627d98]">当前 PMS</p><p className="mt-2 text-2xl font-semibold">{adapter.provider} {adapter.version}</p><p className="mt-2 text-xs text-[#829ab1]">{adapter.baseUrl}</p></div><div className="rounded-2xl border border-[#d9e2ec] bg-white p-5 shadow-sm"><p className="text-sm text-[#627d98]">酒店编码</p><p className="mt-2 font-mono text-2xl font-semibold">{adapter.propertyCode}</p><p className="mt-2 text-xs text-[#829ab1]">配置仅属于当前实例</p></div><div className="rounded-2xl border border-[#d9e2ec] bg-white p-5 shadow-sm"><p className="text-sm text-[#627d98]">适配状态</p><p className="mt-2 text-2xl font-semibold text-[#248a4d]">已完成</p><p className="mt-2 text-xs text-[#829ab1]">真实密钥替换后再启用生产写入</p></div></div><div className="mt-7 flex flex-wrap gap-2 rounded-2xl border border-[#d9e2ec] bg-white p-2 shadow-sm">{([["overview", "接口测试"], ["mapping", "编码映射"], ["policy", "业务规则"], ["security", "设备与安全"]] as const).map(([value, label]) => <button key={value} onClick={() => setTab(value)} className={`rounded-xl px-4 py-2.5 text-sm ${tab === value ? "bg-[#0b2942] text-white" : "text-[#486581]"}`}>{label}</button>)}</div>{tab === "overview" && <section className="mt-6 rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-6 py-5"><p className="text-sm text-[#627d98]">连接测试</p><h2 className="mt-1 text-lg font-semibold">首期五个 PMS 接口</h2></div><div className="grid gap-3 p-5 md:grid-cols-2">{interfaces.map(([label, operation, method]) => <div key={operation} className="flex items-center justify-between rounded-xl bg-[#f8fbfd] p-4"><div><p className="font-medium">{label}</p><p className="mt-1 font-mono text-xs text-[#829ab1]">{method} /api/pms/{operation}</p></div><button onClick={() => test(operation, method)} className="rounded-lg border border-[#cbd9e5] bg-white px-3 py-2 text-xs font-medium text-[#1769aa]">{tests[operation] ?? "测试"}</button></div>)}</div></section>}{tab === "mapping" && <section className="mt-6 rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-6 py-5"><p className="text-sm text-[#627d98]">编码映射</p><h2 className="mt-1 text-lg font-semibold">PMS 与门店执行节点</h2></div><div className="overflow-x-auto p-5"><table className="w-full min-w-[560px] text-left text-sm"><thead><tr className="border-b border-[#e8eef3] text-[#627d98]"><th className="px-3 py-3 font-medium">对象</th><th className="px-3 py-3 font-medium">本系统编码</th><th className="px-3 py-3 font-medium">PMS 编码</th><th className="px-3 py-3 font-medium">门锁/设备编码</th></tr></thead><tbody>{[["酒店", adapter.propertyCode, adapter.propertyCode, "NODE-GZ-01"], ["高楼层大床房", "DLX-KING", `${adapter.propertyCode}-DLX-KING`, "LOCK-GZ-KING"], ["1208 房", "1208", `${adapter.propertyCode}-1208`, "A-1208"]].map((row) => <tr key={row[0]} className="border-b border-[#f0f2f4]"><td className="px-3 py-3 font-medium">{row[0]}</td>{row.slice(1).map((value) => <td key={value} className="px-3 py-3 font-mono text-xs text-[#486581]">{value}</td>)}</tr>)}</tbody></table></div></section>}{tab === "policy" && <section className="mt-6 rounded-2xl border border-[#d9e2ec] bg-white p-6 shadow-sm"><p className="text-sm text-[#627d98]">业务规则</p><h2 className="mt-1 text-lg font-semibold">AI 只能建议，固定程序负责放行</h2><div className="mt-6 space-y-4"><label className="flex items-center justify-between rounded-xl bg-[#f8fbfd] p-4 text-sm"><span><span className="block font-medium">手机号优先匹配订单</span><span className="mt-1 block text-xs text-[#829ab1]">美团、抖音、团购和网购订单统一进入匹配队列</span></span><input type="checkbox" checked={phoneFirst} onChange={(event) => setPhoneFirst(event.target.checked)} className="h-5 w-5" /></label><label className="flex items-center justify-between rounded-xl bg-[#f8fbfd] p-4 text-sm"><span><span className="block font-medium">高风险必须人工确认</span><span className="mt-1 block text-xs text-[#829ab1]">身份不一致、支付不明、房态冲突时禁止自动放行</span></span><input type="checkbox" checked={manualGate} onChange={(event) => setManualGate(event.target.checked)} className="h-5 w-5" /></label></div></section>}{tab === "security" && <section className="mt-6 grid gap-4 md:grid-cols-2"><div className="rounded-2xl border border-[#d9e2ec] bg-white p-5 shadow-sm"><p className="text-sm text-[#627d98]">设备节点</p><div className="mt-4 space-y-3"><Node icon={<UserRoundCheck size={18} />} title="身份证读卡器" detail="HID-02 · 仅在本地读取" status="在线" /><Node icon={<CreditCard size={18} />} title="发卡机" detail="A01 · 等待任务" status="在线" /><Node icon={<MonitorCog size={18} />} title="公安浏览器 Worker" detail="证书与验证码异常转人工" status="在线" /></div></div><div className="rounded-2xl border border-[#f1d6a4] bg-[#fffaf0] p-5 shadow-sm"><p className="text-sm text-[#8a6400]">安全提示</p><p className="mt-3 text-sm leading-6 text-[#6e6e73]">当前 API Key 仍为临时占位。替换真实密钥后，请先在沙盒环境完成五个接口测试，再切换到生产模式。</p><button onClick={onReconfigure} className="mt-4 rounded-lg border border-[#e0bd67] bg-white px-3 py-2 text-sm text-[#8a6400]">重新打开适配向导</button></div></section>}</div></main>;
+}
+
 type DemoScenario = "normal" | "leftBehind" | "mismatch";
 
 const TERMINAL_FLOW = [
@@ -145,7 +226,7 @@ const TERMINAL_FLOW = [
 
 type ApiEvent = { step: number; endpoint: string; status: string; detail: string };
 
-function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
+function VoiceTerminal({ city, adapter, onOpenAdmin, onReconfigure }: { city: "广州" | "珠海"; adapter: AdapterConfig; onOpenAdmin: () => void; onReconfigure: () => void }) {
   const flow = TERMINAL_FLOW;
   const [started, setStarted] = useState(false);
   const [flowIndex, setFlowIndex] = useState(-1);
@@ -248,11 +329,11 @@ function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
   }
 
   return <main className="min-h-screen bg-[#f5f5f7] px-6 py-7 text-[#1d1d1f] md:px-12 md:py-9">
-    <header className="mx-auto flex max-w-6xl items-center justify-between text-sm"><span className="font-semibold tracking-tight">入住</span><div className="flex items-center gap-4"><div className="hidden items-center gap-1 rounded-full bg-white p-1 shadow-sm sm:flex">{(["normal", "leftBehind", "mismatch"] as DemoScenario[]).map((item) => <button key={item} onClick={() => { setScenario(item); resetDemo(); }} className={`rounded-full px-3 py-1.5 text-xs ${scenario === item ? "bg-[#1d1d1f] text-white" : "text-[#6e6e73]"}`}>{item === "normal" ? "正常流程" : item === "leftBehind" ? "遗留证件" : "信息不一致"}</button>)}</div><button onClick={() => setVoiceOn((value) => !value)} className="inline-flex items-center gap-2 text-[#6e6e73]"><span className={`h-2 w-2 rounded-full ${voiceOn ? "bg-[#30d158]" : "bg-[#a1a1a6]"}`} />{voiceOn ? "语音开启" : "静音"}</button></div></header>
+    <header className="mx-auto flex max-w-6xl items-center justify-between text-sm"><span className="font-semibold tracking-tight">入住</span><div className="flex items-center gap-3"><button onClick={onOpenAdmin} className="hidden rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm sm:inline-flex">管理后台</button><button onClick={onReconfigure} className="hidden rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm sm:inline-flex">重新适配</button><div className="hidden items-center gap-1 rounded-full bg-white p-1 shadow-sm lg:flex">{(["normal", "leftBehind", "mismatch"] as DemoScenario[]).map((item) => <button key={item} onClick={() => { setScenario(item); resetDemo(); }} className={`rounded-full px-3 py-1.5 text-xs ${scenario === item ? "bg-[#1d1d1f] text-white" : "text-[#6e6e73]"}`}>{item === "normal" ? "正常流程" : item === "leftBehind" ? "遗留证件" : "信息不一致"}</button>)}</div><button onClick={() => setVoiceOn((value) => !value)} className="inline-flex items-center gap-2 text-[#6e6e73]"><span className={`h-2 w-2 rounded-full ${voiceOn ? "bg-[#30d158]" : "bg-[#a1a1a6]"}`} />{voiceOn ? "语音开启" : "静音"}</button></div></header>
     <section className="mx-auto flex min-h-[calc(100vh-8rem)] max-w-4xl flex-col items-center justify-center text-center">
       <p className="text-sm font-medium text-[#6e6e73]">{city} · AI 自助入住</p>
       <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />本地安全模型 · Qwen3.8-27B（示意） · 敏感字段留在门店节点</div>
-      <div className="mt-2 inline-flex items-center gap-2 rounded-full bg-[#fff8e7] px-3 py-1.5 text-xs text-[#8a6400] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#f5b700]" />PMS 适配器：QloApps 1.6.1 · API Key 临时占位</div>
+      <div className="mt-2 inline-flex items-center gap-2 rounded-full bg-[#fff8e7] px-3 py-1.5 text-xs text-[#8a6400] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#f5b700]" />PMS 适配器：{adapter.provider} {adapter.version} · API Key 临时占位</div>
       <h1 className="mt-5 text-5xl font-semibold tracking-[-.06em] md:text-7xl">{blocked ? "请先处理证件。" : "把身份证放上来。"}</h1>
       <p className="mt-4 text-2xl tracking-[-.03em] text-[#6e6e73] md:text-3xl">剩下的，交给 AI。</p>
       <button onClick={started ? resetDemo : startDemo} aria-label={started ? "重新开始演示" : "模拟放置身份证"} className={`mt-14 grid h-28 w-28 place-items-center rounded-full text-white shadow-[0_20px_50px_rgba(0,0,0,.14)] transition ${started ? "bg-[#007aff]" : "bg-[#1d1d1f] hover:scale-105"}`}>{started ? <Volume2 size={39} /> : <Mic size={39} />}</button>
