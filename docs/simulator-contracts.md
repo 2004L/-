@@ -20,6 +20,8 @@
 
 管理后台调用 `POST /api/simulator/faults` 注入一次性或多次故障，`GET` 查看，`DELETE /api/simulator/faults/:fault_id` 停用，`POST /api/simulator/reset` 恢复正常。故障命中后会写入 `external_commands`、`manual_tasks` 和 `audit_events`，前端可以据此显示人工接管。
 
+当前入住演示已经接线：读卡器命令在“检测到身份证”后执行，公安登记命令在“房间锁定”后执行，发卡机命令在“PMS 入住确认、准备写卡”阶段执行。仿真命令只返回演示 token 和状态，不会接触真实证件、公安或门锁数据。
+
 ## 验收
 
 `fixtures/cases.jsonl` 是可重放场景清单，运行 `pnpm test:cases` 检查场景完整性，运行 `pnpm test:contracts` 检查接口表面。当前是第一阶段的契约验收；下一阶段再把这些 fixture 接到本地 D1 启动器，做真实请求重放和并发 409 验证。
