@@ -63,11 +63,14 @@ pnpm lint
 pnpm build
 pnpm test:cases
 pnpm test:contracts
+pnpm test:replay
 ```
 
 ## 第一阶段仿真器验收
 
 管理后台的“设备与公安仿真器故障开关”可以注入读卡器超时/离线、发卡机离线/回读不一致、公安验证码/维护/回执丢失等情况。每个外部动作都生成唯一命令和幂等键；结果未知时不会自动重复登记或发卡，而是创建人工任务。详细字段和调用示例见 [`docs/simulator-contracts.md`](docs/simulator-contracts.md)。
+
+`pnpm test:replay` 会在本地隔离的假数据模型上顺序重放 `fixtures/cases.jsonl` 的 13 个场景，并检查终态、room_count、幂等审计数量和人工接管事件；该命令不访问真实 PMS、公安系统或硬件。
 
 ## PMS 适配器配置
 
