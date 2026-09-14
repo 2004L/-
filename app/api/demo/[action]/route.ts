@@ -58,6 +58,56 @@ function requireLast4(value: unknown) {
   return value;
 }
 
+function requireUtterance(value: unknown) {
+  if (typeof value !== "string") throw new Error("invalid_utterance");
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (normalized.length < 1 || normalized.length > 200) throw new Error("invalid_utterance");
+  return normalized;
+}
+
+function extractLast4(value: string) {
+  const digitMap: Record<string, string> = { 零: "0", 〇: "0", 一: "1", 幺: "1", 二: "2", 两: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9" };
+  const normalized = [...value].map((character) => digitMap[character] ?? character).join("");
+  const digits = normalized.replace(/\D/g, "");
+  return digits.length >= 4 ? digits.slice(-4) : null;
+}
+
+function redactUtterance(value: string) {
+  return value
+    .replace(/\b\d{17}[\dXx]\b/g, "[身份证号已隐藏]")
+    .replace(/\b1\d{10}\b/g, (phone) => `1** **** ${phone.slice(-4)}`)
+    .slice(0, 80);
+}
+
+function classifyIntent(utterance: string): { intent: string; label: string; confidence: number; action: string; last4: string | null; answer?: string } {
+  const last4 = extractLast4(utterance);
+  if (/(房卡|门卡|卡.*(没|未).*出|取卡)/.test(utterance)) {
+    return { intent: "query_keycard_status", label: "查询房卡进度", confidence: 0.97, action: "read_hardware_status", last4 };
+  }
+  if (/(不住了|取消办理|停止办理|算了)/.test(utterance)) {
+    return { intent: "cancel_checkin", label: "取消办理", confidence: 0.95, action: "request_confirmation", last4 };
+  }
+  if (/(早餐|早饭)/.test(utterance)) {
+    return { intent: "hotel_policy", label: "咨询早餐", confidence: 0.98, action: "rag_answer", last4, answer: "早餐时间是早上七点到十点。正式接入后，这里会读取当前酒店的知识库配置。" };
+  }
+  if (/(停车|停车场|车位)/.test(utterance)) {
+    return { intent: "hotel_policy", label: "咨询停车", confidence: 0.98, action: "rag_answer", last4, answer: "酒店提供停车服务。正式接入后，我会根据门店政策说明位置、费用和入场方式。" };
+  }
+  if (/(押金|微信|支付宝|怎么付|支付)/.test(utterance)) {
+    return { intent: "payment_policy", label: "咨询支付与押金", confidence: 0.96, action: "rag_answer", last4, answer: "押金和支付方式以当前酒店政策为准。系统会在身份与房态核验后展示微信或支付宝付款页面，不会由AI自行修改金额。" };
+  }
+  if (/(退房|几点退)/.test(utterance)) {
+    return { intent: "hotel_policy", label: "咨询退房", confidence: 0.97, action: "rag_answer", last4, answer: "正式系统会读取订单对应的退房时间；如需延迟退房，我会先查询当天房态和酒店政策。" };
+  }
+  if (/(没预订|没有预订|现场办理|直接住|到店住)/.test(utterance)) {
+    return { intent: "walk_in", label: "现场入住", confidence: 0.96, action: last4 ? "prepare_walk_in" : "collect_phone_last4", last4 };
+  }
+  if (last4 || /(预订|订了|订房|入住|住店|美团|抖音|携程|官网)/.test(utterance)) {
+    return { intent: "query_reservation", label: "查询预订", confidence: last4 ? 0.98 : 0.92, action: last4 ? "search_order" : "collect_phone_last4", last4 };
+  }
+  return { intent: "general_assistance", label: "一般咨询", confidence: 0.72, action: "clarify_intent", last4 };
+}
+
 async function readBody(request: Request) {
   try {
     return (await request.json()) as Record<string, unknown>;
@@ -234,6 +284,32 @@ export async function POST(request: Request, context: RouteContext) {
     }
     if (action === "match") {
       return json(await matchOrder(sessionId, requireLast4(body.phone_last4)));
+    }
+    if (action === "interpret") {
+      const utterance = requireUtterance(body.utterance);
+      const classified = classifyIntent(utterance);
+      const safeExpression = redactUtterance(utterance);
+      await audit(sessionId, null, "INTENT_RECOGNIZED", null, classified.intent.toUpperCase(), `表达：“${safeExpression}” → 意图：${classified.label} → 置信度：${Math.round(classified.confidence * 100)}% → 动作：${classified.action}`);
+
+      if (classified.intent === "query_reservation" && classified.last4) {
+        const match = await matchOrder(sessionId, classified.last4);
+        return json({ ...classified, phone_last4: classified.last4, assistantMessage: "我已经理解您的入住需求，正在查询订单。", ...match });
+      }
+      if (classified.intent === "walk_in" && classified.last4) {
+        return json({ ...classified, phone_last4: classified.last4, outcome: "not_found", assistantMessage: "明白，您要现场办理入住。我已准备创建现场办理单，请确认后继续。" });
+      }
+      if (classified.action === "collect_phone_last4") {
+        await audit(sessionId, null, "INTENT_NEEDS_INFO", classified.intent.toUpperCase(), "WAITING_FOR_PHONE_LAST4", "当前意图缺少订单匹配所需的手机号后四位");
+        return json({ ...classified, assistantMessage: "可以，请告诉我预订手机号的后四位，直接说数字就行。" });
+      }
+      if (classified.intent === "query_keycard_status") {
+        const latest = await getD1().prepare("SELECT status, hardware_status FROM checkin_cases WHERE session_id = ? ORDER BY created_at DESC LIMIT 1").bind(sessionId).first<{ status: string; hardware_status: string }>();
+        return json({ ...classified, assistantMessage: latest ? `我查到当前办理状态是 ${latest.status}，设备状态是 ${latest.hardware_status}。系统只查询原发卡命令，不会因此重复发卡。` : "目前没有正在办理的入住任务。" });
+      }
+      if (classified.intent === "cancel_checkin") {
+        return json({ ...classified, assistantMessage: "我理解您想停止办理。取消可能涉及退款或解除锁房，需要您再次确认，演示系统不会直接执行。" });
+      }
+      return json({ ...classified, assistantMessage: classified.answer ?? "可以直接告诉我您想入住、查询订单，或者询问早餐、停车、押金和退房。" });
     }
     if (action === "walk-in") {
       const phoneLast4 = requireLast4(body.phone_last4);

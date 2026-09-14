@@ -1,25 +1,30 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
+  ArrowUp,
   Building2,
   Check,
   CircleCheck,
+  Clock3,
   CreditCard,
   Database,
+  FileCheck2,
   IdCard,
   LoaderCircle,
+  MessageSquareText,
   Mic,
   MonitorCog,
   RefreshCcw,
   Settings2,
   ShieldCheck,
+  TrendingUp,
+  Users,
   Volume2,
   X,
 } from "lucide-react";
-import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 
 type AdapterConfig = {
   provider: string;
@@ -93,6 +98,15 @@ type MatchResponse = {
   order?: DemoOrder;
   orders?: DemoOrder[];
   checkinCase?: CheckinCase;
+};
+
+type IntentResponse = Partial<MatchResponse> & {
+  intent: string;
+  label: string;
+  confidence: number;
+  action: string;
+  phone_last4?: string;
+  assistantMessage: string;
 };
 
 type RecognitionResultEvent = { results: { 0: { 0: { transcript: string } } } };
@@ -169,13 +183,6 @@ function speak(text: string, enabled: boolean) {
   utterance.lang = "zh-CN";
   utterance.rate = 1;
   window.speechSynthesis.speak(utterance);
-}
-
-function parseSpokenLast4(value: string) {
-  const map: Record<string, string> = { 零: "0", 〇: "0", 一: "1", 幺: "1", 二: "2", 两: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9" };
-  const normalized = [...value].map((char) => map[char] ?? char).join("");
-  const digits = normalized.replace(/\D/g, "");
-  return digits.length >= 4 ? digits.slice(-4) : digits;
 }
 
 export default function Home() {
@@ -282,17 +289,21 @@ function Field({ label, value, onChange, wide = false, secret = false }: { label
   return <label className={`text-sm font-medium ${wide ? "sm:col-span-2" : ""}`}>{label}<input type={secret ? "password" : "text"} value={value} onChange={(event) => onChange(event.target.value)} className="mt-2 w-full rounded-xl border border-[#d9d9df] px-3 py-3 text-sm font-normal outline-none focus:border-[#007aff]" /></label>;
 }
 
-type TerminalPhase = "idle" | "confirm" | "searching" | "matched" | "processing" | "ambiguous" | "not_found" | "blocked" | "complete" | "error";
+const SAMPLE_UTTERANCES = ["我在美团订了房，手机号后四位4821", "我没有预订，想直接入住", "早餐几点开始？", "房卡怎么还没出来？"];
+
+type TerminalPhase = "idle" | "searching" | "matched" | "processing" | "ambiguous" | "not_found" | "blocked" | "complete" | "error";
 
 function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }: { sessionId: string; adapter: AdapterConfig; snapshot: Snapshot; onRefresh: () => Promise<void>; onOpenAdmin: () => void }) {
   const [last4, setLast4] = useState("");
+  const [utterance, setUtterance] = useState("");
   const [phase, setPhase] = useState<TerminalPhase>("idle");
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [listening, setListening] = useState(false);
   const [matchedOrder, setMatchedOrder] = useState<DemoOrder | null>(null);
   const [checkinCase, setCheckinCase] = useState<CheckinCase | null>(null);
   const [alternatives, setAlternatives] = useState<DemoOrder[]>([]);
-  const [message, setMessage] = useState("说出或输入预订手机号后四位");
+  const [message, setMessage] = useState("您好，今天想办理什么？");
+  const [intentTrace, setIntentTrace] = useState<Pick<IntentResponse, "label" | "confidence" | "action"> | null>(null);
   const [flowStep, setFlowStep] = useState(0);
   const recognitionRef = useRef<RecognitionLike | null>(null);
 
@@ -305,56 +316,55 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   function reset() {
     recognitionRef.current?.stop();
     setLast4("");
+    setUtterance("");
     setPhase("idle");
     setMatchedOrder(null);
     setCheckinCase(null);
     setAlternatives([]);
+    setIntentTrace(null);
     setFlowStep(0);
-    setMessage("说出或输入预订手机号后四位");
-    speak("您好，请说出或输入预订手机号后四位。", voiceEnabled);
-  }
-
-  function changeLast4(value: string) {
-    const cleaned = value.replace(/\D/g, "").slice(0, 4);
-    setLast4(cleaned);
-    if (cleaned.length === 4) {
-      setPhase("confirm");
-      setMessage(`我听到的是 ${cleaned.split("").join("，")}，请确认后查询。`);
-      speak(`我听到的是 ${cleaned.split("").join("，")}，请确认。`, voiceEnabled);
-    }
+    setMessage("您好，今天想办理什么？");
+    speak("您好，今天想办理什么？您可以直接说。", voiceEnabled);
   }
 
   function startListening() {
     const browserWindow = window as Window & { SpeechRecognition?: RecognitionConstructor; webkitSpeechRecognition?: RecognitionConstructor };
     const Constructor = browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition;
     if (!Constructor) {
-      setMessage("当前浏览器不支持语音识别，请直接输入四位数字");
+      setMessage("当前浏览器不支持语音识别，您可以直接打字告诉我");
       return;
     }
     const recognition = new Constructor();
     recognition.lang = "zh-CN";
     recognition.interimResults = false;
     recognition.continuous = false;
-    recognition.onresult = (event) => changeLast4(parseSpokenLast4(event.results[0][0].transcript));
-    recognition.onerror = () => setMessage("没有听清，请再说一次或直接输入");
+    recognition.onresult = (event) => {
+      const transcript = event.results[0][0].transcript.trim();
+      setUtterance(transcript);
+      void submitUtterance(transcript);
+    };
+    recognition.onerror = () => setMessage("没有听清，您可以换一种说法或直接输入");
     recognition.onend = () => setListening(false);
     recognitionRef.current = recognition;
     setListening(true);
-    setMessage("正在听，请说手机号后四位");
+    setMessage("我在听，您直接说就好");
     recognition.start();
   }
 
-  async function confirmAndMatch() {
-    if (last4.length !== 4) return;
+  async function submitUtterance(value = utterance) {
+    const normalized = value.trim();
+    if (!normalized) return;
     setPhase("searching");
-    setMessage("正在精确匹配订单");
+    setMessage("正在理解您的意思");
     try {
-      const result = await postDemo<MatchResponse>("match", { session_id: sessionId, phone_last4: last4 });
+      const result = await postDemo<IntentResponse>("interpret", { session_id: sessionId, utterance: normalized });
+      setIntentTrace({ label: result.label, confidence: result.confidence, action: result.action });
+      if (result.phone_last4) setLast4(result.phone_last4);
       if (result.outcome === "matched" && result.order && result.checkinCase) {
         setMatchedOrder(result.order);
         setCheckinCase(result.checkinCase);
         setPhase(result.checkinCase.status === "CHECKIN_COMPLETE" ? "complete" : "matched");
-        setMessage(`已找到 ${result.order.source} 订单，请核对脱敏信息`);
+        setMessage(`听懂了，已找到 ${result.order.source} 订单`);
         speak(`已找到${result.order.source}订单。请核对后，将身份证放在读卡器上。`, voiceEnabled);
       } else if (result.outcome === "ambiguous") {
         setAlternatives(result.orders ?? []);
@@ -363,16 +373,21 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         speak("找到多笔订单，我不能替您猜选，请联系工作人员复核。", voiceEnabled);
       } else if (result.outcome === "not_found") {
         setPhase("not_found");
-        setMessage("没有找到线上订单，可以创建现场办理单");
-      } else {
+        setMessage(result.assistantMessage);
+        speak(result.assistantMessage, voiceEnabled);
+      } else if (result.outcome === "already_checked_in" || result.outcome === "cancelled") {
         setPhase("blocked");
         setAlternatives(result.orders ?? []);
         setMessage(result.outcome === "already_checked_in" ? "该订单已经入住，不能重复办理" : "该订单已经取消，不能继续办理");
+      } else {
+        setPhase("idle");
+        setMessage(result.assistantMessage);
+        speak(result.assistantMessage, voiceEnabled);
       }
       await onRefresh();
     } catch {
       setPhase("error");
-      setMessage("订单服务暂时不可用，请稍后重试");
+      setMessage("暂时没有理解成功，您的输入已保留，请稍后重试");
     }
   }
 
@@ -445,15 +460,15 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     }
   }
 
-  const showEntry = phase === "idle" || phase === "confirm" || phase === "searching";
+  const showEntry = phase === "idle" || phase === "searching";
   return <main className="min-h-screen bg-[#f5f5f7] px-5 py-6 text-[#1d1d1f] md:px-10">
     <header className="mx-auto flex max-w-6xl items-center justify-between"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>
     <section className="mx-auto flex min-h-[calc(100vh-7rem)] max-w-5xl flex-col items-center justify-center py-12 text-center">
-      <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />本地小模型交互 · 身份原始字段不进 AI</div>
+      <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />AI Native 对话 · 您怎么说都可以</div>
       <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">{activeMessage}</h1>
-      <p className="mt-4 text-base text-[#86868b]">每一步由固定业务接口执行，AI 只负责交流与编排。</p>
+      <p className="mt-4 text-base text-[#86868b]">系统理解您的意图，再由受控业务接口完成动作。</p>
 
-      {showEntry && <div className="mt-10 flex flex-col items-center"><InputOTP maxLength={4} value={last4} onChange={changeLast4} disabled={phase === "searching"}><InputOTPGroup>{[0, 1, 2, 3].map((index) => <InputOTPSlot key={index} index={index} className="h-16 w-14 border-[#d2d2d7] bg-white text-2xl shadow-sm first:rounded-l-2xl last:rounded-r-2xl md:h-20 md:w-20 md:text-3xl" />)}</InputOTPGroup></InputOTP><div className="mt-6 flex gap-3"><button onClick={startListening} disabled={listening || phase === "searching"} className="grid h-12 w-12 place-items-center rounded-full bg-[#1d1d1f] text-white disabled:opacity-50" aria-label="语音输入手机号后四位">{listening ? <LoaderCircle size={20} className="animate-spin" /> : <Mic size={20} />}</button><button onClick={confirmAndMatch} disabled={last4.length !== 4 || phase === "searching"} className="rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white disabled:opacity-35">{phase === "searching" ? "查询中…" : "确认并查询"}</button></div><p className="mt-4 text-xs text-[#86868b]">演示号码：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
+      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={listening || phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label="开始语音交互">{listening ? <LoaderCircle size={19} className="animate-spin text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={!utterance.trim() || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label="发送"><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching"} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
 
       {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
 
@@ -485,6 +500,9 @@ function RiskCard({ title, text, orders }: { title: string; text: string; orders
 function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack, onReconfigure }: { sessionId: string; adapter: AdapterConfig; snapshot: Snapshot; loading: boolean; onRefresh: () => Promise<void>; onBack: () => void; onReconfigure: () => void }) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const intentEvents = snapshot.auditEvents.filter((event) => event.event_type.startsWith("INTENT_"));
+  const completedCases = snapshot.cases.filter((item) => item.status === "CHECKIN_COMPLETE").length;
+  const estimatedMinutesSaved = completedCases * 6;
   async function resetData() {
     setResetting(true);
     try {
@@ -496,7 +514,9 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     }
   }
   return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button><button onClick={() => setConfirmReset(true)} className="rounded-lg bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">重置演示数据</button></div></div></header>
-    <div className="mx-auto max-w-7xl p-5 md:p-9"><div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div>
+    <div className="mx-auto max-w-7xl p-5 md:p-9"><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
+      <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#3b78a8]">AI Native</p><h2 className="mt-1 font-semibold">意图识别与动作对齐审计</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">只保留脱敏表达</span></div><div className="divide-y divide-[#edf2f7]">{intentEvents.length ? intentEvents.slice(0, 8).map((event) => <div key={event.id} className="grid gap-2 px-5 py-4 md:grid-cols-[1fr_auto]"><div><p className="text-sm leading-6 text-[#334e68]">{event.detail}</p><p className="mt-1 text-xs text-[#9fb3c8]">顾客表达 → 意图 → 置信度 → 受控业务动作</p></div><span className="font-mono text-xs text-[#829ab1]">#{event.id}</span></div>) : <Empty text="与AI说一句话后，这里会显示脱敏的意图识别和动作对齐记录" />}</div></section>
+      <section className="mt-7"><p className="text-sm text-[#627d98]">系统运行</p><h2 className="mt-1 text-xl font-semibold">实时业务数据</h2><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">D1 假数据</p><h2 className="mt-1 font-semibold">订单状态与手机号测试集</h2></div><div className="overflow-x-auto"><table className="w-full min-w-[850px] text-left text-sm"><thead className="bg-[#f8fbfd] text-xs text-[#627d98]"><tr>{["来源", "订单号", "手机号", "日期", "房型", "订单状态", "房间"].map((name) => <th key={name} className="px-5 py-3 font-medium">{name}</th>)}</tr></thead><tbody>{snapshot.orders.map((order) => <tr key={order.id} className="border-t border-[#edf2f7]"><td className="px-5 py-3 font-medium">{order.source}</td><td className="px-5 py-3 font-mono text-xs">{order.order_code}</td><td className="px-5 py-3">{order.phone_masked}</td><td className="px-5 py-3">{order.stay_date}</td><td className="px-5 py-3">{order.room_type}</td><td className="px-5 py-3"><StatusPill value={order.status} /></td><td className="px-5 py-3">{order.room_number ?? "—"}</td></tr>)}</tbody></table></div></section>
       <div className="mt-7 grid gap-7 lg:grid-cols-[1fr_.85fr]"><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">办理任务</p><h2 className="mt-1 font-semibold">数据库状态机</h2></div><div className="divide-y divide-[#edf2f7]">{snapshot.cases.length ? snapshot.cases.map((item) => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="font-mono text-xs text-[#627d98]">{item.id.slice(0, 12)}… · v{item.version}</p><p className="mt-1 text-sm">房间 {item.room_number ?? "未锁定"} · 硬件 {item.hardware_status}</p></div><StatusPill value={item.status} /></div>) : <Empty text="尚无办理任务" />}</div></section>
         <section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">不可篡改式演示记录</p><h2 className="mt-1 font-semibold">最近审计事件</h2></div><div className="max-h-[430px] divide-y divide-[#edf2f7] overflow-y-auto">{snapshot.auditEvents.length ? snapshot.auditEvents.map((event) => <div key={event.id} className="px-5 py-4"><div className="flex justify-between gap-3"><p className="text-sm font-medium">{event.event_type}</p><span className="font-mono text-[10px] text-[#829ab1]">#{event.id}</span></div><p className="mt-1 text-xs leading-5 text-[#627d98]">{event.detail}</p><p className="mt-1 text-[10px] text-[#9fb3c8]">{new Date(event.created_at).toLocaleString("zh-CN")}</p></div>) : <Empty text="尚无审计事件" />}</div></section></div>
@@ -507,6 +527,11 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
 
 function AdminMetric({ label, value, note }: { label: string; value: string; note: string }) {
   return <div className="rounded-2xl border border-[#d9e2ec] bg-white p-5 shadow-sm"><p className="text-sm text-[#627d98]">{label}</p><p className="mt-2 text-3xl font-semibold">{value}</p><p className="mt-2 text-xs text-[#829ab1]">{note}</p></div>;
+}
+
+function ValueMetric({ icon, label, value, note, tone }: { icon: ReactNode; label: string; value: string; note: string; tone: "blue" | "violet" | "orange" | "green" }) {
+  const tones = { blue: "bg-[#eaf4ff] text-[#1769aa]", violet: "bg-[#f1edff] text-[#6e55b4]", orange: "bg-[#fff1e5] text-[#ad5b16]", green: "bg-[#e8f7ee] text-[#248a4d]" };
+  return <article className="rounded-2xl border border-[#d9e2ec] bg-white p-5 shadow-sm"><div className={`grid h-10 w-10 place-items-center rounded-xl ${tones[tone]}`}>{icon}</div><p className="mt-5 text-sm font-medium text-[#627d98]">{label}</p><p className="mt-1 text-2xl font-semibold tracking-[-.03em]">{value}</p><p className="mt-2 text-xs leading-5 text-[#829ab1]">{note}</p></article>;
 }
 
 function StatusPill({ value }: { value: string }) {
