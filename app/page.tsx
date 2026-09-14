@@ -252,6 +252,7 @@ function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
     <section className="mx-auto flex min-h-[calc(100vh-8rem)] max-w-4xl flex-col items-center justify-center text-center">
       <p className="text-sm font-medium text-[#6e6e73]">{city} · AI 自助入住</p>
       <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />本地安全模型 · Qwen3.8-27B（示意） · 敏感字段留在门店节点</div>
+      <div className="mt-2 inline-flex items-center gap-2 rounded-full bg-[#fff8e7] px-3 py-1.5 text-xs text-[#8a6400] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#f5b700]" />PMS 适配器：QloApps 1.6.1 · API Key 临时占位</div>
       <h1 className="mt-5 text-5xl font-semibold tracking-[-.06em] md:text-7xl">{blocked ? "请先处理证件。" : "把身份证放上来。"}</h1>
       <p className="mt-4 text-2xl tracking-[-.03em] text-[#6e6e73] md:text-3xl">剩下的，交给 AI。</p>
       <button onClick={started ? resetDemo : startDemo} aria-label={started ? "重新开始演示" : "模拟放置身份证"} className={`mt-14 grid h-28 w-28 place-items-center rounded-full text-white shadow-[0_20px_50px_rgba(0,0,0,.14)] transition ${started ? "bg-[#007aff]" : "bg-[#1d1d1f] hover:scale-105"}`}>{started ? <Volume2 size={39} /> : <Mic size={39} />}</button>
