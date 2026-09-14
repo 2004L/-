@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { BedDouble, BellRing, Bot, Building2, ChevronRight, CircleCheck, CreditCard, DoorOpen, FileText, KeyRound, Landmark, Mic, MonitorCog, ScanLine, ShieldCheck, Sparkles, UserRoundCheck, Volume2, WalletCards, Wrench } from "lucide-react";
+import { AlertTriangle, BedDouble, BellRing, Bot, Building2, ChevronRight, CircleCheck, CreditCard, DoorOpen, FileText, KeyRound, Landmark, Mic, MonitorCog, ScanLine, ShieldCheck, Sparkles, UserRoundCheck, Volume2, WalletCards, Wrench } from "lucide-react";
 
 type CaseState = "IDENTITY_READ" | "POLICE_REGISTERING" | "POLICE_REGISTERED" | "PAYMENT_SUCCESS" | "ROOM_ASSIGNED" | "CARD_ISSUED" | "IN_HOUSE";
 
@@ -130,22 +130,59 @@ function Node({ icon, title, detail, status }: { icon: React.ReactNode; title: s
   return <div className="flex items-center gap-3 rounded-xl bg-[#f8fbfd] p-4"><div className="rounded-lg bg-white p-2 text-[#1769aa] shadow-sm">{icon}</div><div className="min-w-0 flex-1"><p className="text-sm font-medium">{title}</p><p className="mt-1 truncate text-xs text-[#627d98]">{detail}</p></div><span className="rounded-full bg-[#e7f7f4] px-2 py-1 text-xs text-[#087f73]">{status}</span></div>;
 }
 
+type DemoScenario = "normal" | "leftBehind" | "mismatch";
+
+const TERMINAL_FLOW = [
+  { label: "读卡触发", api: "POST /api/device/id-reader/events", voice: "检测到身份证，请保持证件放置不动，我先确认读卡器状态。" },
+  { label: "身份核验", api: "POST /api/identity/verify", voice: "身份证读取完成，正在为您核对入住订单和实名信息。" },
+  { label: "公安登记", api: "POST /api/public-security/lodging/register", voice: "入住信息核验通过，正在提交公安住宿登记。" },
+  { label: "房间与支付", api: "POST /api/pms/room-lock + /api/payment/authorize", voice: "公安登记已取得回执，正在锁定房间并确认支付。" },
+  { label: "制作房卡", api: "POST /api/doorlock/keycard/issue", voice: "支付和房态已确认，正在为您制作房卡。" },
+  { label: "请取房卡", api: "POST /api/checkin/complete", voice: "入住办理完成，请从发卡机取走您的房卡，祝您入住愉快。" },
+];
+
+type ApiEvent = { step: number; endpoint: string; status: string; detail: string };
+
 function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
-  const flow = [
-    { label: "身份读取", voice: "身份证读取完成，正在为您核对入住订单。" },
-    { label: "信息核验", voice: "入住信息核验完成。" },
-    { label: "分配房间", voice: "已为您分配十二零八房。" },
-    { label: "制作房卡", voice: "正在为您制作房卡，请稍候。" },
-    { label: "请取房卡", voice: "入住办理完成，请从发卡机取走您的房卡，祝您入住愉快。" },
-  ];
+  const flow = TERMINAL_FLOW;
   const [started, setStarted] = useState(false);
   const [flowIndex, setFlowIndex] = useState(-1);
   const [voiceOn, setVoiceOn] = useState(true);
+  const [scenario, setScenario] = useState<DemoScenario>("normal");
+  const [blocked, setBlocked] = useState(false);
+  const [apiEvents, setApiEvents] = useState<ApiEvent[]>([]);
   const active = flowIndex >= 0 ? flow[flowIndex] : null;
   const spoken = active?.voice ?? "您好，请将您的居民身份证放在读卡器上，我将为您自动办理入住。";
+  const blockedReason = scenario === "leftBehind"
+    ? "读卡器仍感应到上一位客人的证件，无法确认当前证件归属。"
+    : "证件姓名与当前订单实名不一致，已暂停自动办理。";
+
+  const riskChecks = scenario === "leftBehind"
+    ? [
+      { label: "读卡器空位确认", detail: "上一张证件仍在感应区", state: "blocked" },
+      { label: "证件 UID 去重", detail: "等待取走后重新读取", state: "pending" },
+      { label: "身份与订单匹配", detail: "尚未执行", state: "pending" },
+    ]
+    : scenario === "mismatch"
+      ? [
+        { label: "读卡器空位确认", detail: "通过 · 感应区已清空", state: "ok" },
+        { label: "证件 UID 去重", detail: "通过 · 本次会话首次出现", state: "ok" },
+        { label: "身份与订单匹配", detail: "姓名不一致，转人工复核", state: "blocked" },
+      ]
+      : [
+        { label: "读卡器空位确认", detail: "通过 · 当前证件已稳定放置", state: "ok" },
+        { label: "证件 UID 去重", detail: "通过 · 未发现遗留或重复证件", state: "ok" },
+        { label: "身份与订单匹配", detail: "通过 · 订单 CI-20260913-0087", state: "ok" },
+      ];
 
   useEffect(() => {
     if (!started || flowIndex < 0) return;
+    if (scenario === "leftBehind" && flowIndex === 0) {
+      setBlocked(true);
+    }
+    if (scenario === "mismatch" && flowIndex === 1) {
+      setBlocked(true);
+    }
     if (voiceOn && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(spoken);
@@ -153,35 +190,77 @@ function VoiceTerminal({ city }: { city: "广州" | "珠海" }) {
       utterance.rate = 1;
       window.speechSynthesis.speak(utterance);
     }
+    setApiEvents((events) => events.some((event) => event.step === flowIndex)
+      ? events
+      : [...events, {
+        step: flowIndex,
+        endpoint: active?.api ?? "POST /api/checkin/session",
+        status: scenario === "mismatch" && flowIndex === 1 ? "409" : "200",
+        detail: scenario === "leftBehind" && flowIndex === 0
+          ? "card.present · readerOccupied=true"
+          : scenario === "mismatch" && flowIndex === 1
+            ? "identity.orderMatch=false · manualReviewRequired=true"
+            : flowIndex === 0
+              ? "card.present · readerOccupied=false"
+              : "accepted · auditId=CI-20260913-0087",
+      }]);
+    if (blocked || (scenario === "leftBehind" && flowIndex === 0) || (scenario === "mismatch" && flowIndex === 1)) return;
     if (flowIndex < flow.length - 1) {
-      const timer = window.setTimeout(() => setFlowIndex((value) => value + 1), 1800);
+      const timer = window.setTimeout(() => setFlowIndex((value) => value + 1), 1000);
       return () => window.clearTimeout(timer);
     }
-  }, [flowIndex, started, voiceOn, spoken, flow.length]);
+  }, [active?.api, blocked, flowIndex, started, voiceOn, spoken, scenario, flow.length]);
 
   function startDemo() {
     setStarted(true);
+    setBlocked(false);
     setFlowIndex(0);
+    setApiEvents([{
+      step: -1,
+      endpoint: "POST /api/checkin/session",
+      status: "201",
+      detail: `session.created · city=${city} · mode=${scenario}`,
+    }]);
   }
 
   function resetDemo() {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     setStarted(false);
+    setBlocked(false);
     setFlowIndex(-1);
+    setApiEvents([]);
+  }
+
+  function resolveRisk() {
+    if (scenario === "leftBehind") {
+      setBlocked(false);
+      setScenario("normal");
+      setApiEvents((events) => [...events, { step: 0.5, endpoint: "POST /api/device/id-reader/clear", status: "200", detail: "readerOccupied=false · previousCardRemoved=true" }]);
+      setFlowIndex(1);
+    } else {
+      setApiEvents((events) => [...events, { step: 1.5, endpoint: "POST /api/manual-review/tasks", status: "202", detail: "人工复核工单已创建 · AI 不代替放行" }]);
+      setBlocked(false);
+      setStarted(false);
+      setFlowIndex(-1);
+    }
   }
 
   return <main className="min-h-screen bg-[#f5f5f7] px-6 py-7 text-[#1d1d1f] md:px-12 md:py-9">
-    <header className="mx-auto flex max-w-6xl items-center justify-between text-sm"><span className="font-semibold tracking-tight">入住</span><button onClick={() => setVoiceOn((value) => !value)} className="inline-flex items-center gap-2 text-[#6e6e73]"><span className={`h-2 w-2 rounded-full ${voiceOn ? "bg-[#30d158]" : "bg-[#a1a1a6]"}`} />{voiceOn ? "语音开启" : "静音"}</button></header>
+    <header className="mx-auto flex max-w-6xl items-center justify-between text-sm"><span className="font-semibold tracking-tight">入住</span><div className="flex items-center gap-4"><div className="hidden items-center gap-1 rounded-full bg-white p-1 shadow-sm sm:flex">{(["normal", "leftBehind", "mismatch"] as DemoScenario[]).map((item) => <button key={item} onClick={() => { setScenario(item); resetDemo(); }} className={`rounded-full px-3 py-1.5 text-xs ${scenario === item ? "bg-[#1d1d1f] text-white" : "text-[#6e6e73]"}`}>{item === "normal" ? "正常流程" : item === "leftBehind" ? "遗留证件" : "信息不一致"}</button>)}</div><button onClick={() => setVoiceOn((value) => !value)} className="inline-flex items-center gap-2 text-[#6e6e73]"><span className={`h-2 w-2 rounded-full ${voiceOn ? "bg-[#30d158]" : "bg-[#a1a1a6]"}`} />{voiceOn ? "语音开启" : "静音"}</button></div></header>
     <section className="mx-auto flex min-h-[calc(100vh-8rem)] max-w-4xl flex-col items-center justify-center text-center">
       <p className="text-sm font-medium text-[#6e6e73]">{city} · AI 自助入住</p>
-      <h1 className="mt-5 text-5xl font-semibold tracking-[-.06em] md:text-7xl">把身份证放上来。</h1>
+      <h1 className="mt-5 text-5xl font-semibold tracking-[-.06em] md:text-7xl">{blocked ? "请先处理证件。" : "把身份证放上来。"}</h1>
       <p className="mt-4 text-2xl tracking-[-.03em] text-[#6e6e73] md:text-3xl">剩下的，交给 AI。</p>
       <button onClick={started ? resetDemo : startDemo} aria-label={started ? "重新开始演示" : "模拟放置身份证"} className={`mt-14 grid h-28 w-28 place-items-center rounded-full text-white shadow-[0_20px_50px_rgba(0,0,0,.14)] transition ${started ? "bg-[#007aff]" : "bg-[#1d1d1f] hover:scale-105"}`}>{started ? <Volume2 size={39} /> : <Mic size={39} />}</button>
-      <p className="mt-6 text-lg font-medium">{started ? "AI 正在为您办理" : "点按开始语音演示"}</p>
+      <p className="mt-6 text-lg font-medium">{blocked ? blockedReason : started ? "AI 正在为您办理" : "点按开始，模拟感应到身份证"}</p>
       <p className="mt-3 max-w-xl text-lg leading-8 text-[#6e6e73]">“{spoken}”</p>
       <div className="mt-10 flex h-8 items-center justify-center gap-1" aria-label="语音播放状态">{[13, 22, 30, 19, 35, 24, 14, 28, 18].map((height, index) => <span key={index} className={`w-1 rounded-full bg-[#007aff] ${started ? "animate-pulse" : "opacity-30"}`} style={{ height: `${height}px`, animationDelay: `${index * 90}ms` }} />)}</div>
       <div className="mt-14 flex max-w-full items-start justify-center gap-0 overflow-x-auto px-2 pb-2">{flow.map((item, index) => { const complete = flowIndex > index; const current = flowIndex === index; return <div key={item.label} className="flex items-center"><div className="w-20 text-center sm:w-28"><div className={`mx-auto grid h-7 w-7 place-items-center rounded-full text-xs ${complete ? "bg-[#1d1d1f] text-white" : current ? "bg-[#007aff] text-white" : "bg-[#d2d2d7] text-[#6e6e73]"}`}>{complete ? <CircleCheck size={15} /> : index + 1}</div><p className={`mt-3 whitespace-nowrap text-xs ${current || complete ? "font-medium text-[#1d1d1f]" : "text-[#86868b]"}`}>{item.label}</p></div>{index < flow.length - 1 && <span className={`mb-6 h-px w-8 sm:w-14 ${complete ? "bg-[#1d1d1f]" : "bg-[#d2d2d7]"}`} />}</div>})}</div>
+      <div className="mt-9 grid w-full gap-4 text-left md:grid-cols-[1.1fr_.9fr]">
+        <section className="rounded-2xl border border-[#e1e1e6] bg-white/80 p-4 shadow-sm"><div className="flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">后台接口</p><p className="mt-1 text-sm font-medium">每一步都有可追踪的事件</p></div><span className="rounded-full bg-[#e8f7ee] px-2.5 py-1 text-xs text-[#248a4d]">模拟实时</span></div><div className="mt-3 space-y-2">{(apiEvents.length ? apiEvents.slice(-3) : [{ step: -1, endpoint: "等待身份证事件", status: "—", detail: "检测到 card.present 后自动开始" }]).map((event, index) => <div key={`${event.endpoint}-${index}`} className="rounded-xl bg-[#f6f6f8] px-3 py-2.5"><div className="flex items-center justify-between gap-3"><span className="truncate font-mono text-[11px] text-[#5f5f66]">{event.endpoint}</span><span className={`font-mono text-[11px] ${event.status === "200" || event.status === "201" ? "text-[#248a4d]" : event.status === "409" ? "text-[#d04a00]" : "text-[#86868b]"}`}>{event.status}</span></div><p className="mt-1 truncate text-xs text-[#86868b]">{event.detail}</p></div>)}</div></section>
+        <section className={`rounded-2xl border p-4 shadow-sm ${blocked ? "border-[#f1c7b5] bg-[#fff8f4]" : "border-[#e1e1e6] bg-white/80"}`}><div className="flex items-center gap-2"><div className={`rounded-lg p-1.5 ${blocked ? "bg-[#ffe4d6] text-[#c54b12]" : "bg-[#e8f7ee] text-[#248a4d]"}`}>{blocked ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}</div><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">风险核验</p><p className="mt-1 text-sm font-medium">先核验，再放行</p></div></div><div className="mt-3 space-y-2">{riskChecks.map((check) => <div key={check.label} className="flex items-center gap-2 text-xs"><span className={`h-2 w-2 rounded-full ${check.state === "ok" ? "bg-[#30d158]" : check.state === "blocked" ? "bg-[#ff6b35]" : "bg-[#c7c7cc]"}`} /><span className="font-medium">{check.label}</span><span className="truncate text-[#86868b]">{check.detail}</span></div>)}</div>{blocked && <button onClick={resolveRisk} className="mt-3 w-full rounded-xl bg-[#1d1d1f] px-3 py-2.5 text-sm font-medium text-white">{scenario === "leftBehind" ? "确认已取走上一张证件" : "创建人工复核工单"}</button>}</section>
+      </div>
     </section>
-    <p className="mx-auto max-w-4xl text-center text-xs text-[#86868b]">演示模式：语音、身份读取、登记、支付、分房与发卡均为模拟。</p>
+    <p className="mx-auto max-w-4xl text-center text-xs text-[#86868b]">演示模式：接口、公安浏览器、支付、PMS 与发卡均为模拟；真实环境由固定业务规则和人工兜底决定是否放行。</p>
   </main>;
 }
