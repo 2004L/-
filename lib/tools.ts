@@ -1,0 +1,52 @@
+import { z } from "zod";
+
+export const toolNames = [
+  "pms.search_order",
+  "pms.create_walk_in",
+  "hotel.policy_answer",
+  "device.reader.read_identity",
+  "device.encoder.issue_keycard",
+  "device.encoder.read_status",
+  "police.submit_registration",
+] as const;
+export const toolNameSchema = z.enum(toolNames);
+
+export const agentMessageSchema = z.object({
+  role: z.enum(["user", "assistant", "tool"]),
+  content: z.string().min(1).max(2000),
+});
+
+export const agentTurnSchema = z.object({
+  session_id: z.string().regex(/^[a-zA-Z0-9_-]{8,80}$/),
+  messages: z.array(agentMessageSchema).min(1).max(30),
+  case_id: z.string().min(8).max(80).optional(),
+}).strict();
+
+export type ToolName = (typeof toolNames)[number];
+export type ToolCall = { type: "tool_call"; tool_call_id: string; tool_name: ToolName; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string };
+export type Clarification = { type: "clarification"; message: string; intent: string; confidence: number };
+
+const last4 = (text: string) => {
+  const digits = text.replace(/\D/g, "");
+  return digits.length >= 4 ? digits.slice(-4) : null;
+};
+
+export function routeIntent(text: string, context?: { case_id?: string }): ToolCall | Clarification {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  const phoneLast4 = last4(normalized);
+  if (/(我老婆|我老公|朋友|同事).*手机号/.test(normalized)) return { type: "clarification", message: "我需要确认具体是哪位客人的预订，请说预订手机号后四位。", intent: "query_reservation", confidence: 0.96 };
+  if (/(早餐|早饭|停车|停车场|押金|微信|支付宝|退房|入住时间)/.test(normalized)) {
+    const topic = /早餐|早饭/.test(normalized) ? "breakfast" : /停车/.test(normalized) ? "parking" : /押金|微信|支付宝/.test(normalized) ? "payment" : "checkout";
+    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "hotel.policy_answer", arguments: { topic }, implementation: "business_api", response_hint: "将读取当前门店政策后回答，不会修改订单或金额。" };
+  }
+  if (/(房卡|门卡).*(状态|进度|没出|没拿到)/.test(normalized)) return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "device.encoder.read_status", arguments: { case_id: context?.case_id ?? null }, implementation: "simulator", response_hint: "将查询发卡机仿真状态，不会重复发卡。" };
+  if (/(读身份证|读取身份证|身份证放|证件放)/.test(normalized)) {
+    if (!context?.case_id) return { type: "clarification", message: "请先告诉我预订手机号后四位，我确认订单后再读取身份证。", intent: "identity_read", confidence: 0.94 };
+    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "device.reader.read_identity", arguments: { case_id: context.case_id, expected_state: "IDENTITY_READING" }, implementation: "simulator", response_hint: "已切换到读卡器仿真接口，读到的是演示身份 Token。" };
+  }
+  if (phoneLast4 || /(预订|订了|订单|入住|住店|美团|抖音|携程|官网)/.test(normalized)) {
+    if (!phoneLast4) return { type: "clarification", message: "可以，请告诉我预订手机号后四位，直接说四个数字就行。", intent: "query_reservation", confidence: 0.91 };
+    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "pms.search_order", arguments: { phone_last4: phoneLast4 }, implementation: "business_api", response_hint: "将按手机号后四位查询订单；命中多笔时会转人工。" };
+  }
+  return { type: "clarification", message: "我可以帮您查订单、办理入住，或者回答早餐、停车、押金和退房问题。", intent: "general_assistance", confidence: 0.72 };
+}

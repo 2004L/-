@@ -109,6 +109,8 @@ type IntentResponse = Partial<MatchResponse> & {
   assistantMessage: string;
 };
 
+type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number };
+
 type RecognitionResultEvent = { results: { 0: { 0: { transcript: string } } } };
 type RecognitionLike = {
   lang: string;
@@ -173,6 +175,13 @@ async function postDemo<T>(action: string, body: Record<string, unknown>): Promi
   });
   const data = (await response.json()) as T & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "request_failed");
+  return data;
+}
+
+async function postAgent<T>(body: Record<string, unknown>): Promise<T> {
+  const response = await fetch("/api/agent/turn", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = (await response.json()) as T;
+  if (!response.ok) throw new Error("agent_turn_failed");
   return data;
 }
 
@@ -369,9 +378,44 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setPhase("searching");
     setMessage("正在理解您的意思");
     try {
-      const result = await postDemo<IntentResponse>("interpret", { session_id: sessionId, utterance: normalized });
-      setIntentTrace({ label: result.label, confidence: result.confidence, action: result.action });
-      if (result.phone_last4) setLast4(result.phone_last4);
+      const agent = await postAgent<AgentResponse>({ session_id: sessionId, case_id: checkinCase?.id, messages: [{ role: "user", content: normalized }] });
+      if (agent.type === "clarification") {
+        setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
+        setPhase("idle");
+        setMessage(agent.message);
+        speak(agent.message, voiceEnabled);
+        return;
+      }
+      const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
+      setIntentTrace({ label: toolLabel, confidence: 0.96, action: agent.tool_name });
+      let result: IntentResponse;
+      if (agent.tool_name === "pms.search_order") {
+        const phoneLast4 = String(agent.arguments.phone_last4 ?? "");
+        setLast4(phoneLast4);
+        result = await postDemo<IntentResponse>("interpret", { session_id: sessionId, utterance: normalized });
+      } else if (agent.tool_name === "hotel.policy_answer") {
+        const topic = String(agent.arguments.topic ?? "");
+        const answer = topic === "breakfast" ? "早餐时间是早上七点到十点。" : topic === "parking" ? "酒店提供停车服务，具体位置和费用以门店政策为准。" : topic === "payment" ? "押金和支付方式以当前酒店政策为准，AI 不会自行修改金额。" : "退房时间以订单和门店政策为准，如需延迟退房我会先查询房态。";
+        setPhase("idle");
+        setMessage(answer);
+        speak(answer, voiceEnabled);
+        await onRefresh();
+        return;
+      } else if (agent.tool_name === "device.encoder.read_status") {
+        const answer = checkinCase ? `当前办理状态是 ${checkinCase.status}，发卡机状态是 ${checkinCase.hardware_status}。我只查询状态，不会重复发卡。` : "目前没有正在办理的入住任务。";
+        setPhase("idle");
+        setMessage(answer);
+        speak(answer, voiceEnabled);
+        return;
+      } else if (agent.tool_name === "device.reader.read_identity" && checkinCase) {
+        await postSimulator("/api/device/reader", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `reader:${checkinCase.id}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" });
+        setPhase("matched");
+        setMessage("身份证已读取，结果已交给业务流程继续核验。");
+        speak("身份证已读取，正在继续核验。", voiceEnabled);
+        return;
+      } else {
+        throw new Error("unsupported_tool");
+      }
       if (result.outcome === "matched" && result.order && result.checkinCase) {
         setMatchedOrder(result.order);
         setCheckinCase(result.checkinCase);

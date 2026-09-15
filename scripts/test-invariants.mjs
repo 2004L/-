@@ -14,6 +14,7 @@ if (demo.includes("console.log(body") || demo.includes("console.error(body")) th
 const forbidden = [];
 function walk(dir) {
   for (const entry of readdirSync(dir)) {
+    if (["node_modules", "dist", ".git", ".wrangler", ".next"].includes(entry)) continue;
     const file = join(dir, entry);
     if (statSync(file).isDirectory()) walk(file);
     else if (/\.(ts|tsx|mjs|md|jsonl)$/.test(entry) && !file.includes("node_modules") && !file.includes("dist")) {

@@ -148,6 +148,7 @@ PMS_API_KEY=TEMP_PMS_API_KEY_REPLACE_ME
 - `app/page.tsx`：语音终端、适配器首次配置和管理后台界面。
 - `app/api/pms/[operation]/route.ts`：PMS 模拟 API。
 - `app/api/demo/[action]/route.ts`：数据库演示 API、状态机与审计入口。
+- `app/api/agent/turn`、`lib/tools.ts`：AI Native 意图路由与工具契约；模型只产生受控 `tool_call`，订单和硬件动作由业务接口/仿真器执行。
 - `app/api/device/reader`、`app/api/device/encoder`、`app/api/police/submit`：第一阶段的外部系统仿真器，支持故障注入与人工接管。
 - `app/api/simulator/faults`：管理后台使用的故障开关；故障会落到命令、人工任务和审计记录。
 - `db/schema.ts`：D1/SQLite 表结构；`drizzle/` 保存追加式迁移。
