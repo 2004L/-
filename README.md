@@ -101,6 +101,17 @@ LLM_API_KEY=TEMP_LLM_API_KEY_REPLACE_ME
 
 `LLM_API_KEY` 只能放在本地环境变量或托管平台密钥管理中，不能写进源码、README、GitHub Issue 或聊天记录。你刚才贴出的 Key 已经暴露，建议先撤销并重新生成，再用新 Key 做测试。官方 OpenAI 快速入门也建议把 API Key 放到环境变量中，而不是写在代码里。[Developer quickstart](https://platform.openai.com/docs/quickstart/make-your-first-api-request)
 
+## 本地开源语音输入
+
+语音终端现在优先连接本地 Qwen3-ASR-0.6B WebSocket 服务，识别音频留在门店设备或局域网的 3090 主机上；本地服务未启动、浏览器阻止连接或识别失败时，自动退回浏览器原生语音识别。Qwen3-ASR 官方发布 0.6B/1.7B 模型，支持中文、粤语和多种方言，代码与权重仓库采用 Apache License 2.0，但分发时仍需保留许可证和版权说明。[官方仓库](https://github.com/QwenLM/Qwen3-ASR)
+
+```text
+自助机麦克风 → 本地 Qwen3-ASR WebSocket → 脱敏文字 → /api/agent/turn → 受控业务工具
+                         └─ 不可用时 → 浏览器原生语音识别备用
+```
+
+本地服务的安装和消息约定见 [`services/asr/README.md`](services/asr/README.md)。在线托管站不能直接运行 3090 模型；部署到自助机时，在首次适配页面填写本地 ASR WebSocket 地址。HTTPS 页面应使用 WSS 和可信证书，避免浏览器拦截不安全的 `ws://` 连接。服务不记录音频、完整手机号或身份证号。
+
 酒店、房型和房间编码仅作演示，建议在管理后台按实际 PMS 主数据映射，例如：
 
 | 字段 | 示例 | 说明 |
@@ -171,6 +182,7 @@ LLM_API_KEY=TEMP_LLM_API_KEY_REPLACE_ME
 - `docs/pms-integration.md`：PMS 适配与真实接入注意事项。
 - `docs/hardware-integration.md`：身份证读卡器、门锁编码器和自动发卡机的接口、安全状态机与验收要求。
 - `docs/model-resource-benchmark.md`：大模型、语音、RAG、GPU 与完整入住压测量化方案。
+- `services/asr/`：本地 Qwen3-ASR-0.6B WebSocket 语音识别服务及启动说明。
 - `docs/ai-native-value-framework.md`：AI Native 意图层、动作安全边界与收益、人力、响应、合规四条价值线。
 - `.openai/hosting.json`：当前在线演示站点的项目绑定和存储配置，不包含业务 API Key；迁移托管平台后才能连同相关构建配置一起删除。
 - `components/`：可复用 UI 组件。

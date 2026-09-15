@@ -31,6 +31,7 @@ type AdapterConfig = {
   version: string;
   baseUrl: string;
   apiKey: string;
+  asrWsUrl: string;
   propertyCode: string;
   hotelName: string;
 };
@@ -124,11 +125,21 @@ type RecognitionLike = {
 };
 type RecognitionConstructor = new () => RecognitionLike;
 
+type AsrSocketMessage = {
+  type: "ready" | "result" | "error";
+  text?: string;
+  language?: string;
+  latency_ms?: number;
+  code?: string;
+  message?: string;
+};
+
 const DEFAULT_ADAPTER: AdapterConfig = {
   provider: "QloApps",
   version: "1.6.1",
   baseUrl: "https://pms.example.local/api",
   apiKey: "TEMP_PMS_API_KEY_REPLACE_ME",
+  asrWsUrl: "ws://127.0.0.1:8765/asr",
   propertyCode: "GZ-HAOS-001",
   hotelName: "Hotel Agent OS 广州示范店",
 };
@@ -223,7 +234,7 @@ export default function Home() {
       setSessionId(storedSession);
       if (storedAdapter) {
         try {
-          setAdapter(JSON.parse(storedAdapter) as AdapterConfig);
+          setAdapter({ ...DEFAULT_ADAPTER, ...(JSON.parse(storedAdapter) as Partial<AdapterConfig>) });
         } catch {
           localStorage.removeItem("hotel_adapter_config");
         }
@@ -299,6 +310,7 @@ function AdapterWizard({ initial, onComplete }: { initial: AdapterConfig; onComp
           <Field label="酒店编码" value={draft.propertyCode} onChange={(value) => update("propertyCode", value)} />
           <Field label="酒店名称" value={draft.hotelName} onChange={(value) => update("hotelName", value)} />
           <Field label="API Key（临时占位）" value={draft.apiKey} onChange={(value) => update("apiKey", value)} wide secret />
+          <Field label="本地 ASR WebSocket 地址" value={draft.asrWsUrl} onChange={(value) => update("asrWsUrl", value)} wide />
         </div><div className="mt-7 flex flex-wrap gap-3"><button onClick={testAdapter} disabled={testing} className="rounded-full border border-[#d2d2d7] px-5 py-3 text-sm font-medium disabled:opacity-50">{testing ? "检测中…" : tested ? "五项接口已通过" : "检测适配器"}</button><button onClick={() => onComplete(draft)} className="rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white">进入演示系统</button></div></section>
         <aside className="rounded-[2rem] bg-[#1d1d1f] p-7 text-white md:p-9"><ShieldCheck size={27} className="text-[#64d2ff]" /><h2 className="mt-8 text-2xl font-semibold tracking-[-.03em]">先演示，后接生产。</h2><div className="mt-6 space-y-5 text-sm leading-6 text-[#c7c7cc]"><p>当前 API Key 明确标记为临时占位，不会调用真实 PMS。</p><p>假订单按浏览器会话隔离，敏感身份字段不进入 AI 上下文。</p><p>公安浏览器和房卡硬件只展示受控流程，不执行真实外部操作。</p></div></aside>
       </div>
@@ -326,7 +338,15 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [message, setMessage] = useState("您好，今天想办理什么？");
   const [intentTrace, setIntentTrace] = useState<Pick<IntentResponse, "label" | "confidence" | "action"> | null>(null);
   const [flowStep, setFlowStep] = useState(0);
+  const [voiceBackend, setVoiceBackend] = useState<"local" | "browser" | null>(null);
   const recognitionRef = useRef<RecognitionLike | null>(null);
+  const asrSocketRef = useRef<WebSocket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const silenceTimerRef = useRef<number | null>(null);
+  const speechStartedAtRef = useRef(0);
+  const localAsrResultRef = useRef(false);
 
   const activeMessage = useMemo(() => {
     if (phase === "complete") return "入住完成，请带好身份证和房卡";
@@ -335,7 +355,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   }, [flowStep, message, phase]);
 
   function reset() {
-    recognitionRef.current?.stop();
+    stopListening();
     setLast4("");
     setUtterance("");
     setPhase("idle");
@@ -348,13 +368,39 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     speak("您好，今天想办理什么？您可以直接说。", voiceEnabled);
   }
 
-  function startListening() {
+  function stopListening() {
+    recognitionRef.current?.stop();
+    recognitionRef.current = null;
+    if (silenceTimerRef.current !== null) window.clearInterval(silenceTimerRef.current);
+    silenceTimerRef.current = null;
+    audioContextRef.current?.close().catch(() => undefined);
+    audioContextRef.current = null;
+    const recorder = mediaRecorderRef.current;
+    const socket = asrSocketRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.onstop = () => {
+        if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
+      };
+      recorder.stop();
+    } else if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "stop" }));
+    }
+    mediaRecorderRef.current = null;
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    asrSocketRef.current = null;
+    setListening(false);
+  }
+
+  function startBrowserRecognition() {
     const browserWindow = window as Window & { SpeechRecognition?: RecognitionConstructor; webkitSpeechRecognition?: RecognitionConstructor };
     const Constructor = browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition;
     if (!Constructor) {
       setMessage("当前浏览器不支持语音识别，您可以直接打字告诉我");
+      setListening(false);
       return;
     }
+    setVoiceBackend("browser");
     const recognition = new Constructor();
     recognition.lang = "zh-CN";
     recognition.interimResults = false;
@@ -370,6 +416,93 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setListening(true);
     setMessage("我在听，您直接说就好");
     recognition.start();
+  }
+
+  async function startLocalRecognition() {
+    if (!adapter.asrWsUrl || typeof WebSocket === "undefined" || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") throw new Error("local_asr_unavailable");
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    mediaStreamRef.current = stream;
+    const socket = new WebSocket(adapter.asrWsUrl);
+    const opened = new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(() => reject(new Error("local_asr_timeout")), 1400);
+      socket.onopen = () => { window.clearTimeout(timer); resolve(); };
+      socket.onerror = () => { window.clearTimeout(timer); reject(new Error("local_asr_socket_error")); };
+    });
+    try {
+      await opened;
+    } catch (error) {
+      socket.close();
+      throw error;
+    }
+    asrSocketRef.current = socket;
+    localAsrResultRef.current = false;
+    setVoiceBackend("local");
+    setListening(true);
+    setMessage("本地语音识别已连接，您直接说就好");
+    socket.send(JSON.stringify({ type: "start", language: "Chinese", sample_rate: 16000 }));
+    const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"].find((value) => MediaRecorder.isTypeSupported(value)) ?? "";
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    mediaRecorderRef.current = recorder;
+    recorder.ondataavailable = (event) => {
+      if (event.data.size && socket.readyState === WebSocket.OPEN) void event.data.arrayBuffer().then((buffer) => socket.send(buffer));
+    };
+    recorder.onerror = () => {
+      if (!localAsrResultRef.current) {
+        setMessage("本地识别暂时不可用，请再说一次");
+        stopListening();
+      }
+    };
+    socket.onmessage = (event) => {
+      let payload: AsrSocketMessage;
+      try { payload = JSON.parse(String(event.data)) as AsrSocketMessage; } catch { return; }
+      if (payload.type === "result" && payload.text?.trim()) {
+        localAsrResultRef.current = true;
+        const transcript = payload.text.trim();
+        setUtterance(transcript);
+        stopListening();
+        void submitUtterance(transcript);
+      } else if (payload.type === "error") {
+        setMessage(payload.message || "本地语音识别失败，请再说一次");
+        stopListening();
+      }
+    };
+    socket.onclose = () => {
+      if (!localAsrResultRef.current && mediaRecorderRef.current) setMessage("本地识别服务已断开，请再说一次");
+    };
+    recorder.start(250);
+    speechStartedAtRef.current = Date.now();
+    const audioContext = new AudioContext();
+    audioContextRef.current = audioContext;
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 512;
+    audioContext.createMediaStreamSource(stream).connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    let quietSince = 0;
+    silenceTimerRef.current = window.setInterval(() => {
+      analyser.getByteTimeDomainData(samples);
+      let energy = 0;
+      for (const sample of samples) energy += Math.abs(sample - 128);
+      const quiet = energy / samples.length < 2.2;
+      if (Date.now() - speechStartedAtRef.current < 700) return;
+      if (quiet) quietSince ||= Date.now(); else quietSince = 0;
+      if (quietSince && Date.now() - quietSince > 1000) stopListening();
+    }, 120);
+  }
+
+  async function startListening() {
+    if (listening) {
+      stopListening();
+      return;
+    }
+    setListening(true);
+    setMessage("正在连接本地语音识别…");
+    try {
+      await startLocalRecognition();
+    } catch {
+      stopListening();
+      setMessage("本地识别未连接，已切换浏览器识别");
+      startBrowserRecognition();
+    }
   }
 
   async function submitUtterance(value = utterance) {
@@ -534,7 +667,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">{activeMessage}</h1>
       <p className="mt-4 text-base text-[#86868b]">系统理解您的意图，再由受控业务接口完成动作。</p>
 
-      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={listening || phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label="开始语音交互">{listening ? <LoaderCircle size={19} className="animate-spin text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={!utterance.trim() || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label="发送"><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching"} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
+      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "停止语音交互" : "开始语音交互"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={!utterance.trim() || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label="发送"><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching"} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 语音只在本机处理" : voiceBackend === "browser" ? "浏览器语音识别备用通道" : "本地 ASR 优先 · 浏览器识别备用"}</p>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
 
       {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
 
