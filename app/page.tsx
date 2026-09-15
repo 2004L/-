@@ -114,13 +114,17 @@ type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: strin
 type AgentHistoryMessage = { role: "user" | "assistant" | "tool"; content: string };
 type TranscriptEntry = { id: string; role: "user" | "assistant" | "tool"; content: string };
 
-type RecognitionResultEvent = { results: { 0: { 0: { transcript: string } } } };
+type RecognitionResultEvent = {
+  resultIndex?: number;
+  results: ArrayLike<{ isFinal?: boolean; 0: { transcript: string } }>;
+};
 type RecognitionLike = {
   lang: string;
   interimResults: boolean;
   continuous: boolean;
   start: () => void;
   stop: () => void;
+  abort?: () => void;
   onresult: ((event: RecognitionResultEvent) => void) | null;
   onerror: (() => void) | null;
   onend: (() => void) | null;
@@ -533,10 +537,12 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const asrSocketRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const silenceTimerRef = useRef<number | null>(null);
-  const speechStartedAtRef = useRef(0);
   const localAsrResultRef = useRef(false);
+  const voiceSubmitRequestedRef = useRef(false);
+  const browserFinalTranscriptRef = useRef("");
+  const browserInterimTranscriptRef = useRef("");
+  const submitInFlightRef = useRef<string | null>(null);
   const conversationRef = useRef<AgentHistoryMessage[]>([]);
   const conversationGenerationRef = useRef(0);
 
@@ -581,13 +587,57 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "tool", content: `已开启新的业务对话：${reason}。上一位客人的对话不会用于本次办理。` }].slice(-40));
   }
 
-  function stopListening() {
-    recognitionRef.current?.stop();
-    recognitionRef.current = null;
-    if (silenceTimerRef.current !== null) window.clearInterval(silenceTimerRef.current);
+  function clearVoiceTimer() {
+    if (silenceTimerRef.current !== null) window.clearTimeout(silenceTimerRef.current);
     silenceTimerRef.current = null;
-    audioContextRef.current?.close().catch(() => undefined);
-    audioContextRef.current = null;
+  }
+
+  function releaseVoiceResources(closeSocket = true) {
+    clearVoiceTimer();
+    recognitionRef.current?.abort?.();
+    recognitionRef.current = null;
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    mediaRecorderRef.current = null;
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    const socket = asrSocketRef.current;
+    if (closeSocket && socket && socket.readyState === WebSocket.OPEN) socket.close();
+    if (closeSocket) asrSocketRef.current = null;
+    setListening(false);
+  }
+
+  function stopListening() {
+    voiceSubmitRequestedRef.current = false;
+    releaseVoiceResources(true);
+  }
+
+  function finishBrowserSubmission() {
+    const finalText = [browserFinalTranscriptRef.current, browserInterimTranscriptRef.current].filter(Boolean).join(" ").trim();
+    if (finalText) setUtterance(finalText);
+    voiceSubmitRequestedRef.current = false;
+    releaseVoiceResources(true);
+    if (finalText) void submitUtterance(finalText);
+    else setMessage("没有听清内容，请再说一次，或直接输入文字");
+  }
+
+  function finishListeningAndSubmit() {
+    if (!listening) {
+      if (utterance.trim()) void submitUtterance();
+      return;
+    }
+    voiceSubmitRequestedRef.current = true;
+    setMessage("正在整理语音内容，请稍候…");
+    if (voiceBackend === "browser") {
+      const recognition = recognitionRef.current;
+      if (recognition) {
+        recognition.onend = finishBrowserSubmission;
+        recognition.stop();
+      } else {
+        finishBrowserSubmission();
+      }
+      return;
+    }
     const recorder = mediaRecorderRef.current;
     const socket = asrSocketRef.current;
     if (recorder && recorder.state !== "inactive") {
@@ -597,11 +647,12 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       recorder.stop();
     } else if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "stop" }));
+    } else {
+      releaseVoiceResources(true);
+      setMessage("本地语音服务没有返回结果，请重试或直接输入文字");
     }
-    mediaRecorderRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
-    asrSocketRef.current = null;
     setListening(false);
   }
 
@@ -614,17 +665,36 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       return;
     }
     setVoiceBackend("browser");
+    browserFinalTranscriptRef.current = "";
+    browserInterimTranscriptRef.current = "";
     const recognition = new Constructor();
     recognition.lang = "zh-CN";
-    recognition.interimResults = false;
-    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.continuous = true;
     recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript.trim();
-      setUtterance(transcript);
-      void submitUtterance(transcript);
+      const finalParts: string[] = [];
+      const interimParts: string[] = [];
+      for (let index = 0; index < event.results.length; index += 1) {
+        const text = event.results[index]?.[0]?.transcript?.trim();
+        if (!text) continue;
+        if (event.results[index]?.isFinal) finalParts.push(text);
+        else interimParts.push(text);
+      }
+      browserFinalTranscriptRef.current = finalParts.join(" ").trim();
+      browserInterimTranscriptRef.current = interimParts.join(" ").trim();
+      const combined = [browserFinalTranscriptRef.current, browserInterimTranscriptRef.current].filter(Boolean).join(" ").trim();
+      if (combined) setUtterance(combined);
     };
-    recognition.onerror = () => setMessage("没有听清，您可以换一种说法或直接输入");
-    recognition.onend = () => setListening(false);
+    recognition.onerror = () => {
+      if (voiceSubmitRequestedRef.current) finishBrowserSubmission();
+      else setMessage("没有听清，您可以继续说，或改用文字输入");
+    };
+    recognition.onend = () => {
+      if (voiceSubmitRequestedRef.current) finishBrowserSubmission();
+      else if (recognitionRef.current === recognition) {
+        try { recognition.start(); } catch { setMessage("语音通道已结束，请点击发送或重新开始"); }
+      }
+    };
     recognitionRef.current = recognition;
     setListening(true);
     setMessage("我在听，您直接说就好");
@@ -675,8 +745,13 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         localAsrResultRef.current = true;
         const transcript = payload.text.trim();
         setUtterance(transcript);
-        stopListening();
-        void submitUtterance(transcript);
+        releaseVoiceResources(true);
+        if (voiceSubmitRequestedRef.current) {
+          voiceSubmitRequestedRef.current = false;
+          void submitUtterance(transcript);
+        } else {
+          setMessage("语音已整理完成，确认无误后点击发送");
+        }
       } else if (payload.type === "error") {
         setMessage(payload.message || "本地语音识别失败，请再说一次");
         stopListening();
@@ -686,37 +761,25 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       if (!localAsrResultRef.current && mediaRecorderRef.current) setMessage("本地识别服务已断开，请再说一次");
     };
     recorder.start(250);
-    speechStartedAtRef.current = Date.now();
-    const AudioContextConstructor = window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    let analyserStarted = false;
-    if (AudioContextConstructor) {
-      try {
-        const audioContext = new AudioContextConstructor();
-        audioContextRef.current = audioContext;
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 512;
-        audioContext.createMediaStreamSource(stream).connect(analyser);
-        const samples = new Uint8Array(analyser.fftSize);
-        let quietSince = 0;
-        silenceTimerRef.current = window.setInterval(() => {
-          analyser.getByteTimeDomainData(samples);
-          let energy = 0;
-          for (const sample of samples) energy += Math.abs(sample - 128);
-          const quiet = energy / samples.length < 2.2;
-          if (Date.now() - speechStartedAtRef.current < 700) return;
-          if (quiet) quietSince ||= Date.now(); else quietSince = 0;
-          if (quietSince && Date.now() - quietSince > 1000) stopListening();
-        }, 120);
-        analyserStarted = true;
-      } catch {
-        audioContextRef.current?.close().catch(() => undefined);
-        audioContextRef.current = null;
+    // 不因短暂安静而中断；仅保留 2 分钟安全上限，避免浏览器长期占用麦克风。
+    silenceTimerRef.current = window.setTimeout(() => {
+      if (!voiceSubmitRequestedRef.current && mediaRecorderRef.current) {
+        const recorder = mediaRecorderRef.current;
+        const socket = asrSocketRef.current;
+        if (recorder.state !== "inactive") {
+          recorder.onstop = () => {
+            if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
+          };
+          recorder.stop();
+        } else if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "stop" }));
+        }
+        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+        setListening(false);
+        setMessage("录音已达到 2 分钟上限，内容已整理，请点击发送");
       }
-    }
-    if (!analyserStarted) {
-      // 部分内置浏览器没有或禁用了 AudioContext，仍可录音；达到最长时长后安全收尾。
-      silenceTimerRef.current = window.setTimeout(() => stopListening(), 8000);
-    }
+    }, 120000);
   }
 
   async function startListening() {
@@ -753,6 +816,12 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   async function submitUtterance(value = utterance) {
     const normalized = value.trim();
     if (!normalized) return;
+    if (/^(嗯+|啊+|呃+|额+|唉+|哦+)[。！!？?，,、\s]*$/u.test(normalized)) {
+      setMessage("我只听到一声回应，请把要办理的事情完整说出来，或直接输入文字");
+      return;
+    }
+    if (submitInFlightRef.current === normalized) return;
+    submitInFlightRef.current = normalized;
     const generation = conversationGenerationRef.current;
     setPhase("searching");
     setMessage("正在理解您的意思");
@@ -849,6 +918,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     } catch {
       setPhase("error");
       setMessage("暂时没有理解成功，您的输入已保留，请稍后重试");
+    } finally {
+      if (submitInFlightRef.current === normalized) submitInFlightRef.current = null;
     }
   }
 
@@ -999,7 +1070,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">{activeMessage}</h1>
       <p className="mt-4 text-base text-[#86868b]">系统理解您的意图，再由受控业务接口完成动作。</p>
 
-      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "停止语音交互" : "开始语音交互"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={!utterance.trim() || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label="发送"><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching"} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 语音只在本机处理" : voiceBackend === "browser" ? "浏览器语音识别备用通道" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 浏览器识别备用"}</p>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
+      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "取消语音输入" : "开始语音输入"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 说完后点击发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 说完后点击发送" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 浏览器识别备用 · 说完后点击发送"}</p>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
 
       {transcript.length > 0 && <section className="mt-8 w-full max-w-2xl rounded-[2rem] bg-white p-5 text-left shadow-sm"><div className="flex items-center justify-between"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">完整对话记录</p><span className="text-xs text-[#a1a1a6]">本次会话 · {transcript.length} 条</span></div><div className="mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">{transcript.map((entry) => <div key={entry.id} className={`whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${entry.role === "user" ? "ml-8 bg-[#eaf4ff] text-[#174a72]" : entry.role === "tool" ? "mr-8 bg-[#f5f5f7] text-[#6e6e73]" : "mr-8 bg-[#eefaf2] text-[#245d38]"}`}><p className="mb-1 text-[10px] uppercase tracking-[.14em] opacity-60">{entry.role === "user" ? "您" : entry.role === "tool" ? "系统动作" : "AI"}</p>{entry.content}</div>)}</div></section>}
       {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete" || phase === "error") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
