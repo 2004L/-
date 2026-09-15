@@ -544,22 +544,28 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     };
     recorder.start(250);
     speechStartedAtRef.current = Date.now();
-    const audioContext = new AudioContext();
-    audioContextRef.current = audioContext;
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 512;
-    audioContext.createMediaStreamSource(stream).connect(analyser);
-    const samples = new Uint8Array(analyser.fftSize);
-    let quietSince = 0;
-    silenceTimerRef.current = window.setInterval(() => {
-      analyser.getByteTimeDomainData(samples);
-      let energy = 0;
-      for (const sample of samples) energy += Math.abs(sample - 128);
-      const quiet = energy / samples.length < 2.2;
-      if (Date.now() - speechStartedAtRef.current < 700) return;
-      if (quiet) quietSince ||= Date.now(); else quietSince = 0;
-      if (quietSince && Date.now() - quietSince > 1000) stopListening();
-    }, 120);
+    const AudioContextConstructor = window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (AudioContextConstructor) {
+      const audioContext = new AudioContextConstructor();
+      audioContextRef.current = audioContext;
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      audioContext.createMediaStreamSource(stream).connect(analyser);
+      const samples = new Uint8Array(analyser.fftSize);
+      let quietSince = 0;
+      silenceTimerRef.current = window.setInterval(() => {
+        analyser.getByteTimeDomainData(samples);
+        let energy = 0;
+        for (const sample of samples) energy += Math.abs(sample - 128);
+        const quiet = energy / samples.length < 2.2;
+        if (Date.now() - speechStartedAtRef.current < 700) return;
+        if (quiet) quietSince ||= Date.now(); else quietSince = 0;
+        if (quietSince && Date.now() - quietSince > 1000) stopListening();
+      }, 120);
+    } else {
+      // 部分内置浏览器没有 AudioContext，仍可录音；达到最长时长后安全收尾。
+      silenceTimerRef.current = window.setTimeout(() => stopListening(), 8000);
+    }
   }
 
   async function startListening() {
