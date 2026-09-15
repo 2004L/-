@@ -134,7 +134,14 @@ type AsrSocketMessage = {
   latency_ms?: number;
   code?: string;
   message?: string;
+  service?: string;
+  model?: string;
+  device?: string;
+  transport?: string;
 };
+
+type PairingCheckStatus = "pending" | "checking" | "passed" | "warning" | "failed";
+type PairingCheck = { id: "context" | "microphone" | "certificate" | "service" | "connection"; label: string; status: PairingCheckStatus; detail: string };
 
 const DEFAULT_ADAPTER: AdapterConfig = {
   provider: "QloApps",
@@ -284,6 +291,7 @@ export default function Home() {
   const [adapter, setAdapter] = useState(DEFAULT_ADAPTER);
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
   const [loadingData, setLoadingData] = useState(false);
+  const [pairingComplete, setPairingComplete] = useState(false);
 
   useEffect(() => {
     const storedSession = localStorage.getItem("hotel_demo_session") || createSessionId();
@@ -299,6 +307,7 @@ export default function Home() {
         }
       }
       setSetupComplete(localStorage.getItem("hotel_setup_complete") === "true");
+      setPairingComplete(localStorage.getItem("hotel_pairing_complete") === "true");
       setHydrated(true);
     });
   }, []);
@@ -329,10 +338,21 @@ export default function Home() {
       localStorage.setItem("hotel_setup_complete", "true");
     }} />;
   }
+  if (!pairingComplete) {
+    return <EnvironmentPairing adapter={adapter} onComplete={() => {
+      setPairingComplete(true);
+      localStorage.setItem("hotel_pairing_complete", "true");
+    }} onContinueText={() => {
+      setPairingComplete(true);
+      localStorage.setItem("hotel_pairing_complete", "true");
+    }} />;
+  }
   if (view === "admin") {
     return <AdminConsole sessionId={sessionId} adapter={adapter} snapshot={snapshot} loading={loadingData} onRefresh={refresh} onBack={() => setView("terminal")} onReconfigure={() => {
       localStorage.removeItem("hotel_setup_complete");
+      localStorage.removeItem("hotel_pairing_complete");
       setSetupComplete(false);
+      setPairingComplete(false);
     }} />;
   }
   return <VoiceTerminal sessionId={sessionId} adapter={adapter} snapshot={snapshot} onRefresh={refresh} onOpenAdmin={() => setView("admin")} />;
@@ -340,6 +360,111 @@ export default function Home() {
 
 function LoadingScreen() {
   return <main className="grid min-h-screen place-items-center bg-[#f5f5f7] text-[#1d1d1f]"><LoaderCircle className="animate-spin" /></main>;
+}
+
+const INITIAL_PAIRING_CHECKS: PairingCheck[] = [
+  { id: "context", label: "页面安全环境", status: "pending", detail: "等待检测" },
+  { id: "microphone", label: "麦克风权限", status: "pending", detail: "等待检测" },
+  { id: "certificate", label: "本地证书信任", status: "pending", detail: "等待 WSS 握手" },
+  { id: "service", label: "Qwen ASR 服务", status: "pending", detail: "等待服务回执" },
+  { id: "connection", label: "语音连接状态", status: "pending", detail: "等待检测" },
+];
+
+function EnvironmentPairing({ adapter, onComplete, onContinueText }: { adapter: AdapterConfig; onComplete: () => void; onContinueText: () => void }) {
+  const [checks, setChecks] = useState(INITIAL_PAIRING_CHECKS);
+  const [testing, setTesting] = useState(false);
+  const [serviceInfo, setServiceInfo] = useState("");
+  const updateCheck = (id: PairingCheck["id"], status: PairingCheckStatus, detail: string) => setChecks((current) => current.map((item) => item.id === id ? { ...item, status, detail } : item));
+
+  async function runChecks() {
+    setTesting(true);
+    setServiceInfo("");
+    setChecks(INITIAL_PAIRING_CHECKS.map((item) => ({ ...item, status: "pending", detail: "等待检测" })));
+
+    const secure = typeof window !== "undefined" && window.isSecureContext;
+    if (secure) updateCheck("context", "passed", "当前页面可调用受保护的浏览器能力");
+    else updateCheck("context", "failed", "当前页面不是安全上下文，请用 HTTPS Chrome/Edge 打开");
+
+    if (!secure || !navigator.mediaDevices?.getUserMedia) {
+      updateCheck("microphone", "failed", !secure ? "页面安全环境不满足，无法申请麦克风" : "当前浏览器没有麦克风接口");
+    } else {
+      updateCheck("microphone", "checking", "正在检查权限（必要时会弹出一次授权）");
+      try {
+        let permission: PermissionState | "unknown" = "unknown";
+        try {
+          const permissionStatus = await navigator.permissions?.query({ name: "microphone" as PermissionName });
+          permission = permissionStatus?.state ?? "unknown";
+        } catch { /* 部分浏览器不提供 microphone 权限查询 */ }
+        if (permission === "denied") throw new Error("microphone_denied");
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+        updateCheck("microphone", "passed", permission === "granted" ? "麦克风已授权" : "麦克风已授权，本次检测未保存录音");
+      } catch (error) {
+        updateCheck("microphone", "failed", error instanceof Error && error.message === "microphone_denied" ? "麦克风权限被拒绝，请在浏览器地址栏重新允许" : "无法取得麦克风，请确认设备已连接并允许使用");
+      }
+    }
+
+    updateCheck("certificate", "checking", "正在建立本地 WSS 连接");
+    updateCheck("service", "checking", "等待 Qwen ASR 就绪回执");
+    updateCheck("connection", "checking", "正在验证连接与来源校验");
+    await new Promise<void>((resolve) => {
+      if (!adapter.asrWsUrl || typeof WebSocket === "undefined") {
+        updateCheck("certificate", "failed", "没有配置本地 WSS 地址");
+        updateCheck("service", "failed", "没有可用的 ASR 地址");
+        updateCheck("connection", "failed", "语音连接未建立");
+        resolve();
+        return;
+      }
+      let settled = false;
+      const socket = new WebSocket(resolveAsrWebSocketUrl(adapter.asrWsUrl));
+      const finish = () => { if (!settled) { settled = true; window.clearTimeout(timer); socket.close(); resolve(); } };
+      const timer = window.setTimeout(() => {
+        updateCheck("certificate", "failed", "WSS 握手超时，可能是证书不信任或服务未启动");
+        updateCheck("service", "failed", "未收到 Qwen ASR 就绪回执");
+        updateCheck("connection", "failed", "无法连接本机 ASR，请确认服务已启动");
+        finish();
+      }, 3500);
+      socket.onopen = () => {
+        updateCheck("certificate", "passed", "WSS 握手成功，证书已被当前浏览器接受");
+        updateCheck("connection", "checking", "已连接，正在等待服务回执");
+        socket.send(JSON.stringify({ type: "start", language: "Chinese", sample_rate: 16000 }));
+      };
+      socket.onmessage = (event) => {
+        let payload: AsrSocketMessage;
+        try { payload = JSON.parse(String(event.data)) as AsrSocketMessage; } catch { return; }
+        if (payload.type === "ready") {
+          const info = [payload.model, payload.device, payload.transport?.toUpperCase()].filter(Boolean).join(" · ");
+          setServiceInfo(info);
+          updateCheck("service", "passed", info ? `服务已就绪 · ${info}` : "服务已就绪");
+          updateCheck("connection", "passed", "来源校验通过，语音链路可用");
+          finish();
+        } else if (payload.type === "error") {
+          updateCheck("service", "failed", payload.message || payload.code || "ASR 服务返回错误");
+          updateCheck("connection", "failed", "服务拒绝了当前连接");
+          finish();
+        }
+      };
+      socket.onerror = () => {
+        updateCheck("certificate", "failed", "WSS 连接失败，证书可能未信任或地址不可达");
+        updateCheck("service", "failed", "没有收到 ASR 服务回执");
+        updateCheck("connection", "failed", "请检查本地服务、证书和来源配置");
+        finish();
+      };
+      socket.onclose = () => { if (!settled) { updateCheck("connection", "failed", "连接提前关闭"); finish(); } };
+    });
+    setTesting(false);
+  }
+
+  const allPassed = checks.every((item) => item.status === "passed");
+  return <main className="min-h-screen bg-[#f5f5f7] px-5 py-8 text-[#1d1d1f] md:px-10 md:py-12">
+    <section className="mx-auto max-w-4xl">
+      <div className="flex items-center gap-3"><div className="grid h-10 w-10 place-items-center rounded-2xl bg-[#1d1d1f] text-white"><ShieldCheck size={19} /></div><div><p className="font-semibold">Hotel Agent OS</p><p className="text-xs text-[#86868b]">首次启动 · 环境配对</p></div></div>
+      <div className="mt-10 grid gap-6 lg:grid-cols-[1fr_.85fr]">
+        <section className="rounded-[2rem] bg-white p-6 shadow-sm md:p-9"><p className="text-xs font-medium uppercase tracking-[.18em] text-[#86868b]">环境检测</p><h1 className="mt-3 text-4xl font-semibold tracking-[-.05em] md:text-5xl">让语音先准备好。</h1><p className="mt-4 leading-7 text-[#6e6e73]">只检测当前设备是否能安全连接本地 ASR，不上传录音，也不会读取证书私钥。</p><div className="mt-8 space-y-3">{checks.map((item) => <div key={item.id} className="flex items-center gap-3 rounded-2xl border border-[#ededf0] px-4 py-3"><div className={`grid h-9 w-9 shrink-0 place-items-center rounded-full ${item.status === "passed" ? "bg-[#e8f7ee] text-[#248a4d]" : item.status === "failed" ? "bg-[#fff0ed] text-[#c54b12]" : item.status === "checking" ? "bg-[#eaf4ff] text-[#1769aa]" : "bg-[#f2f2f7] text-[#86868b]"}`}>{item.status === "passed" ? <CircleCheck size={18} /> : item.status === "failed" ? <AlertTriangle size={18} /> : item.status === "checking" ? <LoaderCircle size={18} className="animate-spin" /> : <Clock3 size={18} />}</div><div className="min-w-0"><p className="font-medium">{item.label}</p><p className="mt-0.5 text-sm text-[#6e6e73]">{item.detail}</p></div></div>)}</div><div className="mt-7 flex flex-wrap gap-3"><button onClick={() => void runChecks()} disabled={testing} className="rounded-full border border-[#d2d2d7] px-5 py-3 text-sm font-medium disabled:opacity-50">{testing ? "检测中…" : "开始检测"}</button>{allPassed ? <button onClick={onComplete} className="rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white">进入语音系统</button> : <button onClick={onContinueText} className="rounded-full bg-[#1d1d1f] px-6 py-3 text-sm font-medium text-white">继续文字模式</button>}</div><p className="mt-4 text-xs leading-5 text-[#86868b]">语音权限只能由浏览器或酒店安装策略授予。检测失败不会影响订单查询和文字办理。</p></section>
+        <aside className="rounded-[2rem] bg-[#1d1d1f] p-7 text-white md:p-9"><Database size={27} className="text-[#64d2ff]" /><h2 className="mt-8 text-2xl font-semibold tracking-[-.03em]">当前配对目标</h2><div className="mt-6 space-y-4 text-sm leading-6 text-[#c7c7cc]"><p><span className="text-[#8e8e93]">酒店：</span>{adapter.hotelName}</p><p><span className="text-[#8e8e93]">PMS：</span>{adapter.provider} {adapter.version}</p><p><span className="text-[#8e8e93]">ASR：</span>{adapter.asrWsUrl}</p>{serviceInfo && <p><span className="text-[#8e8e93]">回执：</span>{serviceInfo}</p>}<p className="border-t border-white/10 pt-4">证书只用于本机 WSS 加密，私钥不会进入网页、数据库或代码仓库。</p></div></aside>
+      </div>
+    </section>
+  </main>;
 }
 
 function AdapterWizard({ initial, onComplete }: { initial: AdapterConfig; onComplete: (config: AdapterConfig) => void }) {

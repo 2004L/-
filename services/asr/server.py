@@ -40,6 +40,8 @@ TLS_CERT = os.getenv("ASR_TLS_CERT", "").strip()
 TLS_KEY = os.getenv("ASR_TLS_KEY", "").strip()
 AUTH_TOKEN = os.getenv("ASR_AUTH_TOKEN", "").strip()
 ALLOWED_ORIGIN = os.getenv("ASR_ALLOWED_ORIGIN", "").strip()
+RUNTIME_DEVICE = os.getenv("QWEN_ASR_DEVICE", "cuda:0") if torch.cuda.is_available() else "cpu"
+RUNTIME_TRANSPORT = "wss" if TLS_CERT and TLS_KEY else "ws"
 
 
 def resolve_ffmpeg() -> str:
@@ -155,7 +157,13 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
             chunks.clear()
             language = payload.get("language") or "Chinese"
             started = True
-            await websocket.send(json.dumps({"type": "ready"}))
+            await websocket.send(json.dumps({
+                "type": "ready",
+                "service": "qwen3-asr",
+                "model": MODEL_NAME,
+                "device": RUNTIME_DEVICE,
+                "transport": RUNTIME_TRANSPORT,
+            }, ensure_ascii=False))
         elif message_type == "stop":
             if not started or not chunks:
                 await send_error(websocket, "empty_audio", "没有听到语音，请再说一次")
