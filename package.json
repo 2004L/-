@@ -21,6 +21,7 @@
     "test:contracts": "node scripts/test-contracts.mjs",
     "test:concurrency": "node scripts/test-concurrency.mjs",
     "test:invariants": "node scripts/test-invariants.mjs",
+    "test:asr": "node scripts/test-asr-accuracy.mjs",
     "test:security": "node scripts/check-secrets.mjs"
   },
   "dependencies": {

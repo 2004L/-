@@ -1,0 +1,2 @@
+{"id":"order-phone-4821","audio":"asr-audio/order-phone-4821.wav","expected":"我在美团订了房，手机号后四位四八二一","fields":{"phone_last4":"4821"}}
+{"id":"walk-in-two-rooms","audio":"asr-audio/walk-in-two-rooms.wav","expected":"我要现场办理入住，两间高级大床房","fields":{"room_count":2}}

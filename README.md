@@ -119,6 +119,16 @@ LLM_API_KEY=TEMP_LLM_API_KEY_REPLACE_ME
 
 本地服务的安装和消息约定见 [`services/asr/README.md`](services/asr/README.md)。在线托管站不能直接运行 3090 模型；部署到自助机时，在首次适配页面填写本地 ASR WebSocket 地址。HTTPS 页面应使用 WSS 和可信证书，避免浏览器拦截不安全的 `ws://` 连接。服务不记录音频、完整手机号或身份证号。
 
+### 语音准确率脚本验收
+
+把使用测试身份和测试订单录制的音频放进 `fixtures/asr-audio/`，按 [`docs/asr-acceptance.md`](docs/asr-acceptance.md) 建立 `fixtures/asr-cases.jsonl`，然后运行：
+
+```bash
+pnpm test:asr
+```
+
+脚本会调用本地 Qwen ASR，对比标准文本、检查手机号后四位和房间数量等关键字段，并记录时延。关键字段错误、ASR 服务未启动、录音缺失或超过阈值都会失败，不会被当成“基本通过”。
+
 酒店、房型和房间编码仅作演示，建议在管理后台按实际 PMS 主数据映射，例如：
 
 | 字段 | 示例 | 说明 |
