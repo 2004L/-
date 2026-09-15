@@ -180,14 +180,38 @@ function createSessionId() {
   return `demo_${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
-async function postDemo<T>(action: string, body: Record<string, unknown>): Promise<T> {
+type FlowStepInfo = { number: number; code: string; label: string; target: string };
+const FLOW_STEPS: FlowStepInfo[] = [
+  { number: 1, code: "ORDER_MATCH", label: "订单匹配", target: "pms" },
+  { number: 2, code: "IDENTITY_READ", label: "证件读取与身份核验", target: "reader" },
+  { number: 3, code: "ROOM_HOLD", label: "锁定房间", target: "pms" },
+  { number: 4, code: "POLICE_REGISTRATION", label: "公安登记", target: "police" },
+  { number: 5, code: "PMS_CHECKIN", label: "确认入住", target: "pms" },
+  { number: 6, code: "KEYCARD_ISSUE", label: "制作房卡", target: "encoder" },
+  { number: 7, code: "CARD_PICKUP", label: "取卡与取证件确认", target: "encoder" },
+];
+
+type ApiErrorPayload = { error?: string; error_code?: string; current_state?: string; expected_next?: string; retryable?: boolean; status?: string; command_id?: string };
+class FlowStepError extends Error {
+  constructor(public readonly step: FlowStepInfo, public readonly code: string, public readonly retryable: boolean, public readonly status: string, public readonly commandId?: string, public readonly currentState?: string) {
+    super(code);
+    this.name = "FlowStepError";
+  }
+}
+
+type ReconcileResponse = { ok: boolean; current_state: string; current_state_label: string; last_command: { id: string; target: string; operation: string; status: string; error_code: string | null; retryable: boolean } | null; unresolved_external_call: { id: string; target: string; operation: string; status: string; error_code: string | null } | null; invariant_failures: string[]; recommended_action: string };
+
+async function postDemo<T>(action: string, body: Record<string, unknown>, step?: FlowStepInfo): Promise<T> {
   const response = await fetch(`/api/demo/${action}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(data.error ?? "request_failed");
+  const data = (await response.json()) as T & ApiErrorPayload;
+  if (!response.ok) {
+    if (step) throw new FlowStepError(step, data.error_code ?? data.error ?? "REQUEST_FAILED", Boolean(data.retryable), data.status ?? `${response.status}`, data.command_id, data.current_state);
+    throw new Error(data.error ?? "request_failed");
+  }
   return data;
 }
 
@@ -219,15 +243,21 @@ async function postAgentStream(body: Record<string, unknown>, onDelta: (delta: s
   return finalResponse;
 }
 
-async function postSimulator<T extends { ok?: boolean; status?: string; error_code?: string }>(path: string, body: Record<string, unknown>): Promise<T> {
+async function postSimulator<T extends { ok?: boolean; status?: string; error_code?: string; retryable?: boolean; command_id?: string }>(path: string, body: Record<string, unknown>, step?: FlowStepInfo): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(data.error ?? "simulator_request_failed");
-  if (data.status !== "SUCCEEDED") throw new Error(data.error_code ?? `simulator_${data.status ?? "failed"}`);
+  const data = (await response.json()) as T & ApiErrorPayload;
+  if (!response.ok) {
+    if (step) throw new FlowStepError(step, data.error_code ?? data.error ?? "SIMULATOR_REQUEST_FAILED", Boolean(data.retryable), data.status ?? `${response.status}`, data.command_id);
+    throw new Error(data.error ?? "simulator_request_failed");
+  }
+  if (data.status !== "SUCCEEDED") {
+    if (step) throw new FlowStepError(step, data.error_code ?? `SIMULATOR_${data.status ?? "FAILED"}`, Boolean(data.retryable), data.status ?? "UNKNOWN", data.command_id);
+    throw new Error(data.error_code ?? `simulator_${data.status ?? "failed"}`);
+  }
   return data;
 }
 
@@ -367,6 +397,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [message, setMessage] = useState("您好，今天想办理什么？");
   const [intentTrace, setIntentTrace] = useState<Pick<IntentResponse, "label" | "confidence" | "action"> | null>(null);
   const [flowStep, setFlowStep] = useState(0);
+  const [flowError, setFlowError] = useState<{ step: FlowStepInfo; code: string; retryable: boolean; status: string; reconciliation?: ReconcileResponse | null } | null>(null);
   const [voiceBackend, setVoiceBackend] = useState<"local" | "browser" | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionRef = useRef<RecognitionLike | null>(null);
@@ -403,6 +434,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setAlternatives([]);
     setIntentTrace(null);
     setFlowStep(0);
+    setFlowError(null);
     conversationRef.current = [];
     setTranscript([]);
     setMessage("您好，今天想办理什么？");
@@ -660,55 +692,79 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   async function runCheckin() {
     if (!checkinCase) return;
     setPhase("processing");
+    setFlowError(null);
+    let activeStep = FLOW_STEPS[1];
     try {
       setFlowStep(1);
-      let result = await postDemo<{ checkinCase: CheckinCase }>("identity-detected", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[1];
+      let result = await postDemo<{ checkinCase: CheckinCase }>("identity-detected", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(result.checkinCase);
       speak("已检测到身份证，正在确认不是上一位客人遗留的证件。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       setFlowStep(2);
-      await postSimulator("/api/device/reader", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `reader:${checkinCase.id}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" });
-      result = await postDemo<{ checkinCase: CheckinCase }>("verify-identity", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[1];
+      await postSimulator("/api/device/reader", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `reader:${checkinCase.id}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" }, activeStep);
+      activeStep = FLOW_STEPS[1];
+      result = await postDemo<{ checkinCase: CheckinCase }>("verify-identity", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(result.checkinCase);
       speak("身份证已自动读取并核验通过，正在锁定房间。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       setFlowStep(3);
-      result = await postDemo<{ checkinCase: CheckinCase }>("hold-room", { session_id: sessionId, case_id: checkinCase.id, room_number: "1208" });
+      activeStep = FLOW_STEPS[2];
+      result = await postDemo<{ checkinCase: CheckinCase }>("hold-room", { session_id: sessionId, case_id: checkinCase.id, room_number: "1208" }, activeStep);
       setCheckinCase(result.checkinCase);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       setFlowStep(4);
-      await postSimulator("/api/police/submit", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `police:${checkinCase.id}`, expected_state: "ROOM_HELD", device_id: "police-browser-demo-01", operation: "submit_registration", actual_identity_verified: true, identity_token: "DEMO-ID-TOKEN" });
-      result = await postDemo<{ checkinCase: CheckinCase }>("browser-start", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[3];
+      await postSimulator("/api/police/submit", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `police:${checkinCase.id}`, expected_state: "ROOM_HELD", device_id: "police-browser-demo-01", operation: "submit_registration", actual_identity_verified: true, identity_token: "DEMO-ID-TOKEN" }, activeStep);
+      activeStep = FLOW_STEPS[3];
+      result = await postDemo<{ checkinCase: CheckinCase }>("browser-start", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(result.checkinCase);
       speak("正在广州隔离演示环境中模拟住宿登记。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 900));
-      const completed = await postDemo<{ checkinCase: CheckinCase; receipt: string }>("browser-complete", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[3];
+      const completed = await postDemo<{ checkinCase: CheckinCase; receipt: string }>("browser-complete", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(completed.checkinCase);
       setFlowStep(5);
-      result = await postDemo<{ checkinCase: CheckinCase }>("confirm-checkin", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[4];
+      result = await postDemo<{ checkinCase: CheckinCase }>("confirm-checkin", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(result.checkinCase);
       setMatchedOrder((current) => current ? { ...current, status: "checkin_confirmed", room_number: result.checkinCase.room_number } : current);
       speak("入住已确认，自动发卡机正在制作房卡。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       setFlowStep(6);
-      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-start", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[5];
+      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-start", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(result.checkinCase);
       await new Promise((resolve) => window.setTimeout(resolve, 950));
-      await postSimulator("/api/device/encoder", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `encoder:${checkinCase.id}`, expected_state: "PMS_CHECKIN_CONFIRMED", device_id: "encoder-demo-01", operation: "issue_keycard", room_number: result.checkinCase.room_number ?? "1208" });
-      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-complete", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[5];
+      await postSimulator("/api/device/encoder", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `encoder:${checkinCase.id}`, expected_state: "PMS_CHECKIN_CONFIRMED", device_id: "encoder-demo-01", operation: "issue_keycard", room_number: result.checkinCase.room_number ?? "1208" }, activeStep);
+      activeStep = FLOW_STEPS[5];
+      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-complete", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(result.checkinCase);
       setMatchedOrder((current) => current ? { ...current, status: "in_house", room_number: result.checkinCase.room_number } : current);
       setFlowStep(7);
       speak("房卡已制作完成，请取走房卡和身份证。", voiceEnabled);
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
-      result = await postDemo<{ checkinCase: CheckinCase }>("pickup-confirmed", { session_id: sessionId, case_id: checkinCase.id });
+      activeStep = FLOW_STEPS[6];
+      result = await postDemo<{ checkinCase: CheckinCase }>("pickup-confirmed", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
       setCheckinCase(result.checkinCase);
       setPhase("complete");
       speak("已确认房卡和身份证取走，自助入住完成。祝您入住愉快。", voiceEnabled);
       await onRefresh();
-    } catch {
+    } catch (error) {
+      let reconciliation: ReconcileResponse | null = null;
+      try { reconciliation = await postDemo<ReconcileResponse>("reconcile", { session_id: sessionId, case_id: checkinCase.id }); } catch { /* 自查接口本身失败时仍保留原始停点 */ }
+      const detail = error instanceof FlowStepError
+        ? error
+        : new FlowStepError(activeStep, error instanceof Error ? error.message : "UNKNOWN_ERROR", false, "UNKNOWN");
+      setFlowError({ step: detail.step, code: detail.code, retryable: detail.retryable, status: detail.status, reconciliation });
+      const statusText = detail.status === "UNKNOWN" ? "结果未知，不能自动重试" : detail.retryable ? "可以在确认外部状态后重试" : "需要人工处理";
+      const checkText = reconciliation
+        ? `自查结果：当前在“${reconciliation.current_state_label}”；${reconciliation.invariant_failures.length ? `发现 ${reconciliation.invariant_failures.join("；")}；` : "内部状态一致；"}${reconciliation.unresolved_external_call ? "存在未确认的外部请求，禁止重复提交；" : "未发现未确认的外部请求；"}`
+        : "自查接口暂时不可用，已保持暂停状态。";
       setPhase("error");
-      setMessage("流程已安全暂停，未继续发卡；系统已通知远程维护人员检查日志");
+      setMessage(`已停在第 ${detail.step.number} 步「${detail.step.label}」：${detail.code}。${statusText}。${checkText}`);
       await onRefresh();
     }
   }
@@ -724,14 +780,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "停止语音交互" : "开始语音交互"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={!utterance.trim() || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label="发送"><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching"} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 语音只在本机处理" : voiceBackend === "browser" ? "浏览器语音识别备用通道" : "本地 ASR 优先 · 浏览器识别备用"}</p>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
 
       {transcript.length > 0 && <section className="mt-8 w-full max-w-2xl rounded-[2rem] bg-white p-5 text-left shadow-sm"><div className="flex items-center justify-between"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">完整对话记录</p><span className="text-xs text-[#a1a1a6]">本次会话 · {transcript.length} 条</span></div><div className="mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">{transcript.map((entry) => <div key={entry.id} className={`whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${entry.role === "user" ? "ml-8 bg-[#eaf4ff] text-[#174a72]" : entry.role === "tool" ? "mr-8 bg-[#f5f5f7] text-[#6e6e73]" : "mr-8 bg-[#eefaf2] text-[#245d38]"}`}><p className="mb-1 text-[10px] uppercase tracking-[.14em] opacity-60">{entry.role === "user" ? "您" : entry.role === "tool" ? "系统动作" : "AI"}</p>{entry.content}</div>)}</div></section>}
-      {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
+      {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete" || phase === "error") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
 
       {phase === "ambiguous" && <RiskCard title="找到多笔待入住订单" text="仅凭手机号后四位无法确认是哪一笔。AI 已停止自动选择，需要工作人员核对完整手机号或订单号。" orders={alternatives} />}
       {phase === "blocked" && <RiskCard title="该订单不能继续自动办理" text={message} orders={alternatives} />}
       {phase === "not_found" && <section className="mt-9 w-full max-w-xl rounded-[2rem] bg-white p-7 shadow-sm"><Database className="mx-auto text-[#007aff]" /><h2 className="mt-4 text-xl font-semibold">线上订单未找到</h2><p className="mt-2 text-sm leading-6 text-[#6e6e73]">如果客人确实是现场到店，可以创建一笔独立的演示现场办理单。</p><button onClick={createWalkIn} className="mt-5 rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white">创建现场办理单</button></section>}
-      {phase === "error" && <RiskCard title="流程已安全暂停" text={message} orders={[]} />}
+      {phase === "error" && <RiskCard title={flowError ? `已停在第 ${flowError.step.number} 步：${flowError.step.label}` : "流程已安全暂停"} text={message} orders={[]} />}
 
-      {(phase === "processing" || phase === "complete") && <div className="mt-8 grid w-full gap-5 lg:grid-cols-[1fr_.9fr]">
+      {(phase === "processing" || phase === "complete" || phase === "error") && <div className="mt-8 grid w-full gap-5 lg:grid-cols-[1fr_.9fr]">
         <section className="rounded-[2rem] bg-white p-6 text-left shadow-sm"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">业务状态机</p><div className="mt-5 space-y-3">{TERMINAL_PROGRESS.map(([label, detail], index) => <div key={label} className={`flex items-center gap-3 rounded-2xl p-3 ${index === flowStep ? "bg-[#eef6ff]" : ""}`}><div className={`grid h-8 w-8 shrink-0 place-items-center rounded-full ${index < flowStep || phase === "complete" ? "bg-[#1d1d1f] text-white" : index === flowStep ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#86868b]"}`}>{index < flowStep || phase === "complete" ? <Check size={15} /> : index + 1}</div><div><p className="text-sm font-medium">{label}</p><p className="mt-0.5 text-xs text-[#86868b]">{detail}</p></div></div>)}</div></section>
         <section className="overflow-hidden rounded-[2rem] bg-[#15171a] text-left text-white shadow-sm"><div className="flex items-center justify-between border-b border-white/10 px-5 py-4"><div className="flex gap-1.5"><span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" /><span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" /><span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" /></div><span className="text-[11px] text-[#8e8e93]">设备与登记回执</span></div><div className="p-6">{flowStep >= 6 ? <CreditCard className="text-[#64d2ff]" /> : <MonitorCog className="text-[#64d2ff]" />}<p className="mt-5 text-xs uppercase tracking-[.16em] text-[#8e8e93]">一体化终端 · 自动设备链路</p><h2 className="mt-2 text-xl font-semibold">{flowStep < 4 ? "等待身份与房态核验" : flowStep < 6 ? "模拟住宿登记与入住确认" : flowStep === 6 ? "自动写卡与回读校验" : phase === "complete" ? "证件与房卡均已取走" : "请取走房卡和身份证"}</h2><div className="mt-5 space-y-3 font-mono text-xs text-[#aeaeb2]"><p>identity: {flowStep >= 2 ? "VERIFIED_TOKEN" : "pending"}</p><p>room: {checkinCase?.room_number ?? "pending"}</p><p>receipt: {checkinCase?.police_receipt ?? "pending"}</p><p>card_machine: {checkinCase?.hardware_status ?? "not_started"}</p></div><p className="mt-6 rounded-xl bg-white/5 p-3 text-xs leading-5 text-[#8e8e93]">演示不会连接真实公安或门锁系统；生产由受控设备适配器执行并返回可审计回执。</p></div></section>
       </div>}

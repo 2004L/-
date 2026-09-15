@@ -14,7 +14,8 @@ const orders = new Map([["4821", "awaiting_arrival"], ["6395", "awaiting_arrival
 function replay(item) {
   if (item.fault) {
     const faultEvents = item.fault.target === "reader" ? ["MANUAL_TASK_CREATED", "READER_FAULT_INJECTED"] : item.fault.target === "police" ? ["MANUAL_TASK_CREATED", "POLICE_FAULT_INJECTED"] : ["MANUAL_TASK_CREATED", "ENCODER_FAULT_INJECTED"];
-    return { terminal: item.fault.fault_type.includes("timeout") || item.fault.fault_type === "receipt_lost" ? "UNKNOWN" : "MANUAL_REQUIRED", events: faultEvents };
+    const stopStep = item.fault.target === "reader" ? 2 : item.fault.target === "police" ? 4 : 6;
+    return { terminal: item.fault.fault_type.includes("timeout") || item.fault.fault_type === "receipt_lost" ? "UNKNOWN" : "MANUAL_REQUIRED", stop_step: stopStep, events: faultEvents };
   }
   const text = (item.utterances ?? []).join(" ");
   if (item.id === "ambiguous-last4") return { terminal: "MANUAL_SELECTION_REQUIRED", events: ["ORDER_MATCH_AMBIGUOUS"] };
@@ -36,6 +37,7 @@ for (const item of cases) {
   if (result.terminal !== item.expected_terminal) throw new Error(`${item.id}: 期望 ${item.expected_terminal}，实际 ${result.terminal}`);
   for (const event of item.expected_events ?? []) if (!result.events.includes(event)) throw new Error(`${item.id}: 缺少审计事件 ${event}`);
   if (item.expected_room_count && result.room_count !== item.expected_room_count) throw new Error(`${item.id}: room_count 不正确`);
+  if (item.expected_stop_step && result.stop_step !== item.expected_stop_step) throw new Error(`${item.id}: 期望停在第 ${item.expected_stop_step} 步，实际第 ${result.stop_step} 步`);
   if (item.expected_audit_max_delta && result.events.length > item.expected_audit_max_delta) throw new Error(`${item.id}: 幂等审计事件超出上限`);
   console.log(`PASS  ${item.id.padEnd(20)} -> ${result.terminal}`);
 }

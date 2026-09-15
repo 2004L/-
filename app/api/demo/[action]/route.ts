@@ -19,8 +19,32 @@ type CaseRow = {
   updated_at: string;
 };
 
+type CommandRow = {
+  id: string;
+  target: string;
+  operation: string;
+  status: string;
+  error_code: string | null;
+  retryable: number;
+  result_json: string | null;
+  updated_at: string;
+};
+
 const SESSION_PATTERN = /^[a-zA-Z0-9_-]{8,80}$/;
 const LAST4_PATTERN = /^\d{4}$/;
+
+const STATE_LABELS: Record<string, string> = {
+  ORDER_MATCHED: "订单已匹配",
+  IDENTITY_READING: "正在读取身份证",
+  IDENTITY_VERIFIED: "身份已核验",
+  ROOM_HELD: "房间已锁定",
+  POLICE_RUNNING: "公安登记中",
+  POLICE_COMPLETED: "公安登记完成",
+  PMS_CHECKIN_CONFIRMED: "PMS 已确认入住",
+  KEYCARD_WRITING: "正在制作房卡",
+  KEYCARD_DISPENSED: "房卡已送达取卡口",
+  CHECKIN_COMPLETE: "入住完成",
+};
 
 const SEED_ORDERS = [
   ["MT-20260914-4821", "美团", "演示住客甲", "4821", "138****4821", "2026-09-14", 1, "高级大床房", "awaiting_arrival", null],
@@ -258,6 +282,45 @@ async function matchOrder(sessionId: string, phoneLast4: string) {
   return { outcome: "matched", order, checkinCase: await loadCase(sessionId, caseId), reused: false };
 }
 
+async function reconcileCase(sessionId: string, caseId: unknown) {
+  const current = await loadCase(sessionId, caseId);
+  const db = getD1();
+  const [commands, job, lastAudit, order] = await Promise.all([
+    db.prepare("SELECT id, target, operation, status, error_code, retryable, result_json, updated_at FROM external_commands WHERE session_id = ? AND case_id = ? ORDER BY created_at DESC LIMIT 20").bind(sessionId, current.id).all<CommandRow>(),
+    db.prepare("SELECT id, status, attempt, receipt, last_error, updated_at FROM browser_jobs WHERE session_id = ? AND case_id = ? ORDER BY created_at DESC LIMIT 1").bind(sessionId, current.id).first<{ id: string; status: string; attempt: number; receipt: string | null; last_error: string | null; updated_at: string }>(),
+    db.prepare("SELECT id, event_type, from_state, to_state, detail, created_at FROM audit_events WHERE session_id = ? AND case_id = ? ORDER BY id DESC LIMIT 1").bind(sessionId, current.id).first<{ id: number; event_type: string; from_state: string | null; to_state: string | null; detail: string; created_at: string }>(),
+    db.prepare("SELECT status, room_number FROM demo_orders WHERE id = ? AND session_id = ?").bind(current.order_id, sessionId).first<{ status: string; room_number: string | null }>(),
+  ]);
+  const commandList = commands.results;
+  const unknownExternal = commandList.find((item) => item.status === "UNKNOWN" || item.status === "RUNNING");
+  const lastCommand = commandList[0] ?? null;
+  const invariantFailures: string[] = [];
+  if (["ROOM_HELD", "POLICE_RUNNING", "POLICE_COMPLETED", "PMS_CHECKIN_CONFIRMED", "KEYCARD_WRITING", "KEYCARD_DISPENSED", "CHECKIN_COMPLETE"].includes(current.status) && current.identity_result !== "verified_demo_token") invariantFailures.push("身份未核验却已进入后续阶段");
+  if (["PMS_CHECKIN_CONFIRMED", "KEYCARD_WRITING", "KEYCARD_DISPENSED", "CHECKIN_COMPLETE"].includes(current.status) && !current.police_receipt) invariantFailures.push("没有公安登记回执却已确认入住");
+  if (["KEYCARD_WRITING", "KEYCARD_DISPENSED", "CHECKIN_COMPLETE"].includes(current.status) && (!current.room_number || order?.status !== "checkin_confirmed")) invariantFailures.push("房卡阶段缺少已确认的房间或订单状态");
+  const consistency = invariantFailures.length === 0;
+  const recommendedAction = !consistency || unknownExternal
+    ? "manual_verify_external"
+    : current.status === "CHECKIN_COMPLETE"
+      ? "no_action"
+      : lastCommand?.status === "FAILED" && Boolean(lastCommand.retryable)
+        ? "retry_current_step"
+        : "resume_from_confirmed_state";
+  await audit(sessionId, current.id, "FLOW_RECONCILED", current.status, current.status, `自查完成：${consistency ? "状态一致" : invariantFailures.join("；")}；建议 ${recommendedAction}`);
+  return {
+    ok: consistency && !unknownExternal,
+    case_id: current.id,
+    current_state: current.status,
+    current_state_label: STATE_LABELS[current.status] ?? current.status,
+    last_command: lastCommand ? { id: lastCommand.id, target: lastCommand.target, operation: lastCommand.operation, status: lastCommand.status, error_code: lastCommand.error_code, retryable: Boolean(lastCommand.retryable), updated_at: lastCommand.updated_at } : null,
+    browser_job: job,
+    last_audit: lastAudit,
+    invariant_failures: invariantFailures,
+    unresolved_external_call: unknownExternal ? { id: unknownExternal.id, target: unknownExternal.target, operation: unknownExternal.operation, status: unknownExternal.status, error_code: unknownExternal.error_code } : null,
+    recommended_action: recommendedAction,
+  };
+}
+
 export async function GET(request: Request, context: RouteContext) {
   const { action } = await context.params;
   try {
@@ -281,6 +344,9 @@ export async function POST(request: Request, context: RouteContext) {
       await getD1().prepare("DELETE FROM demo_sessions WHERE id = ?").bind(sessionId).run();
       await seedSession(sessionId);
       return json({ ok: true, ...(await snapshot(sessionId)) });
+    }
+    if (action === "reconcile") {
+      return json(await reconcileCase(sessionId, body.case_id));
     }
     if (action === "match") {
       return json(await matchOrder(sessionId, requireLast4(body.phone_last4)));
@@ -378,7 +444,11 @@ function handleError(error: unknown) {
   const message = error instanceof Error ? error.message : "internal_error";
   if (message === "invalid_json" || message.startsWith("invalid_")) return json({ error: message }, 400);
   if (message === "case_not_found") return json({ error: message }, 404);
-  if (message === "concurrent_update" || message.startsWith("invalid_transition")) return json({ error: message }, 409);
+  if (message === "concurrent_update") return json({ error: message, error_code: "CONCURRENT_UPDATE", retryable: true }, 409);
+  if (message.startsWith("invalid_transition")) {
+    const [, currentState, expectedNext] = message.split(":");
+    return json({ error: "invalid_transition", error_code: "INVALID_TRANSITION", current_state: currentState, expected_next: expectedNext, retryable: false }, 409);
+  }
   console.error("demo_api_error", message);
-  return json({ error: "internal_error" }, 500);
+  return json({ error: "internal_error", error_code: "INTERNAL_ERROR", retryable: false }, 500);
 }

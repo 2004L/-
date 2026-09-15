@@ -8,6 +8,6 @@
 {"id":"idempotent-retry","utterances":["查询4821","查询4821"],"expected_terminal":"ORDER_MATCHED","expected_audit_max_delta":1}
 {"id":"concurrent-hold","utterances":["锁定1208","锁定1208"],"expected_terminal":"ONE_SUCCESS_ONE_409"}
 {"id":"invalid-tool","utterances":["执行不存在的工具"],"expected_terminal":"CLARIFICATION","expected_events":["INTENT_NEEDS_INFO"]}
-{"id":"reader-timeout","fault":{"target":"reader","fault_type":"reader_timeout"},"expected_terminal":"UNKNOWN","expected_events":["MANUAL_TASK_CREATED","READER_FAULT_INJECTED"]}
-{"id":"encoder-offline","fault":{"target":"encoder","fault_type":"encoder_offline"},"expected_terminal":"MANUAL_REQUIRED","expected_events":["MANUAL_TASK_CREATED"]}
-{"id":"police-captcha","fault":{"target":"police","fault_type":"captcha_required"},"expected_terminal":"MANUAL_REQUIRED","expected_events":["POLICE_FAULT_INJECTED"]}
+{"id":"reader-timeout","fault":{"target":"reader","fault_type":"reader_timeout"},"expected_terminal":"UNKNOWN","expected_stop_step":2,"expected_events":["MANUAL_TASK_CREATED","READER_FAULT_INJECTED"]}
+{"id":"encoder-offline","fault":{"target":"encoder","fault_type":"encoder_offline"},"expected_terminal":"MANUAL_REQUIRED","expected_stop_step":6,"expected_events":["MANUAL_TASK_CREATED"]}
+{"id":"police-captcha","fault":{"target":"police","fault_type":"captcha_required"},"expected_terminal":"MANUAL_REQUIRED","expected_stop_step":4,"expected_events":["POLICE_FAULT_INJECTED"]}
