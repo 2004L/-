@@ -111,6 +111,7 @@ type IntentResponse = Partial<MatchResponse> & {
 };
 
 type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
+type AgentHistoryMessage = { role: "user" | "assistant" | "tool"; content: string };
 
 type RecognitionResultEvent = { results: { 0: { 0: { transcript: string } } } };
 type RecognitionLike = {
@@ -347,6 +348,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const silenceTimerRef = useRef<number | null>(null);
   const speechStartedAtRef = useRef(0);
   const localAsrResultRef = useRef(false);
+  const conversationRef = useRef<AgentHistoryMessage[]>([]);
 
   const activeMessage = useMemo(() => {
     if (phase === "complete") return "入住完成，请带好身份证和房卡";
@@ -364,6 +366,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setAlternatives([]);
     setIntentTrace(null);
     setFlowStep(0);
+    conversationRef.current = [];
     setMessage("您好，今天想办理什么？");
     speak("您好，今天想办理什么？您可以直接说。", voiceEnabled);
   }
@@ -511,8 +514,11 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setPhase("searching");
     setMessage("正在理解您的意思");
     try {
-      const agent = await postAgent<AgentResponse>({ session_id: sessionId, case_id: checkinCase?.id, messages: [{ role: "user", content: normalized }] });
+      const messages = [...conversationRef.current, { role: "user" as const, content: normalized }].slice(-24);
+      conversationRef.current = messages;
+      const agent = await postAgent<AgentResponse>({ session_id: sessionId, case_id: checkinCase?.id, messages });
       if (agent.type === "clarification") {
+        conversationRef.current = [...conversationRef.current, { role: "assistant", content: agent.message }].slice(-24);
         setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
         setPhase("idle");
         setMessage(agent.message);
@@ -520,12 +526,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         return;
       }
       if (agent.type === "assistant_message") {
+        conversationRef.current = [...conversationRef.current, { role: "assistant", content: agent.message }].slice(-24);
         setIntentTrace({ label: "模型回答", confidence: 0.9, action: "respond" });
         setPhase("idle");
         setMessage(agent.message);
         speak(agent.message, voiceEnabled);
         return;
       }
+      conversationRef.current = [...conversationRef.current, { role: "assistant", content: `已选择工具 ${agent.tool_name}` }].slice(-24);
       const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
       setIntentTrace({ label: toolLabel, confidence: 0.96, action: agent.tool_name });
       let result: IntentResponse;
@@ -536,6 +544,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       } else if (agent.tool_name === "hotel.policy_answer") {
         const topic = String(agent.arguments.topic ?? "");
         const answer = topic === "breakfast" ? "早餐时间是早上七点到十点。" : topic === "parking" ? "酒店提供停车服务，具体位置和费用以门店政策为准。" : topic === "payment" ? "押金和支付方式以当前酒店政策为准，AI 不会自行修改金额。" : "退房时间以订单和门店政策为准，如需延迟退房我会先查询房态。";
+        conversationRef.current = [...conversationRef.current, { role: "tool", content: `hotel.policy_answer 已返回 topic=${topic}` }].slice(-24);
         setPhase("idle");
         setMessage(answer);
         speak(answer, voiceEnabled);
@@ -543,12 +552,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         return;
       } else if (agent.tool_name === "device.encoder.read_status") {
         const answer = checkinCase ? `当前办理状态是 ${checkinCase.status}，发卡机状态是 ${checkinCase.hardware_status}。我只查询状态，不会重复发卡。` : "目前没有正在办理的入住任务。";
+        conversationRef.current = [...conversationRef.current, { role: "tool", content: `device.encoder.read_status 已返回 case=${checkinCase ? "active" : "none"}` }].slice(-24);
         setPhase("idle");
         setMessage(answer);
         speak(answer, voiceEnabled);
         return;
       } else if (agent.tool_name === "device.reader.read_identity" && checkinCase) {
         await postSimulator("/api/device/reader", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `reader:${checkinCase.id}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" });
+        conversationRef.current = [...conversationRef.current, { role: "tool", content: "device.reader.read_identity 仿真成功，已返回演示身份 Token" }].slice(-24);
         setPhase("matched");
         setMessage("身份证已读取，结果已交给业务流程继续核验。");
         speak("身份证已读取，正在继续核验。", voiceEnabled);
@@ -556,6 +567,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       } else {
         throw new Error("unsupported_tool");
       }
+      conversationRef.current = [...conversationRef.current, { role: "tool", content: `pms.search_order outcome=${result.outcome}; order_count=${result.orders?.length ?? (result.order ? 1 : 0)}; case=${result.checkinCase ? "created" : "none"}` }].slice(-24);
       if (result.outcome === "matched" && result.order && result.checkinCase) {
         setMatchedOrder(result.order);
         setCheckinCase(result.checkinCase);

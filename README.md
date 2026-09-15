@@ -95,7 +95,10 @@ PMS_API_KEY=TEMP_PMS_API_KEY_REPLACE_ME
 LLM_ENABLED=true
 LLM_BASE_URL=https://tokenhub.tencentmaas.com/v1
 LLM_MODEL=hy3
-LLM_MAX_TOKENS=700
+LLM_MAX_TOKENS=2000
+LLM_TEMPERATURE=0
+LLM_TIMEOUT_MS=20000
+LLM_MAX_TOOL_STEPS=8
 LLM_API_KEY=TEMP_LLM_API_KEY_REPLACE_ME
 ```
 
@@ -106,9 +109,11 @@ LLM_API_KEY=TEMP_LLM_API_KEY_REPLACE_ME
 语音终端现在优先连接本地 Qwen3-ASR-0.6B WebSocket 服务，识别音频留在门店设备或局域网的 3090 主机上；本地服务未启动、浏览器阻止连接或识别失败时，自动退回浏览器原生语音识别。Qwen3-ASR 官方发布 0.6B/1.7B 模型，支持中文、粤语和多种方言，代码与权重仓库采用 Apache License 2.0，但分发时仍需保留许可证和版权说明。[官方仓库](https://github.com/QwenLM/Qwen3-ASR)
 
 ```text
-自助机麦克风 → 本地 Qwen3-ASR WebSocket → 脱敏文字 → /api/agent/turn → 受控业务工具
+自助机麦克风 → 本地 Qwen3-ASR WebSocket → 脱敏文字 → /api/agent/turn → hy3 多轮上下文 → 受控业务工具
                          └─ 不可用时 → 浏览器原生语音识别备用
 ```
+
+每次对话会保留最近 24 条脱敏消息，并把工具结果摘要带入下一轮，让模型能理解“刚才那笔订单”“继续办理”等说法。工具名和参数先通过 schema 校验，再交给业务 API 或仿真器执行；模型不会直接访问数据库。
 
 本地服务的安装和消息约定见 [`services/asr/README.md`](services/asr/README.md)。在线托管站不能直接运行 3090 模型；部署到自助机时，在首次适配页面填写本地 ASR WebSocket 地址。HTTPS 页面应使用 WSS 和可信证书，避免浏览器拦截不安全的 `ws://` 连接。服务不记录音频、完整手机号或身份证号。
 

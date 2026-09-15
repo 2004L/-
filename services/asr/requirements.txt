@@ -2,3 +2,4 @@ qwen-asr>=0.0.6
 websockets>=12.0
 numpy>=1.26
 torch>=2.6
+imageio-ffmpeg>=0.6.0

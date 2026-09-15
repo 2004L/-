@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import time
 from typing import Any
@@ -31,6 +32,22 @@ PORT = int(os.getenv("ASR_PORT", "8765"))
 MODEL_NAME = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 MAX_AUDIO_BYTES = int(os.getenv("ASR_MAX_AUDIO_BYTES", str(8 * 1024 * 1024)))
 TRANSCRIBE_TIMEOUT = float(os.getenv("ASR_TRANSCRIBE_TIMEOUT", "20"))
+ASR_CONCURRENCY = max(1, int(os.getenv("ASR_CONCURRENCY", "1")))
+
+
+def resolve_ffmpeg() -> str:
+    configured = os.getenv("FFMPEG_BIN", "").strip()
+    if configured:
+        return configured
+    system_binary = shutil.which("ffmpeg")
+    if system_binary:
+        return system_binary
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as error:
+        raise FileNotFoundError("ffmpeg_missing") from error
 
 
 def load_model() -> Qwen3ASRModel:
@@ -46,13 +63,14 @@ def load_model() -> Qwen3ASRModel:
 
 
 MODEL = load_model()
+TRANSCRIBE_SEMAPHORE = asyncio.Semaphore(ASR_CONCURRENCY)
 
 
 def decode_audio(audio: bytes) -> tuple[np.ndarray, int]:
     """Decode a browser recording into mono 16 kHz float32 PCM."""
     result = subprocess.run(
         [
-            "ffmpeg",
+            resolve_ffmpeg(),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -129,7 +147,8 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
             chunks.clear()
             started_at = time.perf_counter()
             try:
-                result = await asyncio.wait_for(asyncio.to_thread(transcribe, audio, language), TRANSCRIBE_TIMEOUT)
+                async with TRANSCRIBE_SEMAPHORE:
+                    result = await asyncio.wait_for(asyncio.to_thread(transcribe, audio, language), TRANSCRIBE_TIMEOUT)
                 result.update(type="result", latency_ms=round((time.perf_counter() - started_at) * 1000))
                 await websocket.send(json.dumps(result, ensure_ascii=False))
             except asyncio.TimeoutError:
