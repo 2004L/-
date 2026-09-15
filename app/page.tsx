@@ -191,11 +191,32 @@ async function postDemo<T>(action: string, body: Record<string, unknown>): Promi
   return data;
 }
 
-async function postAgent<T>(body: Record<string, unknown>): Promise<T> {
+async function postAgentStream(body: Record<string, unknown>, onDelta: (delta: string) => void): Promise<AgentResponse> {
   const response = await fetch("/api/agent/turn", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const data = (await response.json()) as T;
   if (!response.ok) throw new Error("agent_turn_failed");
-  return data;
+  if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) return (await response.json()) as AgentResponse;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResponse: AgentResponse | null = null;
+  const consume = (block: string) => {
+    const line = block.split("\n").find((candidate) => candidate.startsWith("data: "));
+    if (!line) return;
+    const event = JSON.parse(line.slice(6)) as { type: string; delta?: string; response?: AgentResponse };
+    if (event.type === "text_delta" && event.delta) onDelta(event.delta);
+    if ((event.type === "done" || event.type === "fallback") && event.response) finalResponse = event.response;
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() ?? "";
+    blocks.forEach(consume);
+    if (done) break;
+  }
+  if (buffer.trim()) consume(buffer);
+  if (!finalResponse) throw new Error("agent_stream_incomplete");
+  return finalResponse;
 }
 
 async function postSimulator<T extends { ok?: boolean; status?: string; error_code?: string }>(path: string, body: Record<string, unknown>): Promise<T> {
@@ -533,7 +554,11 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     try {
       recordConversation("user", normalized);
       const messages = conversationRef.current.slice(-24);
-      const agent = await postAgent<AgentResponse>({ session_id: sessionId, case_id: checkinCase?.id, messages });
+      let streamedText = "";
+      const agent = await postAgentStream({ session_id: sessionId, case_id: checkinCase?.id, messages }, (delta) => {
+        streamedText += delta;
+        setMessage(streamedText);
+      });
       if (agent.type === "clarification") {
         recordConversation("assistant", agent.message);
         setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
