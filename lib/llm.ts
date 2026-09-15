@@ -21,7 +21,8 @@ export function llmConfig() {
     apiKey: envValue("LLM_API_KEY"),
     maxTokens: Number(envValue("LLM_MAX_TOKENS", "700")) || 700,
     temperature: Number(envValue("LLM_TEMPERATURE", "0")) || 0,
-    timeoutMs: Math.min(8000, Math.max(1000, Number(envValue("LLM_TIMEOUT_MS", "8000")) || 8000)),
+    // 首 token 可能受模型冷启动影响；流式接口用 30 秒上限，避免边缘运行时在首包前误判失败。
+    timeoutMs: Math.min(30000, Math.max(3000, Number(envValue("LLM_TIMEOUT_MS", "30000")) || 30000)),
     maxToolSteps: Math.min(8, Math.max(1, Number(envValue("LLM_MAX_TOOL_STEPS", "8")) || 8)),
   };
 }

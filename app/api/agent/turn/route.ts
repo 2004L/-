@@ -18,6 +18,9 @@ export async function POST(request: Request) {
         async start(controller) {
           let text = "";
           let toolResponse: Record<string, unknown> | null = null;
+          // 先发一个事件并定时心跳，避免模型首 token 较慢时被浏览器或代理判定为断开。
+          send(controller, { type: "start" });
+          const heartbeat = setInterval(() => send(controller, { type: "ping" }), 5000);
           try {
             for await (const part of modelResult.fullStream) {
               if (part.type === "text-delta") {
@@ -37,6 +40,7 @@ export async function POST(request: Request) {
           } catch (error) {
             send(controller, { type: "fallback", response: ruleResult, message: error instanceof Error ? error.message : "stream_failed" });
           } finally {
+            clearInterval(heartbeat);
             controller.close();
           }
         },
