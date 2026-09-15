@@ -141,7 +141,7 @@ const DEFAULT_ADAPTER: AdapterConfig = {
   version: "1.6.1",
   baseUrl: "https://pms.example.local/api",
   apiKey: "TEMP_PMS_API_KEY_REPLACE_ME",
-  asrWsUrl: "ws://127.0.0.1:8765/asr",
+  asrWsUrl: "wss://127.0.0.1:8765/asr",
   propertyCode: "GZ-HAOS-001",
   hotelName: "Hotel Agent OS 广州示范店",
 };

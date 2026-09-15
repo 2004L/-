@@ -21,7 +21,18 @@ D:\AI-Hotel-Models\asr-venv\Scripts\python.exe server.py
 
 首次启动会下载 `Qwen/Qwen3-ASR-0.6B` 权重。建议把缓存或本地目录放在 `D:\AI-Hotel-Models\qwen3-asr-0.6b`，再把 `QWEN_ASR_MODEL` 指向该目录。国内网络可以先通过 ModelScope 下载到本地。
 
-默认地址是 `ws://127.0.0.1:8765/asr`。本地 HTTP 演示可直接使用；如果网页通过 HTTPS 访问，首次适配时应填写 `wss://127.0.0.1:8765/asr`，并为 ASR 服务配置浏览器信任的本地证书（`ASR_TLS_CERT`、`ASR_TLS_KEY`）。可同时设置 `ASR_ALLOWED_ORIGIN` 和 `ASR_AUTH_TOKEN`，限制来源并完成设备配对，避免其他网页调用本地语音服务。
+默认地址是 `wss://127.0.0.1:8765/asr`。如果只在本地 HTTP 页面测试，可填写 `ws://127.0.0.1:8765/asr`；正式网页使用 HTTPS 时必须使用 WSS，并配置浏览器信任的本地证书（`ASR_TLS_CERT`、`ASR_TLS_KEY`）。可同时设置 `ASR_ALLOWED_ORIGIN` 和 `ASR_AUTH_TOKEN`，限制来源并完成设备配对，避免其他网页调用本地语音服务。
+
+### HTTPS 网页的正式配置
+
+生产网页使用 HTTPS 时，不能依赖普通 `ws://`。在项目目录执行下面两步，证书和私钥会写入 D 盘，不会进入 Git：
+
+```powershell
+D:\AI-Hotel-Models\asr-venv\Scripts\python.exe services\asr\generate-local-cert.py --output-dir D:\AI-Hotel-Models\asr-certs
+certutil.exe -user -addstore Root D:\AI-Hotel-Models\asr-certs\asr-local-ca.pem
+```
+
+然后使用 `services\asr\start-on-d.ps1` 启动。脚本会自动启用 WSS，并限制来源为 Hotel Agent OS 网页。证书私钥 `asr-local-key.pem` 只留在本机，禁止上传、复制到前端或提交到仓库。若更换电脑，需要在新电脑重新生成并信任证书。
 
 ## WebSocket 约定
 
