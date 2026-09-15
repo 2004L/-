@@ -492,7 +492,10 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   }
 
   async function startLocalRecognition() {
-    if (!adapter.asrWsUrl || typeof WebSocket === "undefined" || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") throw new Error("local_asr_unavailable");
+    if (!window.isSecureContext) throw new Error("secure_context_required");
+    if (!adapter.asrWsUrl || typeof WebSocket === "undefined") throw new Error("local_asr_unavailable");
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("microphone_api_unavailable");
+    if (typeof MediaRecorder === "undefined") throw new Error("recorder_api_unavailable");
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     mediaStreamRef.current = stream;
     const socket = new WebSocket(resolveAsrWebSocketUrl(adapter.asrWsUrl));
@@ -585,9 +588,12 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setMessage("正在连接本地语音识别…");
     try {
       await startLocalRecognition();
-    } catch {
+    } catch (error) {
       stopListening();
-      setMessage("本地识别未连接，已切换浏览器识别");
+      const code = error instanceof Error ? error.message : "";
+      if (code === "secure_context_required") setMessage("当前预览环境不开放麦克风，请用部署机的 HTTPS Chrome/Edge 访问");
+      else if (code === "microphone_api_unavailable" || code === "recorder_api_unavailable") setMessage("当前浏览器不支持录音，已切换浏览器识别");
+      else setMessage("本地识别未连接，已切换浏览器识别");
       startBrowserRecognition();
     }
   }
