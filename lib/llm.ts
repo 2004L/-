@@ -12,7 +12,15 @@ export function llmConfig() {
     baseUrl: envValue("LLM_BASE_URL", "https://tokenhub.tencentmaas.com/v1").replace(/\/$/, ""),
     model: envValue("LLM_MODEL", "hy3"),
     apiKey: envValue("LLM_API_KEY"),
+    maxTokens: Number(envValue("LLM_MAX_TOKENS", "700")) || 700,
   };
+}
+
+function redactForModel(value: string) {
+  return value
+    .replace(/\b\d{17}[\dXx]\b/g, "[身份证号已隐藏]")
+    .replace(/\b1\d{10}\b/g, (phone) => `1** **** ${phone.slice(-4)}`)
+    .slice(0, 2000);
 }
 
 function fromModelName(name: string): ToolName | null {
@@ -25,7 +33,8 @@ export async function askModel(messages: ChatMessage[], context?: { case_id?: st
   if (!config.enabled || !config.apiKey || config.apiKey === "TEMP_LLM_API_KEY_REPLACE_ME") return null;
   const system = "你是酒店自助入住助手。你只能通过提供的受控工具完成业务动作，不能直接访问数据库，不能猜测身份、手机号、金额、房号或公安字段。遇到歧义先澄清；硬件和公安工具当前是 simulator，只能返回仿真结果。";
   const enriched = context?.case_id ? `${system}\n当前办理 case_id：${context.case_id}` : system;
-  const response = await fetch(`${config.baseUrl}/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` }, body: JSON.stringify({ model: config.model, messages: [{ role: "system", content: enriched }, ...messages], tools: modelToolDefinitions, tool_choice: "auto", temperature: 0, max_tokens: 300 }), });
+  const safeMessages = messages.map((message) => ({ ...message, content: redactForModel(message.content) }));
+  const response = await fetch(`${config.baseUrl}/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` }, body: JSON.stringify({ model: config.model, messages: [{ role: "system", content: enriched }, ...safeMessages], tools: modelToolDefinitions, tool_choice: "auto", temperature: 0, max_tokens: config.maxTokens }), });
   if (!response.ok) throw new Error(`llm_http_${response.status}`);
   const payload = await response.json() as { choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> } }> };
   const message = payload.choices?.[0]?.message;
