@@ -109,7 +109,7 @@ type IntentResponse = Partial<MatchResponse> & {
   assistantMessage: string;
 };
 
-type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number };
+type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
 
 type RecognitionResultEvent = { results: { 0: { 0: { transcript: string } } } };
 type RecognitionLike = {
@@ -381,6 +381,13 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       const agent = await postAgent<AgentResponse>({ session_id: sessionId, case_id: checkinCase?.id, messages: [{ role: "user", content: normalized }] });
       if (agent.type === "clarification") {
         setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
+        setPhase("idle");
+        setMessage(agent.message);
+        speak(agent.message, voiceEnabled);
+        return;
+      }
+      if (agent.type === "assistant_message") {
+        setIntentTrace({ label: "模型回答", confidence: 0.9, action: "respond" });
         setPhase("idle");
         setMessage(agent.message);
         speak(agent.message, voiceEnabled);

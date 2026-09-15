@@ -26,6 +26,25 @@ export type ToolName = (typeof toolNames)[number];
 export type ToolCall = { type: "tool_call"; tool_call_id: string; tool_name: ToolName; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string };
 export type Clarification = { type: "clarification"; message: string; intent: string; confidence: number };
 
+export const toolArgumentSchemas: Record<ToolName, z.ZodTypeAny> = {
+  "pms.search_order": z.object({ phone_last4: z.string().regex(/^\d{4}$/) }).strict(),
+  "pms.create_walk_in": z.object({ phone_last4: z.string().regex(/^\d{4}$/) }).strict(),
+  "hotel.policy_answer": z.object({ topic: z.enum(["breakfast", "parking", "payment", "checkout"]) }).strict(),
+  "device.reader.read_identity": z.object({ case_id: z.string().min(8), expected_state: z.string() }).strict(),
+  "device.encoder.issue_keycard": z.object({ case_id: z.string().min(8), room_number: z.string().regex(/^\d{3,5}$/) }).strict(),
+  "device.encoder.read_status": z.object({ case_id: z.string().min(8).nullable() }).strict(),
+  "police.submit_registration": z.object({ case_id: z.string().min(8), expected_state: z.string() }).strict(),
+};
+
+export const modelToolDefinitions = toolNames.map((toolName) => ({
+  type: "function" as const,
+  function: {
+    name: toolName.replaceAll(".", "_"),
+    description: `受控工具 ${toolName}。不得猜测身份、金额、房号或公安字段。`,
+    parameters: { type: "object", additionalProperties: false, properties: toolName === "pms.search_order" || toolName === "pms.create_walk_in" ? { phone_last4: { type: "string", pattern: "^[0-9]{4}$" } } : toolName === "hotel.policy_answer" ? { topic: { type: "string", enum: ["breakfast", "parking", "payment", "checkout"] } } : { case_id: { type: ["string", "null"] }, expected_state: { type: "string" }, room_number: { type: "string", pattern: "^[0-9]{3,5}$" } } },
+  },
+}));
+
 const last4 = (text: string) => {
   const digits = text.replace(/\D/g, "");
   return digits.length >= 4 ? digits.slice(-4) : null;

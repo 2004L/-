@@ -87,6 +87,19 @@ PMS_BASE_URL=https://pms.example.local/api
 PMS_API_KEY=TEMP_PMS_API_KEY_REPLACE_ME
 ```
 
+## 大模型测试配置
+
+系统支持 OpenAI 兼容的 Chat Completions 接口。当前只在运行环境配置了 `LLM_ENABLED=true` 时调用大模型；没有密钥或调用失败时自动退回本地规则路由，不会让入住流程失控。
+
+```env
+LLM_ENABLED=true
+LLM_BASE_URL=https://tokenhub.tencentmaas.com/v1
+LLM_MODEL=hy3
+LLM_API_KEY=TEMP_LLM_API_KEY_REPLACE_ME
+```
+
+`LLM_API_KEY` 只能放在本地环境变量或托管平台密钥管理中，不能写进源码、README、GitHub Issue 或聊天记录。你刚才贴出的 Key 已经暴露，建议先撤销并重新生成，再用新 Key 做测试。官方 OpenAI 快速入门也建议把 API Key 放到环境变量中，而不是写在代码里。[Developer quickstart](https://platform.openai.com/docs/quickstart/make-your-first-api-request)
+
 酒店、房型和房间编码仅作演示，建议在管理后台按实际 PMS 主数据映射，例如：
 
 | 字段 | 示例 | 说明 |

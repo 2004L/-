@@ -12,7 +12,7 @@ const contentExcluded = new Set([
   "pnpm-lock.yaml",
   "yarn.lock",
 ]);
-const safePlaceholders = ["TEMP_PMS_API_KEY_REPLACE_ME"];
+const safePlaceholders = ["TEMP_PMS_API_KEY_REPLACE_ME", "TEMP_LLM_API_KEY_REPLACE_ME"];
 
 const detectors = [
   {
