@@ -18,6 +18,7 @@ export const agentMessageSchema = z.object({
 
 export const agentTurnSchema = z.object({
   session_id: z.string().regex(/^[a-zA-Z0-9_-]{8,80}$/),
+  conversation_id: z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/).optional(),
   messages: z.array(agentMessageSchema).min(1).max(30),
   case_id: z.string().min(8).max(80).optional(),
 }).strict();
@@ -47,11 +48,13 @@ export const modelToolDefinitions = toolNames.map((toolName) => ({
 }));
 
 const last4 = (text: string) => {
-  const digits = text.replace(/\D/g, "");
+  const digitMap: Record<string, string> = { 零: "0", 〇: "0", 一: "1", 幺: "1", 二: "2", 两: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9" };
+  const normalized = [...text].map((character) => digitMap[character] ?? character).join("");
+  const digits = normalized.replace(/\D/g, "");
   return digits.length >= 4 ? digits.slice(-4) : null;
 };
 
-export function routeIntent(text: string, context?: { case_id?: string }): ToolCall | Clarification | AssistantMessage {
+export function routeIntent(text: string, context?: { case_id?: string; pending_walk_in?: boolean }): ToolCall | Clarification | AssistantMessage {
   const normalized = text.trim().replace(/\s+/g, " ");
   const phoneLast4 = last4(normalized);
   if (/(C语言|C 语言|C程序|Hello World|hello world|编程|代码)/i.test(normalized)) {
@@ -66,6 +69,11 @@ export function routeIntent(text: string, context?: { case_id?: string }): ToolC
   if (/(读身份证|读取身份证|身份证放|证件放)/.test(normalized)) {
     if (!context?.case_id) return { type: "clarification", message: "请先告诉我预订手机号后四位，我确认订单后再读取身份证。", intent: "identity_read", confidence: 0.94 };
     return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "device.reader.read_identity", arguments: { case_id: context.case_id, expected_state: "IDENTITY_READING" }, implementation: "simulator", response_hint: "已切换到读卡器仿真接口，读到的是演示身份 Token。" };
+  }
+  const walkIn = /(没有?预订|无预订|现场(?:预订|办理|入住)|直接(?:入住|住)|到店(?:办理|入住)|walk[- ]?in)/i.test(normalized);
+  if (walkIn || (context?.pending_walk_in && phoneLast4)) {
+    if (!phoneLast4) return { type: "clarification", message: "好的，现场办理入住。请告诉我手机号后四位，直接说四个数字就行。", intent: "walk_in", confidence: 0.96 };
+    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "pms.create_walk_in", arguments: { phone_last4: phoneLast4 }, implementation: "business_api", response_hint: "将创建一笔现场办理单；重复请求会复用原办理单，不会重复创建。" };
   }
   if (phoneLast4 || /(预订|订了|订单|入住|住店|美团|抖音|携程|官网)/.test(normalized)) {
     if (!phoneLast4) return { type: "clarification", message: "可以，请告诉我预订手机号后四位，直接说四个数字就行。", intent: "query_reservation", confidence: 0.91 };

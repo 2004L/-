@@ -2,6 +2,9 @@
 {"id":"already-in-house","utterances":["我来入住，手机号后四位7366"],"expected_terminal":"ALREADY_CHECKED_IN","expected_events":["ORDER_MATCH_BLOCKED"]}
 {"id":"cancelled-order","utterances":["查一下4402的订单"],"expected_terminal":"CANCELLED","expected_events":["ORDER_MATCH_BLOCKED"]}
 {"id":"not-found-walk-in","utterances":["没有预订，我现场办理","手机号后四位9053"],"expected_terminal":"ORDER_MATCHED","expected_events":["WALK_IN_CREATED"]}
+{"id":"inline-walk-in-last4","utterances":["我没有预订，想直接入住，7878"],"expected_terminal":"ORDER_MATCHED","expected_events":["WALK_IN_CREATED","ORDER_MATCHED"]}
+{"id":"followup-walk-in-last4","utterances":["我要现场入住","7878"],"expected_terminal":"ORDER_MATCHED","expected_events":["WALK_IN_CREATED","ORDER_MATCHED"]}
+{"id":"walk-in-idempotent","utterances":["现场入住，7878","现场入住，7878"],"expected_terminal":"ORDER_MATCHED","expected_events":["WALK_IN_CREATED"],"expected_audit_max_delta":2}
 {"id":"relation-clarification","utterances":["我老婆的手机号"],"expected_terminal":"WAITING_FOR_PHONE_LAST4","expected_events":["INTENT_NEEDS_INFO"]}
 {"id":"change-mind","utterances":["查询4821","不是这个订单"],"expected_terminal":"CANCELLED_BY_GUEST","expected_events":["INTENT_RECOGNIZED"]}
 {"id":"two-rooms","utterances":["手机号后四位6395，一次订两间"],"expected_terminal":"ORDER_MATCHED","expected_room_count":2}

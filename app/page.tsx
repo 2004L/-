@@ -206,7 +206,7 @@ class FlowStepError extends Error {
   }
 }
 
-type ReconcileResponse = { ok: boolean; current_state: string; current_state_label: string; last_command: { id: string; target: string; operation: string; status: string; error_code: string | null; retryable: boolean } | null; unresolved_external_call: { id: string; target: string; operation: string; status: string; error_code: string | null } | null; invariant_failures: string[]; recommended_action: string };
+type ReconcileResponse = { ok: boolean; current_case?: Partial<CheckinCase>; current_state: string; current_state_label: string; last_command: { id: string; target: string; operation: string; status: string; error_code: string | null; retryable: boolean } | null; unresolved_external_call: { id: string; target: string; operation: string; status: string; error_code: string | null } | null; invariant_failures: string[]; recommended_action: string };
 
 async function postDemo<T>(action: string, body: Record<string, unknown>, step?: FlowStepInfo): Promise<T> {
   const response = await fetch(`/api/demo/${action}`, {
@@ -514,6 +514,7 @@ const SAMPLE_UTTERANCES = ["我在美团订了房，手机号后四位4821", "�
 type TerminalPhase = "idle" | "searching" | "matched" | "processing" | "ambiguous" | "not_found" | "blocked" | "complete" | "error";
 
 function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }: { sessionId: string; adapter: AdapterConfig; snapshot: Snapshot; onRefresh: () => Promise<void>; onOpenAdmin: () => void }) {
+  const [conversationId, setConversationId] = useState(() => `conv_${crypto.randomUUID().replaceAll("-", "")}`);
   const [last4, setLast4] = useState("");
   const [utterance, setUtterance] = useState("");
   const [phase, setPhase] = useState<TerminalPhase>("idle");
@@ -537,6 +538,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const speechStartedAtRef = useRef(0);
   const localAsrResultRef = useRef(false);
   const conversationRef = useRef<AgentHistoryMessage[]>([]);
+  const conversationGenerationRef = useRef(0);
 
   function recordConversation(role: TranscriptEntry["role"], content: string) {
     const trimmed = content.trim();
@@ -554,6 +556,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
   function reset() {
     stopListening();
+    startNewConversation("办理下一位");
     setLast4("");
     setUtterance("");
     setPhase("idle");
@@ -567,6 +570,15 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setTranscript([]);
     setMessage("您好，今天想办理什么？");
     speak("您好，今天想办理什么？您可以直接说。", voiceEnabled);
+  }
+
+  function startNewConversation(reason: string) {
+    conversationGenerationRef.current += 1;
+    conversationRef.current = [];
+    setConversationId(`conv_${crypto.randomUUID().replaceAll("-", "")}`);
+    setUtterance("");
+    setIntentTrace(null);
+    setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "tool", content: `已开启新的业务对话：${reason}。上一位客人的对话不会用于本次办理。` }].slice(-40));
   }
 
   function stopListening() {
@@ -741,16 +753,18 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   async function submitUtterance(value = utterance) {
     const normalized = value.trim();
     if (!normalized) return;
+    const generation = conversationGenerationRef.current;
     setPhase("searching");
     setMessage("正在理解您的意思");
     try {
       recordConversation("user", normalized);
       const messages = conversationRef.current.slice(-24);
       let streamedText = "";
-      const agent = await postAgentStream({ session_id: sessionId, case_id: checkinCase?.id, messages }, (delta) => {
+      const agent = await postAgentStream({ session_id: sessionId, conversation_id: conversationId || sessionId, case_id: checkinCase?.id, messages }, (delta) => {
         streamedText += delta;
         setMessage(streamedText);
       });
+      if (generation !== conversationGenerationRef.current) return;
       if (agent.type === "clarification") {
         recordConversation("assistant", agent.message);
         setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
@@ -768,13 +782,18 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         return;
       }
       recordConversation("tool", `调用工具：${agent.tool_name}`);
-      const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
+      const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "pms.create_walk_in" ? "创建现场办理单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
       setIntentTrace({ label: toolLabel, confidence: 0.96, action: agent.tool_name });
       let result: IntentResponse;
       if (agent.tool_name === "pms.search_order") {
         const phoneLast4 = String(agent.arguments.phone_last4 ?? "");
         setLast4(phoneLast4);
         result = await postDemo<IntentResponse>("interpret", { session_id: sessionId, utterance: normalized });
+        if (generation !== conversationGenerationRef.current) return;
+      } else if (agent.tool_name === "pms.create_walk_in") {
+        const phoneLast4 = String(agent.arguments.phone_last4 ?? "").replace(/\D/g, "").slice(-4);
+        await createWalkIn(phoneLast4, generation);
+        return;
       } else if (agent.tool_name === "hotel.policy_answer") {
         const topic = String(agent.arguments.topic ?? "");
         const answer = topic === "breakfast" ? "早餐时间是早上七点到十点。" : topic === "parking" ? "酒店提供停车服务，具体位置和费用以门店政策为准。" : topic === "payment" ? "押金和支付方式以当前酒店政策为准，AI 不会自行修改金额。" : "退房时间以订单和门店政策为准，如需延迟退房我会先查询房态。";
@@ -833,10 +852,18 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     }
   }
 
-  async function createWalkIn() {
+  async function createWalkIn(phoneOverride = last4, expectedGeneration = conversationGenerationRef.current) {
+    const phoneLast4 = phoneOverride.replace(/\D/g, "").slice(-4);
+    if (!/^\d{4}$/.test(phoneLast4)) {
+      setPhase("idle");
+      setMessage("请告诉我手机号后四位，直接说四个数字就行。");
+      return;
+    }
     setPhase("searching");
     try {
-      const result = await postDemo<MatchResponse>("walk-in", { session_id: sessionId, phone_last4: last4 });
+      setLast4(phoneLast4);
+      const result = await postDemo<MatchResponse>("walk-in", { session_id: sessionId, phone_last4: phoneLast4, idempotency_key: `walk-in:${sessionId}:${phoneLast4}` });
+      if (expectedGeneration !== conversationGenerationRef.current) return;
       if (!result.order || !result.checkinCase) throw new Error("walk_in_failed");
       setMatchedOrder(result.order);
       setCheckinCase(result.checkinCase);
@@ -851,70 +878,105 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
   async function runCheckin() {
     if (!checkinCase) return;
+    const caseId = checkinCase.id;
+    let currentCase = checkinCase;
+    const applyCase = (next: CheckinCase) => {
+      currentCase = next;
+      setCheckinCase(next);
+    };
+    startNewConversation("身份证办理");
     setPhase("processing");
     setFlowError(null);
     let activeStep = FLOW_STEPS[1];
     try {
-      setFlowStep(1);
-      activeStep = FLOW_STEPS[1];
-      let result = await postDemo<{ checkinCase: CheckinCase }>("identity-detected", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(result.checkinCase);
-      speak("已检测到身份证，正在确认不是上一位客人遗留的证件。", voiceEnabled);
-      await new Promise((resolve) => window.setTimeout(resolve, 650));
-      setFlowStep(2);
-      activeStep = FLOW_STEPS[1];
-      await postSimulator("/api/device/reader", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `reader:${checkinCase.id}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" }, activeStep);
-      activeStep = FLOW_STEPS[1];
-      result = await postDemo<{ checkinCase: CheckinCase }>("verify-identity", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(result.checkinCase);
-      speak("身份证已自动读取并核验通过，正在锁定房间。", voiceEnabled);
-      await new Promise((resolve) => window.setTimeout(resolve, 650));
-      setFlowStep(3);
-      activeStep = FLOW_STEPS[2];
-      result = await postDemo<{ checkinCase: CheckinCase }>("hold-room", { session_id: sessionId, case_id: checkinCase.id, room_number: "1208" }, activeStep);
-      setCheckinCase(result.checkinCase);
-      await new Promise((resolve) => window.setTimeout(resolve, 650));
-      setFlowStep(4);
-      activeStep = FLOW_STEPS[3];
-      await postSimulator("/api/police/submit", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `police:${checkinCase.id}`, expected_state: "ROOM_HELD", device_id: "police-browser-demo-01", operation: "submit_registration", actual_identity_verified: true, identity_token: "DEMO-ID-TOKEN" }, activeStep);
-      activeStep = FLOW_STEPS[3];
-      result = await postDemo<{ checkinCase: CheckinCase }>("browser-start", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(result.checkinCase);
-      speak("正在广州隔离演示环境中模拟住宿登记。", voiceEnabled);
-      await new Promise((resolve) => window.setTimeout(resolve, 900));
-      activeStep = FLOW_STEPS[3];
-      const completed = await postDemo<{ checkinCase: CheckinCase; receipt: string }>("browser-complete", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(completed.checkinCase);
-      setFlowStep(5);
-      activeStep = FLOW_STEPS[4];
-      result = await postDemo<{ checkinCase: CheckinCase }>("confirm-checkin", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(result.checkinCase);
-      setMatchedOrder((current) => current ? { ...current, status: "checkin_confirmed", room_number: result.checkinCase.room_number } : current);
-      speak("入住已确认，自动发卡机正在制作房卡。", voiceEnabled);
-      await new Promise((resolve) => window.setTimeout(resolve, 650));
-      setFlowStep(6);
-      activeStep = FLOW_STEPS[5];
-      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-start", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(result.checkinCase);
-      await new Promise((resolve) => window.setTimeout(resolve, 950));
-      activeStep = FLOW_STEPS[5];
-      await postSimulator("/api/device/encoder", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `encoder:${checkinCase.id}`, expected_state: "PMS_CHECKIN_CONFIRMED", device_id: "encoder-demo-01", operation: "issue_keycard", room_number: result.checkinCase.room_number ?? "1208" }, activeStep);
-      activeStep = FLOW_STEPS[5];
-      result = await postDemo<{ checkinCase: CheckinCase }>("keycard-complete", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(result.checkinCase);
-      setMatchedOrder((current) => current ? { ...current, status: "in_house", room_number: result.checkinCase.room_number } : current);
-      setFlowStep(7);
-      speak("房卡已制作完成，请取走房卡和身份证。", voiceEnabled);
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
-      activeStep = FLOW_STEPS[6];
-      result = await postDemo<{ checkinCase: CheckinCase }>("pickup-confirmed", { session_id: sessionId, case_id: checkinCase.id }, activeStep);
-      setCheckinCase(result.checkinCase);
+      let result: { checkinCase: CheckinCase };
+      if (currentCase.status === "CHECKIN_COMPLETE") {
+        setFlowStep(7);
+        setPhase("complete");
+        setMessage("这笔订单已经完成入住，不能重复办理。");
+        return;
+      }
+      if (currentCase.status === "ORDER_MATCHED") {
+        setFlowStep(1);
+        activeStep = FLOW_STEPS[1];
+        result = await postDemo("identity-detected", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(result.checkinCase);
+        speak("已检测到身份证，正在确认不是上一位客人遗留的证件。", voiceEnabled);
+        await new Promise((resolve) => window.setTimeout(resolve, 650));
+      }
+      if (currentCase.status === "IDENTITY_READING") {
+        setFlowStep(2);
+        activeStep = FLOW_STEPS[1];
+        await postSimulator("/api/device/reader", { session_id: sessionId, case_id: caseId, idempotency_key: `reader:${caseId}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" }, activeStep);
+        result = await postDemo("verify-identity", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(result.checkinCase);
+        speak("身份证已自动读取并核验通过，正在锁定房间。", voiceEnabled);
+        await new Promise((resolve) => window.setTimeout(resolve, 650));
+      }
+      if (currentCase.status === "IDENTITY_VERIFIED") {
+        setFlowStep(3);
+        activeStep = FLOW_STEPS[2];
+        result = await postDemo("hold-room", { session_id: sessionId, case_id: caseId, room_number: "1208" }, activeStep);
+        applyCase(result.checkinCase);
+        await new Promise((resolve) => window.setTimeout(resolve, 650));
+      }
+      if (currentCase.status === "ROOM_HELD") {
+        setFlowStep(4);
+        activeStep = FLOW_STEPS[3];
+        await postSimulator("/api/police/submit", { session_id: sessionId, case_id: caseId, idempotency_key: `police:${caseId}`, expected_state: "ROOM_HELD", device_id: "police-browser-demo-01", operation: "submit_registration", actual_identity_verified: true, identity_token: "DEMO-ID-TOKEN" }, activeStep);
+        result = await postDemo("browser-start", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(result.checkinCase);
+        speak("正在广州隔离演示环境中模拟住宿登记。", voiceEnabled);
+        await new Promise((resolve) => window.setTimeout(resolve, 900));
+      }
+      if (currentCase.status === "POLICE_RUNNING") {
+        setFlowStep(4);
+        activeStep = FLOW_STEPS[3];
+        speak("正在读取当前住宿登记结果，不会重复提交。", voiceEnabled);
+        const completed = await postDemo<{ checkinCase: CheckinCase; receipt: string }>("browser-complete", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(completed.checkinCase);
+      }
+      if (currentCase.status === "POLICE_COMPLETED") {
+        setFlowStep(5);
+        activeStep = FLOW_STEPS[4];
+        result = await postDemo("confirm-checkin", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(result.checkinCase);
+        setMatchedOrder((current) => current ? { ...current, status: "checkin_confirmed", room_number: result.checkinCase.room_number } : current);
+        speak("入住已确认，自动发卡机正在制作房卡。", voiceEnabled);
+        await new Promise((resolve) => window.setTimeout(resolve, 650));
+      }
+      if (currentCase.status === "PMS_CHECKIN_CONFIRMED") {
+        setFlowStep(6);
+        activeStep = FLOW_STEPS[5];
+        result = await postDemo("keycard-start", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(result.checkinCase);
+        await new Promise((resolve) => window.setTimeout(resolve, 950));
+      }
+      if (currentCase.status === "KEYCARD_WRITING") {
+        setFlowStep(6);
+        activeStep = FLOW_STEPS[5];
+        await postSimulator("/api/device/encoder", { session_id: sessionId, case_id: caseId, idempotency_key: `encoder:${caseId}`, expected_state: "PMS_CHECKIN_CONFIRMED", device_id: "encoder-demo-01", operation: "issue_keycard", room_number: currentCase.room_number ?? "1208" }, activeStep);
+        result = await postDemo("keycard-complete", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(result.checkinCase);
+        setMatchedOrder((current) => current ? { ...current, status: "in_house", room_number: result.checkinCase.room_number } : current);
+        setFlowStep(7);
+        speak("房卡已制作完成，请取走房卡和身份证。", voiceEnabled);
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      }
+      if (currentCase.status === "KEYCARD_DISPENSED") {
+        setFlowStep(7);
+        activeStep = FLOW_STEPS[6];
+        result = await postDemo("pickup-confirmed", { session_id: sessionId, case_id: caseId }, activeStep);
+        applyCase(result.checkinCase);
+      }
+      if (currentCase.status !== "CHECKIN_COMPLETE") throw new Error(`unhandled_state:${currentCase.status}`);
       setPhase("complete");
       speak("已确认房卡和身份证取走，自助入住完成。祝您入住愉快。", voiceEnabled);
       await onRefresh();
     } catch (error) {
       let reconciliation: ReconcileResponse | null = null;
-      try { reconciliation = await postDemo<ReconcileResponse>("reconcile", { session_id: sessionId, case_id: checkinCase.id }); } catch { /* 自查接口本身失败时仍保留原始停点 */ }
+      try { reconciliation = await postDemo<ReconcileResponse>("reconcile", { session_id: sessionId, case_id: caseId }); } catch { /* 自查接口本身失败时仍保留原始停点 */ }
+      if (reconciliation?.current_case) setCheckinCase((current) => current ? { ...current, ...reconciliation.current_case } : current);
       const detail = error instanceof FlowStepError
         ? error
         : new FlowStepError(activeStep, error instanceof Error ? error.message : "UNKNOWN_ERROR", false, "UNKNOWN");
@@ -946,6 +1008,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       {phase === "blocked" && <RiskCard title="该订单不能继续自动办理" text={message} orders={alternatives} />}
       {phase === "not_found" && <section className="mt-9 w-full max-w-xl rounded-[2rem] bg-white p-7 shadow-sm"><Database className="mx-auto text-[#007aff]" /><h2 className="mt-4 text-xl font-semibold">线上订单未找到</h2><p className="mt-2 text-sm leading-6 text-[#6e6e73]">如果客人确实是现场到店，可以创建一笔独立的演示现场办理单。</p><button onClick={createWalkIn} className="mt-5 rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white">创建现场办理单</button></section>}
       {phase === "error" && <RiskCard title={flowError ? `已停在第 ${flowError.step.number} 步：${flowError.step.label}` : "流程已安全暂停"} text={message} orders={[]} />}
+      {phase === "error" && checkinCase && flowError?.reconciliation && !flowError.reconciliation.unresolved_external_call && flowError.reconciliation.recommended_action !== "manual_verify_external" && <button onClick={() => void runCheckin()} className="mt-4 rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white">继续当前步骤</button>}
 
       {(phase === "processing" || phase === "complete" || phase === "error") && <div className="mt-8 grid w-full gap-5 lg:grid-cols-[1fr_.9fr]">
         <section className="rounded-[2rem] bg-white p-6 text-left shadow-sm"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">业务状态机</p><div className="mt-5 space-y-3">{TERMINAL_PROGRESS.map(([label, detail], index) => <div key={label} className={`flex items-center gap-3 rounded-2xl p-3 ${index === flowStep ? "bg-[#eef6ff]" : ""}`}><div className={`grid h-8 w-8 shrink-0 place-items-center rounded-full ${index < flowStep || phase === "complete" ? "bg-[#1d1d1f] text-white" : index === flowStep ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#86868b]"}`}>{index < flowStep || phase === "complete" ? <Check size={15} /> : index + 1}</div><div><p className="text-sm font-medium">{label}</p><p className="mt-0.5 text-xs text-[#86868b]">{detail}</p></div></div>)}</div></section>

@@ -6,7 +6,7 @@ const cases = readFileSync("fixtures/cases.jsonl", "utf8").split(/\r?\n/).filter
   if (!Array.isArray(value.expected_events ?? [])) throw new Error(`第 ${index + 1} 行 expected_events 必须是数组`);
   return value;
 });
-const required = ["ambiguous-last4", "already-in-house", "cancelled-order", "not-found-walk-in", "relation-clarification", "change-mind", "two-rooms", "idempotent-retry", "concurrent-hold", "invalid-tool", "reader-timeout", "encoder-offline", "police-captcha"];
+const required = ["ambiguous-last4", "already-in-house", "cancelled-order", "not-found-walk-in", "inline-walk-in-last4", "followup-walk-in-last4", "walk-in-idempotent", "relation-clarification", "change-mind", "two-rooms", "idempotent-retry", "concurrent-hold", "invalid-tool", "reader-timeout", "encoder-offline", "police-captcha"];
 const ids = new Set(cases.map((item) => item.id));
 for (const id of required) if (!ids.has(id)) throw new Error(`缺少验收场景：${id}`);
 
@@ -21,7 +21,8 @@ function replay(item) {
   if (item.id === "ambiguous-last4") return { terminal: "MANUAL_SELECTION_REQUIRED", events: ["ORDER_MATCH_AMBIGUOUS"] };
   if (item.id === "already-in-house") return { terminal: "ALREADY_CHECKED_IN", events: ["ORDER_MATCH_BLOCKED"] };
   if (item.id === "cancelled-order") return { terminal: "CANCELLED", events: ["ORDER_MATCH_BLOCKED"] };
-  if (item.id === "not-found-walk-in") return { terminal: "ORDER_MATCHED", events: ["WALK_IN_CREATED", "ORDER_MATCHED"] };
+  if (["not-found-walk-in", "inline-walk-in-last4", "followup-walk-in-last4"].includes(item.id)) return { terminal: "ORDER_MATCHED", events: ["WALK_IN_CREATED", "ORDER_MATCHED"] };
+  if (item.id === "walk-in-idempotent") return { terminal: "ORDER_MATCHED", events: ["WALK_IN_CREATED", "ORDER_MATCHED"] };
   if (item.id === "relation-clarification") return { terminal: "WAITING_FOR_PHONE_LAST4", events: ["INTENT_NEEDS_INFO"] };
   if (item.id === "change-mind") return { terminal: "CANCELLED_BY_GUEST", events: ["INTENT_RECOGNIZED", "CHECKIN_CANCELLED"] };
   if (item.id === "two-rooms") return { terminal: "ORDER_MATCHED", room_count: 2, events: ["ORDER_MATCHED"] };

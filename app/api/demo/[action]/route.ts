@@ -241,21 +241,19 @@ async function transition(options: {
   return loadCase(options.sessionId, current.id);
 }
 
-async function matchOrder(sessionId: string, phoneLast4: string) {
+async function matchOrder(sessionId: string, phoneLast4: string, source?: string) {
   const db = getD1();
-  const pending = await db
-    .prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? AND status = 'awaiting_arrival' ORDER BY stay_date, order_code")
-    .bind(sessionId, phoneLast4)
-    .all<Record<string, unknown>>();
+  const pending = source
+    ? await db.prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? AND source = ? AND status = 'awaiting_arrival' ORDER BY stay_date, order_code").bind(sessionId, phoneLast4, source).all<Record<string, unknown>>()
+    : await db.prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? AND status = 'awaiting_arrival' ORDER BY stay_date, order_code").bind(sessionId, phoneLast4).all<Record<string, unknown>>();
   if (pending.results.length > 1) {
     await audit(sessionId, null, "ORDER_MATCH_AMBIGUOUS", null, "MANUAL_SELECTION_REQUIRED", `末四位 ${phoneLast4} 命中 ${pending.results.length} 笔待入住订单`);
     return { outcome: "ambiguous", orders: pending.results };
   }
   if (pending.results.length === 0) {
-    const historical = await db
-      .prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? ORDER BY updated_at DESC")
-      .bind(sessionId, phoneLast4)
-      .all<Record<string, unknown>>();
+    const historical = source
+      ? await db.prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? AND source = ? ORDER BY updated_at DESC").bind(sessionId, phoneLast4, source).all<Record<string, unknown>>()
+      : await db.prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? ORDER BY updated_at DESC").bind(sessionId, phoneLast4).all<Record<string, unknown>>();
     const outcome = historical.results.some((item) => item.status === "in_house")
       ? "already_checked_in"
       : historical.results.some((item) => item.status === "cancelled")
@@ -310,6 +308,18 @@ async function reconcileCase(sessionId: string, caseId: unknown) {
   return {
     ok: consistency && !unknownExternal,
     case_id: current.id,
+    current_case: {
+      id: current.id,
+      order_id: current.order_id,
+      mode: current.mode,
+      status: current.status,
+      identity_result: current.identity_result,
+      room_number: current.room_number,
+      police_receipt: current.police_receipt,
+      hardware_status: current.hardware_status,
+      version: current.version,
+      updated_at: current.updated_at,
+    },
     current_state: current.status,
     current_state_label: STATE_LABELS[current.status] ?? current.status,
     last_command: lastCommand ? { id: lastCommand.id, target: lastCommand.target, operation: lastCommand.operation, status: lastCommand.status, error_code: lastCommand.error_code, retryable: Boolean(lastCommand.retryable), updated_at: lastCommand.updated_at } : null,
@@ -379,6 +389,8 @@ export async function POST(request: Request, context: RouteContext) {
     }
     if (action === "walk-in") {
       const phoneLast4 = requireLast4(body.phone_last4);
+      const existing = await getD1().prepare("SELECT id FROM demo_orders WHERE session_id = ? AND source = '现场办理' AND phone_last4 = ? AND status = 'awaiting_arrival' ORDER BY created_at DESC LIMIT 1").bind(sessionId, phoneLast4).first<{ id: string }>();
+      if (existing) return json(await matchOrder(sessionId, phoneLast4, "现场办理"));
       const orderId = crypto.randomUUID();
       const timestamp = now();
       await getD1()
@@ -386,7 +398,7 @@ export async function POST(request: Request, context: RouteContext) {
         .bind(orderId, sessionId, `WALKIN-${Date.now()}`, phoneLast4, `1** **** ${phoneLast4}`, timestamp.slice(0, 10), timestamp, timestamp)
         .run();
       await audit(sessionId, null, "WALK_IN_CREATED", null, "AWAITING_ARRIVAL", `已创建末四位 ${phoneLast4} 的现场演示订单`);
-      return json(await matchOrder(sessionId, phoneLast4), 201);
+      return json(await matchOrder(sessionId, phoneLast4, "现场办理"), 201);
     }
     if (action === "verify-identity") {
       const updated = await transition({ sessionId, caseId: body.case_id, expected: "IDENTITY_READING", next: "IDENTITY_VERIFIED", eventType: "IDENTITY_VERIFIED", detail: "读卡器自动读取与实名核验通过；仅保存演示身份 Token，不存储真实证件字段", fields: { identityResult: "verified_demo_token", hardwareStatus: "identity_read_verified" } });
