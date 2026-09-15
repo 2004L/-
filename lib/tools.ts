@@ -25,6 +25,7 @@ export const agentTurnSchema = z.object({
 export type ToolName = (typeof toolNames)[number];
 export type ToolCall = { type: "tool_call"; tool_call_id: string; tool_name: ToolName; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string };
 export type Clarification = { type: "clarification"; message: string; intent: string; confidence: number };
+export type AssistantMessage = { type: "assistant_message"; message: string };
 
 export const toolArgumentSchemas: Record<ToolName, z.ZodTypeAny> = {
   "pms.search_order": z.object({ phone_last4: z.string().regex(/^\d{4}$/) }).strict(),
@@ -50,9 +51,12 @@ const last4 = (text: string) => {
   return digits.length >= 4 ? digits.slice(-4) : null;
 };
 
-export function routeIntent(text: string, context?: { case_id?: string }): ToolCall | Clarification {
+export function routeIntent(text: string, context?: { case_id?: string }): ToolCall | Clarification | AssistantMessage {
   const normalized = text.trim().replace(/\s+/g, " ");
   const phoneLast4 = last4(normalized);
+  if (/(C语言|C 语言|C程序|Hello World|hello world|编程|代码)/i.test(normalized)) {
+    return { type: "assistant_message", message: "可以。C 语言的 Hello World 是：\n\n#include <stdio.h>\n\nint main(void) {\n    printf(\"Hello, World!\\n\");\n    return 0;\n}\n\n当前 Demo 主要负责酒店入住；这段代码只是用来测试 AI 对话是否正常。" };
+  }
   if (/(我老婆|我老公|朋友|同事).*手机号/.test(normalized)) return { type: "clarification", message: "我需要确认具体是哪位客人的预订，请说预订手机号后四位。", intent: "query_reservation", confidence: 0.96 };
   if (/(早餐|早饭|停车|停车场|押金|微信|支付宝|退房|入住时间)/.test(normalized)) {
     const topic = /早餐|早饭/.test(normalized) ? "breakfast" : /停车/.test(normalized) ? "parking" : /押金|微信|支付宝/.test(normalized) ? "payment" : "checkout";
@@ -67,5 +71,5 @@ export function routeIntent(text: string, context?: { case_id?: string }): ToolC
     if (!phoneLast4) return { type: "clarification", message: "可以，请告诉我预订手机号后四位，直接说四个数字就行。", intent: "query_reservation", confidence: 0.91 };
     return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "pms.search_order", arguments: { phone_last4: phoneLast4 }, implementation: "business_api", response_hint: "将按手机号后四位查询订单；命中多笔时会转人工。" };
   }
-  return { type: "clarification", message: "我可以帮您查订单、办理入住，或者回答早餐、停车、押金和退房问题。", intent: "general_assistance", confidence: 0.72 };
+  return { type: "clarification", message: "我听到了您的话，但当前系统主要负责酒店订单和入住办理，暂时不能执行 C 语言编程。您可以说查订单、办理入住，或者询问早餐、停车、押金和退房。", intent: "general_assistance", confidence: 0.72 };
 }

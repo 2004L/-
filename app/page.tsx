@@ -112,6 +112,7 @@ type IntentResponse = Partial<MatchResponse> & {
 
 type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
 type AgentHistoryMessage = { role: "user" | "assistant" | "tool"; content: string };
+type TranscriptEntry = { id: string; role: "user" | "assistant" | "tool"; content: string };
 
 type RecognitionResultEvent = { results: { 0: { 0: { transcript: string } } } };
 type RecognitionLike = {
@@ -216,6 +217,12 @@ function speak(text: string, enabled: boolean) {
   utterance.lang = "zh-CN";
   utterance.rate = 1;
   window.speechSynthesis.speak(utterance);
+}
+
+function resolveAsrWebSocketUrl(value: string) {
+  if (typeof window === "undefined") return value;
+  if (window.location.protocol === "https:" && value.startsWith("ws://")) return value.replace(/^ws:\/\//, "wss://");
+  return value;
 }
 
 export default function Home() {
@@ -340,6 +347,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [intentTrace, setIntentTrace] = useState<Pick<IntentResponse, "label" | "confidence" | "action"> | null>(null);
   const [flowStep, setFlowStep] = useState(0);
   const [voiceBackend, setVoiceBackend] = useState<"local" | "browser" | null>(null);
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionRef = useRef<RecognitionLike | null>(null);
   const asrSocketRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -349,6 +357,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const speechStartedAtRef = useRef(0);
   const localAsrResultRef = useRef(false);
   const conversationRef = useRef<AgentHistoryMessage[]>([]);
+
+  function recordConversation(role: TranscriptEntry["role"], content: string) {
+    const trimmed = content.trim();
+    if (!trimmed) return;
+    const entry = { id: crypto.randomUUID(), role, content: trimmed };
+    setTranscript((current) => [...current, entry].slice(-40));
+    conversationRef.current = [...conversationRef.current, { role, content: trimmed }].slice(-24);
+  }
 
   const activeMessage = useMemo(() => {
     if (phase === "complete") return "入住完成，请带好身份证和房卡";
@@ -367,6 +383,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setIntentTrace(null);
     setFlowStep(0);
     conversationRef.current = [];
+    setTranscript([]);
     setMessage("您好，今天想办理什么？");
     speak("您好，今天想办理什么？您可以直接说。", voiceEnabled);
   }
@@ -425,7 +442,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     if (!adapter.asrWsUrl || typeof WebSocket === "undefined" || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") throw new Error("local_asr_unavailable");
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     mediaStreamRef.current = stream;
-    const socket = new WebSocket(adapter.asrWsUrl);
+    const socket = new WebSocket(resolveAsrWebSocketUrl(adapter.asrWsUrl));
     const opened = new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(() => reject(new Error("local_asr_timeout")), 1400);
       socket.onopen = () => { window.clearTimeout(timer); resolve(); };
@@ -514,11 +531,11 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setPhase("searching");
     setMessage("正在理解您的意思");
     try {
-      const messages = [...conversationRef.current, { role: "user" as const, content: normalized }].slice(-24);
-      conversationRef.current = messages;
+      recordConversation("user", normalized);
+      const messages = conversationRef.current.slice(-24);
       const agent = await postAgent<AgentResponse>({ session_id: sessionId, case_id: checkinCase?.id, messages });
       if (agent.type === "clarification") {
-        conversationRef.current = [...conversationRef.current, { role: "assistant", content: agent.message }].slice(-24);
+        recordConversation("assistant", agent.message);
         setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
         setPhase("idle");
         setMessage(agent.message);
@@ -526,14 +543,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         return;
       }
       if (agent.type === "assistant_message") {
-        conversationRef.current = [...conversationRef.current, { role: "assistant", content: agent.message }].slice(-24);
+        recordConversation("assistant", agent.message);
         setIntentTrace({ label: "模型回答", confidence: 0.9, action: "respond" });
         setPhase("idle");
         setMessage(agent.message);
         speak(agent.message, voiceEnabled);
         return;
       }
-      conversationRef.current = [...conversationRef.current, { role: "assistant", content: `已选择工具 ${agent.tool_name}` }].slice(-24);
+      recordConversation("tool", `调用工具：${agent.tool_name}`);
       const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
       setIntentTrace({ label: toolLabel, confidence: 0.96, action: agent.tool_name });
       let result: IntentResponse;
@@ -544,7 +561,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       } else if (agent.tool_name === "hotel.policy_answer") {
         const topic = String(agent.arguments.topic ?? "");
         const answer = topic === "breakfast" ? "早餐时间是早上七点到十点。" : topic === "parking" ? "酒店提供停车服务，具体位置和费用以门店政策为准。" : topic === "payment" ? "押金和支付方式以当前酒店政策为准，AI 不会自行修改金额。" : "退房时间以订单和门店政策为准，如需延迟退房我会先查询房态。";
-        conversationRef.current = [...conversationRef.current, { role: "tool", content: `hotel.policy_answer 已返回 topic=${topic}` }].slice(-24);
+        recordConversation("tool", `门店政策查询完成：${topic}`);
         setPhase("idle");
         setMessage(answer);
         speak(answer, voiceEnabled);
@@ -552,14 +569,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         return;
       } else if (agent.tool_name === "device.encoder.read_status") {
         const answer = checkinCase ? `当前办理状态是 ${checkinCase.status}，发卡机状态是 ${checkinCase.hardware_status}。我只查询状态，不会重复发卡。` : "目前没有正在办理的入住任务。";
-        conversationRef.current = [...conversationRef.current, { role: "tool", content: `device.encoder.read_status 已返回 case=${checkinCase ? "active" : "none"}` }].slice(-24);
+        recordConversation("tool", `发卡机状态查询完成：${checkinCase ? "当前办理中" : "暂无办理任务"}`);
         setPhase("idle");
         setMessage(answer);
         speak(answer, voiceEnabled);
         return;
       } else if (agent.tool_name === "device.reader.read_identity" && checkinCase) {
         await postSimulator("/api/device/reader", { session_id: sessionId, case_id: checkinCase.id, idempotency_key: `reader:${checkinCase.id}`, expected_state: "IDENTITY_READING", device_id: "reader-demo-01", operation: "read_identity" });
-        conversationRef.current = [...conversationRef.current, { role: "tool", content: "device.reader.read_identity 仿真成功，已返回演示身份 Token" }].slice(-24);
+        recordConversation("tool", "读卡器仿真成功：已返回演示身份 Token");
         setPhase("matched");
         setMessage("身份证已读取，结果已交给业务流程继续核验。");
         speak("身份证已读取，正在继续核验。", voiceEnabled);
@@ -567,7 +584,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       } else {
         throw new Error("unsupported_tool");
       }
-      conversationRef.current = [...conversationRef.current, { role: "tool", content: `pms.search_order outcome=${result.outcome}; order_count=${result.orders?.length ?? (result.order ? 1 : 0)}; case=${result.checkinCase ? "created" : "none"}` }].slice(-24);
+      recordConversation("tool", `订单查询完成：${result.outcome === "matched" ? "已匹配" : result.outcome === "ambiguous" ? "存在多笔候选" : result.outcome === "not_found" ? "未找到" : "已拦截"}`);
       if (result.outcome === "matched" && result.order && result.checkinCase) {
         setMatchedOrder(result.order);
         setCheckinCase(result.checkinCase);
@@ -681,6 +698,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
       {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "停止语音交互" : "开始语音交互"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={!utterance.trim() || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label="发送"><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching"} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 语音只在本机处理" : voiceBackend === "browser" ? "浏览器语音识别备用通道" : "本地 ASR 优先 · 浏览器识别备用"}</p>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
 
+      {transcript.length > 0 && <section className="mt-8 w-full max-w-2xl rounded-[2rem] bg-white p-5 text-left shadow-sm"><div className="flex items-center justify-between"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">完整对话记录</p><span className="text-xs text-[#a1a1a6]">本次会话 · {transcript.length} 条</span></div><div className="mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">{transcript.map((entry) => <div key={entry.id} className={`whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${entry.role === "user" ? "ml-8 bg-[#eaf4ff] text-[#174a72]" : entry.role === "tool" ? "mr-8 bg-[#f5f5f7] text-[#6e6e73]" : "mr-8 bg-[#eefaf2] text-[#245d38]"}`}><p className="mb-1 text-[10px] uppercase tracking-[.14em] opacity-60">{entry.role === "user" ? "您" : entry.role === "tool" ? "系统动作" : "AI"}</p>{entry.content}</div>)}</div></section>}
       {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
 
       {phase === "ambiguous" && <RiskCard title="找到多笔待入住订单" text="仅凭手机号后四位无法确认是哪一笔。AI 已停止自动选择，需要工作人员核对完整手机号或订单号。" orders={alternatives} />}

@@ -11,9 +11,12 @@ import asyncio
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import time
+from hmac import compare_digest
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import torch
@@ -33,6 +36,10 @@ MODEL_NAME = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 MAX_AUDIO_BYTES = int(os.getenv("ASR_MAX_AUDIO_BYTES", str(8 * 1024 * 1024)))
 TRANSCRIBE_TIMEOUT = float(os.getenv("ASR_TRANSCRIBE_TIMEOUT", "20"))
 ASR_CONCURRENCY = max(1, int(os.getenv("ASR_CONCURRENCY", "1")))
+TLS_CERT = os.getenv("ASR_TLS_CERT", "").strip()
+TLS_KEY = os.getenv("ASR_TLS_KEY", "").strip()
+AUTH_TOKEN = os.getenv("ASR_AUTH_TOKEN", "").strip()
+ALLOWED_ORIGIN = os.getenv("ASR_ALLOWED_ORIGIN", "").strip()
 
 
 def resolve_ffmpeg() -> str:
@@ -52,7 +59,7 @@ def resolve_ffmpeg() -> str:
 
 def load_model() -> Qwen3ASRModel:
     dtype_name = os.getenv("QWEN_ASR_DTYPE", "float16").lower()
-    dtype = torch.bfloat16 if dtype_name in {"bf16", "bfloat16"} else torch.float16
+    dtype = torch.float32 if dtype_name in {"fp32", "float32"} else torch.bfloat16 if dtype_name in {"bf16", "bfloat16"} else torch.float16
     return Qwen3ASRModel.from_pretrained(
         MODEL_NAME,
         dtype=dtype,
@@ -112,6 +119,17 @@ async def send_error(websocket: ServerConnection, code: str, message: str) -> No
 
 
 async def handler(websocket: ServerConnection, *_: Any) -> None:
+    request = getattr(websocket, "request", None)
+    request_path = str(getattr(request, "path", "") or "")
+    origin = str(getattr(getattr(request, "headers", None), "get", lambda *_: "")("Origin") or "")
+    if ALLOWED_ORIGIN and origin != ALLOWED_ORIGIN:
+        await websocket.close(code=1008, reason="origin_not_allowed")
+        return
+    if AUTH_TOKEN:
+        supplied = parse_qs(urlparse(request_path).query).get("token", [""])[0]
+        if not compare_digest(supplied, AUTH_TOKEN):
+            await websocket.close(code=1008, reason="pairing_required")
+            return
     chunks: list[bytes] = []
     language: str | None = "Chinese"
     started = False
@@ -162,8 +180,16 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
 
 
 async def main() -> None:
-    print(f"Hotel Agent OS local ASR listening on ws://{HOST}:{PORT}/asr")
-    async with serve(handler, HOST, PORT, max_size=MAX_AUDIO_BYTES, ping_interval=20, ping_timeout=20):
+    ssl_context = None
+    scheme = "ws"
+    if TLS_CERT or TLS_KEY:
+        if not TLS_CERT or not TLS_KEY:
+            raise RuntimeError("asr_tls_cert_and_key_required")
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(TLS_CERT, TLS_KEY)
+        scheme = "wss"
+    print(f"Hotel Agent OS local ASR listening on {scheme}://{HOST}:{PORT}/asr")
+    async with serve(handler, HOST, PORT, max_size=MAX_AUDIO_BYTES, ping_interval=20, ping_timeout=20, ssl=ssl_context):
         await asyncio.Future()
 
 
