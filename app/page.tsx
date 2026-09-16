@@ -544,7 +544,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [audioCaptureStatus, setAudioCaptureStatus] = useState<"unknown" | "checking" | "ok" | "silent" | "error">("unknown");
   const [audioDeviceLabel, setAudioDeviceLabel] = useState("");
   const [audioInputs, setAudioInputs] = useState<AudioInputDevice[]>([]);
-  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState(() => typeof window === "undefined" ? "" : localStorage.getItem("hotel_audio_input_device") || "");
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionRef = useRef<RecognitionLike | null>(null);
@@ -578,7 +578,10 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   }, [selectedAudioDeviceId]);
 
   useEffect(() => {
-    queueMicrotask(() => { void refreshAudioInputs(); });
+    queueMicrotask(() => {
+      setSelectedAudioDeviceId(localStorage.getItem("hotel_audio_input_device") || "");
+      void refreshAudioInputs();
+    });
     const mediaDevices = navigator.mediaDevices;
     const handleDeviceChange = () => { void refreshAudioInputs(); };
     mediaDevices?.addEventListener?.("devicechange", handleDeviceChange);
