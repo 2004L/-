@@ -38,7 +38,9 @@ certutil.exe -user -addstore Root D:\AI-Hotel-Models\asr-certs\asr-local-ca.pem
 
 1. 客户端发送 `{"type":"start","language":"Chinese"}`。
 2. 客户端发送 WebM/Opus 二进制音频分片。
-3. 客户端发送 `{"type":"stop"}`。
-4. 服务返回 `{"type":"result","text":"...","language":"...","latency_ms":123}`，失败时返回 `{"type":"error","code":"...","message":"..."}`。
+3. 客户端等待所有音频分片发送完成后发送 `{"type":"stop"}`。
+4. 服务返回 `{"type":"result","text":"...","language":"...","latency_ms":123,"audio_chunks":12,"audio_bytes":45678,"audio_duration_ms":3200}`，失败时返回 `{"type":"error","code":"...","message":"..."}`。
+
+服务端会拒绝过短或未完整解码的录音（默认小于 800 字节或 350 毫秒），避免把没有采集完整的声音误当成“嗯”。音频统计只用于本次诊断，不写入音频内容或完整身份信息日志。`ASR_MIN_AUDIO_BYTES` 和 `ASR_MIN_AUDIO_DURATION_MS` 可按设备麦克风质量调整。
 
 音频只在内存中处理，服务不记录音频、完整手机号或身份证号。模型代码和权重请以 Qwen3-ASR 发布仓库及具体模型卡的许可证为准。

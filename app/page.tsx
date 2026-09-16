@@ -136,6 +136,9 @@ type AsrSocketMessage = {
   text?: string;
   language?: string;
   latency_ms?: number;
+  audio_chunks?: number;
+  audio_bytes?: number;
+  audio_duration_ms?: number;
   code?: string;
   message?: string;
   service?: string;
@@ -285,6 +288,10 @@ function resolveAsrWebSocketUrl(value: string) {
   if (typeof window === "undefined") return value;
   if (window.location.protocol === "https:" && value.startsWith("ws://")) return value.replace(/^ws:\/\//, "wss://");
   return value;
+}
+
+function isFillerTranscript(value: string) {
+  return /^(嗯+|啊+|呃+|额+|唉+|哦+)[。！!？?，,、\s]*$/u.test(value.trim());
 }
 
 export default function Home() {
@@ -540,6 +547,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const silenceTimerRef = useRef<number | null>(null);
   const localAsrResultRef = useRef(false);
   const voiceSubmitRequestedRef = useRef(false);
+  const asrChunkTailRef = useRef(Promise.resolve());
+  const asrAudioBytesRef = useRef(0);
+  const asrAudioChunksRef = useRef(0);
   const browserFinalTranscriptRef = useRef("");
   const browserInterimTranscriptRef = useRef("");
   const submitInFlightRef = useRef<string | null>(null);
@@ -642,11 +652,19 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     const socket = asrSocketRef.current;
     if (recorder && recorder.state !== "inactive") {
       recorder.onstop = () => {
-        if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
+        void asrChunkTailRef.current.then(() => {
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: "stop", client_audio_chunks: asrAudioChunksRef.current, client_audio_bytes: asrAudioBytesRef.current }));
+          }
+        });
       };
       recorder.stop();
     } else if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "stop" }));
+      void asrChunkTailRef.current.then(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "stop", client_audio_chunks: asrAudioChunksRef.current, client_audio_bytes: asrAudioBytesRef.current }));
+        }
+      });
     } else {
       releaseVoiceResources(true);
       setMessage("本地语音服务没有返回结果，请重试或直接输入文字");
@@ -722,6 +740,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     }
     asrSocketRef.current = socket;
     localAsrResultRef.current = false;
+    asrChunkTailRef.current = Promise.resolve();
+    asrAudioBytesRef.current = 0;
+    asrAudioChunksRef.current = 0;
     setVoiceBackend("local");
     setListening(true);
     setMessage("本地语音识别已连接，您直接说就好");
@@ -730,7 +751,17 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
     mediaRecorderRef.current = recorder;
     recorder.ondataavailable = (event) => {
-      if (event.data.size && socket.readyState === WebSocket.OPEN) void event.data.arrayBuffer().then((buffer) => socket.send(buffer));
+      if (!event.data.size) return;
+      // MediaRecorder 的 dataavailable 事件和 arrayBuffer() 是异步的。
+      // 所有分片必须按顺序排队，stop 只能在队列清空后发送，否则服务端可能只收到“嗯”这一小段。
+      const chunk = event.data;
+      asrChunkTailRef.current = asrChunkTailRef.current.then(async () => {
+        const buffer = await chunk.arrayBuffer();
+        if (socket.readyState !== WebSocket.OPEN) return;
+        socket.send(buffer);
+        asrAudioBytesRef.current += buffer.byteLength;
+        asrAudioChunksRef.current += 1;
+      }).catch(() => undefined);
     };
     recorder.onerror = () => {
       if (!localAsrResultRef.current) {
@@ -744,6 +775,13 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       if (payload.type === "result" && payload.text?.trim()) {
         localAsrResultRef.current = true;
         const transcript = payload.text.trim();
+        if (isFillerTranscript(transcript)) {
+          voiceSubmitRequestedRef.current = false;
+          setUtterance("");
+          releaseVoiceResources(true);
+          setMessage("只识别到很短的回应，请完整说出“手机尾号3452”或直接输入文字");
+          return;
+        }
         setUtterance(transcript);
         releaseVoiceResources(true);
         if (voiceSubmitRequestedRef.current) {
@@ -768,11 +806,19 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         const socket = asrSocketRef.current;
         if (recorder.state !== "inactive") {
           recorder.onstop = () => {
-            if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
+            void asrChunkTailRef.current.then(() => {
+              if (socket?.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: "stop", client_audio_chunks: asrAudioChunksRef.current, client_audio_bytes: asrAudioBytesRef.current }));
+              }
+            });
           };
           recorder.stop();
         } else if (socket?.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: "stop" }));
+          void asrChunkTailRef.current.then(() => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: "stop", client_audio_chunks: asrAudioChunksRef.current, client_audio_bytes: asrAudioBytesRef.current }));
+            }
+          });
         }
         mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
         mediaStreamRef.current = null;

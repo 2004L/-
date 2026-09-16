@@ -34,6 +34,8 @@ HOST = os.getenv("ASR_HOST", "127.0.0.1")
 PORT = int(os.getenv("ASR_PORT", "8765"))
 MODEL_NAME = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 MAX_AUDIO_BYTES = int(os.getenv("ASR_MAX_AUDIO_BYTES", str(8 * 1024 * 1024)))
+MIN_AUDIO_BYTES = int(os.getenv("ASR_MIN_AUDIO_BYTES", "800"))
+MIN_AUDIO_DURATION_MS = int(os.getenv("ASR_MIN_AUDIO_DURATION_MS", "350"))
 TRANSCRIBE_TIMEOUT = float(os.getenv("ASR_TRANSCRIBE_TIMEOUT", "20"))
 ASR_CONCURRENCY = max(1, int(os.getenv("ASR_CONCURRENCY", "1")))
 TLS_CERT = os.getenv("ASR_TLS_CERT", "").strip()
@@ -75,7 +77,7 @@ MODEL = load_model()
 TRANSCRIBE_SEMAPHORE = asyncio.Semaphore(ASR_CONCURRENCY)
 
 
-def decode_audio(audio: bytes) -> tuple[np.ndarray, int]:
+def decode_audio(audio: bytes) -> tuple[np.ndarray, int, int]:
     """Decode a browser recording into mono 16 kHz float32 PCM."""
     result = subprocess.run(
         [
@@ -102,18 +104,29 @@ def decode_audio(audio: bytes) -> tuple[np.ndarray, int]:
     if result.returncode != 0 or not result.stdout:
         raise ValueError("audio_decode_failed")
     pcm = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-    return pcm, 16000
+    duration_ms = round(len(pcm) / 16000 * 1000)
+    return pcm, 16000, duration_ms
 
 
-def transcribe(audio: bytes, language: str | None) -> dict[str, Any]:
-    samples, sample_rate = decode_audio(audio)
+def transcribe(audio: bytes, language: str | None, chunk_count: int) -> dict[str, Any]:
+    if len(audio) < MIN_AUDIO_BYTES:
+        raise ValueError("audio_too_short")
+    samples, sample_rate, duration_ms = decode_audio(audio)
+    if duration_ms < MIN_AUDIO_DURATION_MS:
+        raise ValueError("audio_too_short")
     result = MODEL.transcribe(audio=(samples, sample_rate), language=language or None)
     item = result[0]
     text = str(getattr(item, "text", "") or "").strip()
     detected_language = str(getattr(item, "language", "") or language or "").strip()
     if not text:
         raise ValueError("empty_transcript")
-    return {"text": text, "language": detected_language}
+    return {
+        "text": text,
+        "language": detected_language,
+        "audio_chunks": chunk_count,
+        "audio_bytes": len(audio),
+        "audio_duration_ms": duration_ms,
+    }
 
 
 async def send_error(websocket: ServerConnection, code: str, message: str) -> None:
@@ -170,17 +183,28 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
                 continue
             started = False
             audio = b"".join(chunks)
+            chunk_count = len(chunks)
             chunks.clear()
             started_at = time.perf_counter()
             try:
                 async with TRANSCRIBE_SEMAPHORE:
-                    result = await asyncio.wait_for(asyncio.to_thread(transcribe, audio, language), TRANSCRIBE_TIMEOUT)
+                    result = await asyncio.wait_for(asyncio.to_thread(transcribe, audio, language, chunk_count), TRANSCRIBE_TIMEOUT)
                 result.update(type="result", latency_ms=round((time.perf_counter() - started_at) * 1000))
                 await websocket.send(json.dumps(result, ensure_ascii=False))
             except asyncio.TimeoutError:
                 await send_error(websocket, "transcribe_timeout", "本地识别超时，请再说一次")
             except FileNotFoundError:
                 await send_error(websocket, "ffmpeg_missing", "本地语音服务缺少音频解码组件")
+            except ValueError as error:
+                code = str(error)
+                if code == "audio_too_short":
+                    await send_error(websocket, code, "没有采集到完整语音，请完整说出一句话后再点击发送")
+                elif code == "audio_decode_failed":
+                    await send_error(websocket, code, "录音格式无法解码，请重试或改用文字输入")
+                elif code == "empty_transcript":
+                    await send_error(websocket, code, "没有听清内容，请完整说出一句话后再试")
+                else:
+                    await send_error(websocket, "transcribe_failed", "本地语音识别失败，请再说一次")
             except Exception:
                 await send_error(websocket, "transcribe_failed", "本地识别失败，请再说一次")
         else:

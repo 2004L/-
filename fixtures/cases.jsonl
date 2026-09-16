@@ -8,6 +8,7 @@
 {"id":"relation-clarification","utterances":["我老婆的手机号"],"expected_terminal":"WAITING_FOR_PHONE_LAST4","expected_events":["INTENT_NEEDS_INFO"]}
 {"id":"change-mind","utterances":["查询4821","不是这个订单"],"expected_terminal":"CANCELLED_BY_GUEST","expected_events":["INTENT_RECOGNIZED"]}
 {"id":"two-rooms","utterances":["手机号后四位6395，一次订两间"],"expected_terminal":"ORDER_MATCHED","expected_room_count":2}
+{"id":"asr-phone-tail-chinese","utterances":["我要查订单，手机尾号四八二一"],"expected_terminal":"ORDER_MATCHED","expected_events":["ORDER_MATCHED"]}
 {"id":"idempotent-retry","utterances":["查询4821","查询4821"],"expected_terminal":"ORDER_MATCHED","expected_audit_max_delta":1}
 {"id":"concurrent-hold","utterances":["锁定1208","锁定1208"],"expected_terminal":"ONE_SUCCESS_ONE_409"}
 {"id":"invalid-tool","utterances":["执行不存在的工具"],"expected_terminal":"CLARIFICATION","expected_events":["INTENT_NEEDS_INFO"]}

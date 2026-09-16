@@ -26,6 +26,8 @@ if ($cuda.Trim() -eq "1") {
 }
 $env:ASR_CONCURRENCY = "1"
 $env:ASR_MAX_AUDIO_BYTES = "8388608"
+$env:ASR_MIN_AUDIO_BYTES = "800"
+$env:ASR_MIN_AUDIO_DURATION_MS = "350"
 $env:ASR_TRANSCRIBE_TIMEOUT = "20"
 $env:ASR_ALLOWED_ORIGIN = "https://hotel-agent-os.abloom-toast-5174.chatgpt.site"
 if ((Test-Path -LiteralPath $certPath) -and (Test-Path -LiteralPath $keyPath)) {
