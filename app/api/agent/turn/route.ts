@@ -1,4 +1,4 @@
-import { agentTurnSchema, routeIntent, toolArgumentSchemas, toolNames } from "@/lib/tools";
+import { agentTurnSchema, extractPhoneNumber, routeIntent, toolArgumentSchemas, toolNames } from "@/lib/tools";
 import { streamModel } from "@/lib/llm";
 
 export const runtime = "edge";
@@ -9,8 +9,9 @@ export async function POST(request: Request) {
     const latest = [...input.messages].reverse().find((message) => message.role === "user");
     if (!latest) return Response.json({ type: "clarification", message: "请告诉我您想办理什么。", intent: "general_assistance", confidence: 0.5 });
     const recentHistory = input.messages.slice(-6).map((message) => message.content).join(" ");
-    const pendingWalkIn = /(现场(?:办理|入住|预订)|没有?预订|直接(?:入住|住)|walk[- ]?in)/i.test(recentHistory);
-    const ruleResult = routeIntent(latest.content, { case_id: input.case_id, pending_walk_in: pendingWalkIn });
+    const pendingWalkIn = !input.walk_in_draft_id && /(现场(?:办理|入住|预订)|没有?预订|直接(?:入住|住)|walk[- ]?in)/i.test(recentHistory);
+    const pendingWalkInPhone = pendingWalkIn ? extractPhoneNumber(recentHistory) ?? undefined : undefined;
+    const ruleResult = routeIntent(latest.content, { case_id: input.case_id, pending_walk_in: pendingWalkIn, pending_walk_in_phone: pendingWalkInPhone, walk_in_draft_id: input.walk_in_draft_id, walk_in_draft_status: input.walk_in_draft_status });
     try {
       const modelResult = await streamModel(input.messages, { case_id: input.case_id });
       if (!modelResult) return Response.json(ruleResult);

@@ -101,6 +101,10 @@ type MatchResponse = {
   checkinCase?: CheckinCase;
 };
 
+type WalkInRoomType = { code: string; name: string; nightly_rate: number; deposit: number; available: number };
+type WalkInDraft = { id: string; phone_masked: string; stay_date: string; nights: number; room_count: number; room_type_code: string | null; room_type_name: string | null; nightly_rate: number | null; room_amount: number | null; deposit_amount: number | null; total_amount: number | null; status: string; payment_id: string | null; order_id: string | null };
+type WalkInPayment = { id: string; method: string; amount: number; status: string; receipt?: string | null; qr_token?: string };
+
 type IntentResponse = Partial<MatchResponse> & {
   intent: string;
   label: string;
@@ -536,6 +540,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [matchedOrder, setMatchedOrder] = useState<DemoOrder | null>(null);
   const [checkinCase, setCheckinCase] = useState<CheckinCase | null>(null);
   const [alternatives, setAlternatives] = useState<DemoOrder[]>([]);
+  const [walkInDraft, setWalkInDraft] = useState<WalkInDraft | null>(null);
+  const [walkInRoomTypes, setWalkInRoomTypes] = useState<WalkInRoomType[]>([]);
+  const [walkInPayment, setWalkInPayment] = useState<WalkInPayment | null>(null);
   const [message, setMessage] = useState("您好，今天想办理什么？");
   const [intentTrace, setIntentTrace] = useState<Pick<IntentResponse, "label" | "confidence" | "action"> | null>(null);
   const [flowStep, setFlowStep] = useState(0);
@@ -611,6 +618,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setMatchedOrder(null);
     setCheckinCase(null);
     setAlternatives([]);
+    setWalkInDraft(null);
+    setWalkInRoomTypes([]);
+    setWalkInPayment(null);
     setIntentTrace(null);
     setFlowStep(0);
     setFlowError(null);
@@ -987,7 +997,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       recordConversation("user", normalized);
       const messages = conversationRef.current.slice(-24);
       let streamedText = "";
-      const agent = await postAgentStream({ session_id: sessionId, conversation_id: conversationId || sessionId, case_id: checkinCase?.id, messages }, (delta) => {
+      const agent = await postAgentStream({ session_id: sessionId, conversation_id: conversationId || sessionId, case_id: checkinCase?.id, walk_in_draft_id: walkInDraft?.id, walk_in_draft_status: walkInDraft?.status, messages }, (delta) => {
         streamedText += delta;
         setMessage(streamedText);
       });
@@ -1009,7 +1019,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         return;
       }
       recordConversation("tool", `调用工具：${agent.tool_name}`);
-      const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "pms.create_walk_in" ? "创建现场办理单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
+      const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "pms.create_walk_in_draft" ? "创建现场办理草稿" : agent.tool_name === "pms.quote_walk_in" ? "查询房态并报价" : agent.tool_name === "payment.create" ? "生成支付页面" : agent.tool_name === "pms.create_walk_in" ? "创建现场办理单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
       setIntentTrace({ label: toolLabel, confidence: 0.96, action: agent.tool_name });
       let result: IntentResponse;
       if (agent.tool_name === "pms.search_order") {
@@ -1020,6 +1030,44 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       } else if (agent.tool_name === "pms.create_walk_in") {
         const phoneLast4 = String(agent.arguments.phone_last4 ?? "").replace(/\D/g, "").slice(-4);
         await createWalkIn(phoneLast4, generation);
+        return;
+      } else if (agent.tool_name === "pms.create_walk_in_draft") {
+        const phoneNumber = String(agent.arguments.phone_number ?? "");
+        const draftResult = await postDemo<{ draft: WalkInDraft; room_types: WalkInRoomType[] }>("walk-in-draft", { session_id: sessionId, phone_number: phoneNumber, idempotency_key: `walk-in-draft:${sessionId}:${phoneNumber.slice(-4)}` });
+        setWalkInDraft(draftResult.draft);
+        setWalkInRoomTypes(draftResult.room_types ?? []);
+        setWalkInPayment(null);
+        setPhase("idle");
+        const draftMessage = "手机号已确认。请在下方选择房型、入住晚数和房间数，我先给您报价；确认金额并完成支付后，才会创建正式订单。";
+        recordConversation("tool", "现场办理草稿已创建，等待房型和报价");
+        setMessage(draftMessage);
+        speak(draftMessage, voiceEnabled);
+        return;
+      } else if (agent.tool_name === "pms.quote_walk_in") {
+        const draftId = String(agent.arguments.draft_id ?? walkInDraft?.id ?? "");
+        const roomTypeCode = String(agent.arguments.room_type_code ?? "");
+        const nights = Number(agent.arguments.nights ?? 1);
+        const roomCount = Number(agent.arguments.room_count ?? 1);
+        const quote = await postDemo<{ draft: WalkInDraft; room_types: WalkInRoomType[] }>("walk-in-quote", { session_id: sessionId, draft_id: draftId, room_type_code: roomTypeCode, nights, room_count: roomCount, idempotency_key: `quote:${draftId}:${roomTypeCode}:${nights}:${roomCount}` });
+        setWalkInDraft(quote.draft);
+        setWalkInRoomTypes(quote.room_types ?? walkInRoomTypes);
+        setPhase("idle");
+        const quoteMessage = `报价已生成：${quote.draft.room_type_name}，${quote.draft.nights}晚${quote.draft.room_count}间，房费 ¥${quote.draft.room_amount}，押金 ¥${quote.draft.deposit_amount}，合计 ¥${quote.draft.total_amount}。请确认金额后选择支付方式。`;
+        recordConversation("tool", "房型和金额报价已生成，等待客人确认");
+        setMessage(quoteMessage);
+        speak(quoteMessage, voiceEnabled);
+        return;
+      } else if (agent.tool_name === "payment.create") {
+        const draftId = String(agent.arguments.draft_id ?? walkInDraft?.id ?? "");
+        const method = String(agent.arguments.method ?? "wechat");
+        const paymentResult = await postDemo<{ draft: WalkInDraft; payment: WalkInPayment }>("walk-in-payment", { session_id: sessionId, draft_id: draftId, method, idempotency_key: `payment:${draftId}` });
+        setWalkInDraft(paymentResult.draft);
+        setWalkInPayment(paymentResult.payment);
+        setPhase("idle");
+        const paymentMessage = `已生成${method === "alipay" ? "支付宝" : "微信"}模拟支付页面，应付 ¥${paymentResult.payment.amount}。完成支付后点击下方“模拟支付成功”，系统才会创建订单。`;
+        recordConversation("tool", "支付页面已生成，等待支付回执");
+        setMessage(paymentMessage);
+        speak(paymentMessage, voiceEnabled);
         return;
       } else if (agent.tool_name === "hotel.policy_answer") {
         const topic = String(agent.arguments.topic ?? "");
@@ -1102,6 +1150,58 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     } catch {
       setPhase("error");
       setMessage("现场办理单创建失败，请联系工作人员");
+    }
+  }
+
+  async function quoteWalkIn(roomTypeCode: string) {
+    if (!walkInDraft) return;
+    setPhase("searching");
+    try {
+      const quote = await postDemo<{ draft: WalkInDraft; room_types: WalkInRoomType[] }>("walk-in-quote", { session_id: sessionId, draft_id: walkInDraft.id, room_type_code: roomTypeCode, nights: walkInDraft.nights, room_count: walkInDraft.room_count, idempotency_key: `quote:${walkInDraft.id}:${roomTypeCode}:${walkInDraft.nights}:${walkInDraft.room_count}` });
+      setWalkInDraft(quote.draft);
+      setWalkInRoomTypes(quote.room_types ?? walkInRoomTypes);
+      setPhase("idle");
+      setMessage(`报价已生成，合计 ¥${quote.draft.total_amount}。请核对金额后选择支付方式。`);
+    } catch {
+      setPhase("error");
+      setMessage("房型报价暂时失败，请重新选择或联系工作人员。");
+    }
+  }
+
+  async function createWalkInPayment(method: "wechat" | "alipay") {
+    if (!walkInDraft) return;
+    setPhase("searching");
+    try {
+      const result = await postDemo<{ draft: WalkInDraft; payment: WalkInPayment }>("walk-in-payment", { session_id: sessionId, draft_id: walkInDraft.id, method, idempotency_key: `payment:${walkInDraft.id}` });
+      setWalkInDraft(result.draft);
+      setWalkInPayment(result.payment);
+      setPhase("idle");
+      setMessage(`已生成${method === "wechat" ? "微信" : "支付宝"}模拟支付页面，请完成支付后点击下方按钮。`);
+    } catch {
+      setPhase("error");
+      setMessage("支付页面生成失败，请重新尝试。");
+    }
+  }
+
+  async function completeWalkInPayment() {
+    if (!walkInPayment) return;
+    setPhase("searching");
+    try {
+      const result = await postDemo<{ draft: WalkInDraft; payment: WalkInPayment } & MatchResponse>("walk-in-payment-complete", { session_id: sessionId, payment_id: walkInPayment.id, idempotency_key: `payment-complete:${walkInPayment.id}` });
+      if (!result.order || !result.checkinCase) throw new Error("order_not_created");
+      setWalkInDraft(null);
+      setWalkInPayment(null);
+      setWalkInRoomTypes([]);
+      setMatchedOrder(result.order);
+      setCheckinCase(result.checkinCase);
+      setPhase("matched");
+      setMessage("支付已确认，现场订单已创建。现在请将身份证放入读卡器，系统会继续核验。");
+      recordConversation("tool", "支付成功，正式现场订单已创建并匹配入住流程");
+      speak("支付已确认，现场订单已创建。请将身份证放入读卡器。", voiceEnabled);
+      await onRefresh();
+    } catch {
+      setPhase("error");
+      setMessage("支付回执未确认，系统没有重复创建订单，请稍后重试或联系工作人员。");
     }
   }
 
@@ -1232,12 +1332,13 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
       {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在平台订了房，帮我查一下订单" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "取消语音输入" : "开始语音输入"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 说完后点击发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 说完后点击发送" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 浏览器识别备用 · 说完后点击发送"}</p>{audioCaptureStatus !== "unknown" && <div className="mt-2 flex items-center justify-center gap-2 text-xs text-[#86868b]"><span>麦克风：{audioCaptureStatus === "checking" ? "等待声音" : audioCaptureStatus === "ok" ? `已采到声音${audioDeviceLabel ? ` · ${audioDeviceLabel}` : ""}` : audioCaptureStatus === "silent" ? "未检测到有效声音" : "检测失败"}</span>{listening && <span className="h-1.5 w-16 overflow-hidden rounded-full bg-[#e5e5ea]"><span className={`block h-full rounded-full ${audioCaptureStatus === "ok" ? "bg-[#34c759]" : "bg-[#ff9500]"}`} style={{ width: `${Math.max(4, Math.round(audioLevel * 100))}%` }} /></span>}</div>}{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据仅用于本地验收，支持任意四位尾号输入</p></div>}
 
+      {walkInDraft && <section className="mt-8 w-full max-w-2xl rounded-[2rem] border border-[#d8e9f8] bg-white p-6 text-left shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#1769aa]">现场办理草稿</p><h2 className="mt-2 text-xl font-semibold">手机号 {walkInDraft.phone_masked}</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">{walkInDraft.status === "AWAITING_PAYMENT" ? "等待支付" : walkInDraft.status === "QUOTED" ? "等待确认" : "等待选房"}</span></div><p className="mt-3 text-xs leading-5 text-[#6e6e73]">这是临时草稿。未确认金额并完成支付前，不会创建正式订单，也不会进入身份证、公安或发卡流程。</p>{walkInRoomTypes.length > 0 && <div className="mt-5 grid gap-2">{walkInRoomTypes.map((room) => <button key={room.code} onClick={() => void quoteWalkIn(room.code)} disabled={phase === "searching" || walkInDraft.status === "AWAITING_PAYMENT"} className={`flex items-center justify-between rounded-2xl border px-4 py-3 text-left text-sm ${walkInDraft.room_type_code === room.code ? "border-[#007aff] bg-[#eef6ff]" : "border-[#e5e5ea] bg-white"}`}><span><span className="font-medium">{room.name}</span><span className="ml-2 text-xs text-[#86868b]">余 {room.available} 间</span></span><span className="text-[#6e6e73]">¥{room.nightly_rate}/晚</span></button>)}</div>}{walkInDraft.room_type_code && <div className="mt-5 grid grid-cols-2 gap-3 rounded-2xl bg-[#f5f5f7] p-4 text-sm"><div><p className="text-xs text-[#86868b]">已选房型</p><p className="mt-1 font-medium">{walkInDraft.room_type_name}</p></div><label className="text-xs text-[#86868b]">入住晚数<input type="number" min={1} max={30} value={walkInDraft.nights} disabled={walkInDraft.status === "AWAITING_PAYMENT"} onChange={(event) => setWalkInDraft((current) => current ? { ...current, nights: Math.min(30, Math.max(1, Number(event.target.value) || 1)), status: "DRAFT", total_amount: null, room_amount: null, deposit_amount: null } : current)} className="mt-1 w-full rounded-lg border border-[#d9d9df] bg-white px-2 py-1.5 text-sm" /></label><label className="text-xs text-[#86868b]">房间数<input type="number" min={1} max={4} value={walkInDraft.room_count} disabled={walkInDraft.status === "AWAITING_PAYMENT"} onChange={(event) => setWalkInDraft((current) => current ? { ...current, room_count: Math.min(4, Math.max(1, Number(event.target.value) || 1)), status: "DRAFT", total_amount: null, room_amount: null, deposit_amount: null } : current)} className="mt-1 w-full rounded-lg border border-[#d9d9df] bg-white px-2 py-1.5 text-sm" /></label>{walkInDraft.total_amount !== null && <div className="col-span-2 border-t border-[#e5e5ea] pt-3"><p className="text-xs text-[#86868b]">房费 ¥{walkInDraft.room_amount} + 押金 ¥{walkInDraft.deposit_amount}</p><p className="mt-1 text-lg font-semibold">合计 ¥{walkInDraft.total_amount}</p></div>}</div>}{walkInDraft.status === "QUOTED" && !walkInPayment && <div className="mt-5 flex flex-wrap gap-2"><button onClick={() => void createWalkInPayment("wechat")} disabled={phase === "searching"} className="flex-1 rounded-2xl bg-[#07c160] px-4 py-3 text-sm font-medium text-white">生成微信支付</button><button onClick={() => void createWalkInPayment("alipay")} disabled={phase === "searching"} className="flex-1 rounded-2xl bg-[#1677ff] px-4 py-3 text-sm font-medium text-white">生成支付宝支付</button></div>}{walkInPayment && <div className="mt-5 rounded-2xl border border-[#bde7cf] bg-[#effaf4] p-4"><div className="flex items-center justify-between text-sm"><span>{walkInPayment.method === "alipay" ? "支付宝" : "微信"}模拟支付</span><span className="font-semibold">¥{walkInPayment.amount}</span></div><p className="mt-2 font-mono text-xs text-[#52745f]">支付码：{walkInPayment.qr_token ?? "DEMO"}</p><button onClick={() => void completeWalkInPayment()} disabled={phase === "searching" || walkInPayment.status === "PAID"} className="mt-4 w-full rounded-2xl bg-[#1d1d1f] px-4 py-3 text-sm font-medium text-white">模拟支付成功</button></div>}</section>}
       {transcript.length > 0 && <section className="mt-8 w-full max-w-2xl rounded-[2rem] bg-white p-5 text-left shadow-sm"><div className="flex items-center justify-between"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">完整对话记录</p><span className="text-xs text-[#a1a1a6]">本次会话 · {transcript.length} 条</span></div><div className="mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">{transcript.map((entry) => <div key={entry.id} className={`whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${entry.role === "user" ? "ml-8 bg-[#eaf4ff] text-[#174a72]" : entry.role === "tool" ? "mr-8 bg-[#f5f5f7] text-[#6e6e73]" : "mr-8 bg-[#eefaf2] text-[#245d38]"}`}><p className="mb-1 text-[10px] uppercase tracking-[.14em] opacity-60">{entry.role === "user" ? "您" : entry.role === "tool" ? "系统动作" : "AI"}</p>{entry.content}</div>)}</div></section>}
       {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete" || phase === "error") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
 
       {phase === "ambiguous" && <RiskCard title="找到多笔待入住订单" text="仅凭手机号后四位无法确认是哪一笔。AI 已停止自动选择，需要工作人员核对完整手机号或订单号。" orders={alternatives} />}
       {phase === "blocked" && <RiskCard title="该订单不能继续自动办理" text={message} orders={alternatives} />}
-      {phase === "not_found" && <section className="mt-9 w-full max-w-xl rounded-[2rem] bg-white p-7 shadow-sm"><Database className="mx-auto text-[#007aff]" /><h2 className="mt-4 text-xl font-semibold">线上订单未找到</h2><p className="mt-2 text-sm leading-6 text-[#6e6e73]">如果客人确实是现场到店，可以创建一笔独立的演示现场办理单。</p><button onClick={createWalkIn} className="mt-5 rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white">创建现场办理单</button></section>}
+      {phase === "not_found" && <section className="mt-9 w-full max-w-xl rounded-[2rem] bg-white p-7 shadow-sm"><Database className="mx-auto text-[#007aff]" /><h2 className="mt-4 text-xl font-semibold">线上订单未找到</h2><p className="mt-2 text-sm leading-6 text-[#6e6e73]">如果客人是现场到店，请在输入框中说“我要现场办理”，再提供完整手机号。系统会先生成草稿、报价和支付页，支付确认后才创建正式订单。</p></section>}
       {phase === "error" && <RiskCard title={flowError ? `已停在第 ${flowError.step.number} 步：${flowError.step.label}` : "流程已安全暂停"} text={message} orders={[]} />}
       {phase === "error" && checkinCase && flowError?.reconciliation && !flowError.reconciliation.unresolved_external_call && flowError.reconciliation.recommended_action !== "manual_verify_external" && <button onClick={() => void runCheckin()} className="mt-4 rounded-full bg-[#007aff] px-6 py-3 text-sm font-medium text-white">继续当前步骤</button>}
 
