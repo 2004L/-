@@ -10,7 +10,7 @@ for (const name of ["pms.search_order", "hotel.policy_answer", "device.reader.re
   if (!tools.includes(name)) throw new Error(`缺少工具契约：${name}`);
 }
 const adminTools = readFileSync("lib/admin-tools.ts", "utf8");
-for (const name of ["admin.search_guest", "admin.get_room_status", "admin.prepare_room_change", "admin.confirm_room_change", "admin.cancel_room_change", "admin.get_audit_records"]) {
+for (const name of ["admin.search_guest", "admin.get_room_status", "admin.prepare_room_change", "admin.prepare_amount_adjustment", "admin.prepare_keycard_issue", "admin.prepare_police_submission", "admin.confirm_pending_action", "admin.confirm_room_change", "admin.cancel_pending_action", "admin.cancel_room_change", "admin.get_audit_records"]) {
   if (!adminTools.includes(name)) throw new Error(`缺少管理员工具契约：${name}`);
 }
 const auth = readFileSync("lib/admin-auth.ts", "utf8");
@@ -24,7 +24,7 @@ for (const route of ["app/api/admin/auth/login/route.ts", "app/api/admin/auth/me
   if (!readFileSync(route, "utf8").includes("ensureAdminSchema")) throw new Error(`管理员认证接口未初始化数据库：${route}`);
 }
 const adminService = readFileSync("lib/admin-service.ts", "utf8");
-for (const guard of ["AWAITING_CONFIRMATION", "room_change_conflict", "idempotent", "ADMIN_ROOM_CHANGE_EXECUTED", "NOT EXISTS"]) {
+for (const guard of ["AWAITING_CONFIRMATION", "room_change_conflict", "amount_adjustment_conflict", "ADMIN_AMOUNT_ADJUSTMENT_EXECUTED", "ADMIN_KEYCARD_ISSUE_EXECUTED", "ADMIN_POLICE_SUBMISSION_EXECUTED", "idempotent", "ADMIN_ROOM_CHANGE_EXECUTED", "NOT EXISTS"]) {
   if (!adminService.includes(guard)) throw new Error(`管理员换房安全门禁缺失：${guard}`);
 }
 for (const route of ["app/api/admin/agent/turn/route.ts", "app/api/admin/tools/execute/route.ts"]) {

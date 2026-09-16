@@ -165,12 +165,18 @@ type AsrSocketMessage = {
 type AudioInputDevice = { deviceId: string; label: string };
 type AdminUser = { id: string; hotel_code: string; username: string; display_name: string; role: "owner" | "manager" | "frontdesk" | "housekeeping"; permissions: string[] };
 
-type PendingAdminChange = {
+type PendingAdminAction = {
   actionId: string;
+  actionType: string;
+  title: string;
+  riskLevel: string;
+  requiredPermission: string;
   phone: string;
-  fromRoom: string;
-  toRoom: string;
   orderCode: string;
+  fields: Array<{ label: string; value: string }>;
+  impacts: string[];
+  confirmLabel: string;
+  cancelLabel: string;
   reason: string;
   expiresAt: string;
 };
@@ -1388,7 +1394,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   const [adminUser, setAdminUser] = useState<AdminUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
-  const [username, setUsername] = useState("admin-owner-demo");
+  const [username, setUsername] = useState("owner");
   const [password, setPassword] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -1401,9 +1407,9 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   const [adminReply, setAdminReply] = useState("管理员模式已就绪。您可以说：查询尾号4821，或把尾号4821换到1306。");
   const [adminBusy, setAdminBusy] = useState(false);
   const [pendingAdminActionId, setPendingAdminActionId] = useState<string | null>(null);
-  const [pendingAdminChange, setPendingAdminChange] = useState<PendingAdminChange | null>(null);
-  const [confirmChangeOpen, setConfirmChangeOpen] = useState(false);
-  const [changeActionBusy, setChangeActionBusy] = useState(false);
+  const [pendingAdminAction, setPendingAdminAction] = useState<PendingAdminAction | null>(null);
+  const [confirmActionOpen, setConfirmActionOpen] = useState(false);
+  const [adminActionBusy, setAdminActionBusy] = useState(false);
   useEffect(() => {
     void fetch("/api/admin/auth/me", { cache: "no-store" })
       .then((response) => response.ok ? response.json() as Promise<{ user?: AdminUser }> : Promise.reject(new Error("auth_required")))
@@ -1452,39 +1458,39 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     await fetch("/api/admin/auth/logout", { method: "POST" });
     setAdminUser(null);
   }
-  async function executePendingRoomChange() {
-    if (!pendingAdminChange || changeActionBusy) return;
-    setChangeActionBusy(true);
+  async function executePendingAdminAction() {
+    if (!pendingAdminAction || adminActionBusy) return;
+    setAdminActionBusy(true);
     try {
-      const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.confirm_room_change", arguments: { action_id: pendingAdminChange.actionId, confirmation: "CONFIRM" } }) });
+      const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.confirm_pending_action", arguments: { action_id: pendingAdminAction.actionId, confirmation: "CONFIRM" } }) });
       const data = await response.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
-      if (!response.ok || !data.ok) throw new Error(data.error ?? "换房执行失败，请重新核对房态");
+      if (!response.ok || !data.ok) throw new Error(data.error ?? "执行失败，请重新核对业务状态");
       const result = data.result ?? {};
-      setConfirmChangeOpen(false);
+      setConfirmActionOpen(false);
       setPendingAdminActionId(null);
-      setPendingAdminChange(null);
-      setAdminReply(`换房已执行：${String(result.from_room)} → ${String(result.to_room)}。PMS 已更新，操作已写入审计。`);
+      setPendingAdminAction(null);
+      setAdminReply(`已执行：${String(result.title ?? pendingAdminAction.title)}。业务系统已更新，操作已写入审计。`);
       await onRefresh();
     } catch (error) {
-      setAdminReply(error instanceof Error ? error.message : "换房执行失败，请转人工核对");
-      setConfirmChangeOpen(false);
-    } finally { setChangeActionBusy(false); }
+      setAdminReply(error instanceof Error ? error.message : "执行失败，请转人工核对");
+      setConfirmActionOpen(false);
+    } finally { setAdminActionBusy(false); }
   }
-  async function cancelPendingRoomChange() {
-    if (!pendingAdminChange || changeActionBusy) return;
-    setChangeActionBusy(true);
+  async function cancelPendingAdminAction() {
+    if (!pendingAdminAction || adminActionBusy) return;
+    setAdminActionBusy(true);
     try {
-      const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.cancel_room_change", arguments: { action_id: pendingAdminChange.actionId, reason: "管理员在确认弹窗中取消" } }) });
+      const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.cancel_pending_action", arguments: { action_id: pendingAdminAction.actionId, reason: "管理员在确认弹窗中取消" } }) });
       const data = await response.json() as { ok?: boolean; error?: string };
-      if (!response.ok || !data.ok) throw new Error(data.error ?? "取消换房失败");
-      setConfirmChangeOpen(false);
+      if (!response.ok || !data.ok) throw new Error(data.error ?? "取消失败");
+      setConfirmActionOpen(false);
       setPendingAdminActionId(null);
-      setPendingAdminChange(null);
-      setAdminReply("已取消待确认换房，没有修改 PMS。");
+      setPendingAdminAction(null);
+      setAdminReply("已取消待确认动作，没有修改 PMS、金额、公安或房卡设备。 ");
     } catch (error) {
       setAdminReply(error instanceof Error ? error.message : "取消失败，请转人工核对");
-      setConfirmChangeOpen(false);
-    } finally { setChangeActionBusy(false); }
+      setConfirmActionOpen(false);
+    } finally { setAdminActionBusy(false); }
   }
   async function submitAdminCommand(command = adminUtterance) {
     const text = command.trim();
@@ -1505,16 +1511,19 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
         setAdminReply(orders.length ? orders.map((order) => `找到${String(order.source)}订单 ${String(order.order_code)}：客人${String(order.guest_label)}，手机号尾号${String(order.phone).replace(/^\*+/, "")}，房间${String(order.room_number ?? "未分配")}，状态${String(order.status)}`).join("；") : "没有找到符合条件的客人或订单。");
       } else if (result.tool_name === "admin.get_room_status") {
         setAdminReply(toolResult.status === "occupied" ? `房间 ${String(toolResult.room_number)} 当前有人入住，已隐藏完整客人信息。` : `房间 ${String(toolResult.room_number)} 当前空闲，可继续核对。`);
-      } else if (result.tool_name === "admin.prepare_room_change") {
+      } else if (result.tool_name.startsWith("admin.prepare_")) {
         const actionId = String(toolResult.action_id ?? "");
         setPendingAdminActionId(actionId || null);
-        setPendingAdminChange({ actionId, phone: String((toolResult.guest as Record<string, unknown> | undefined)?.phone ?? "***未知"), fromRoom: String(toolResult.from_room ?? ""), toRoom: String(toolResult.to_room ?? ""), orderCode: String(toolResult.order_code ?? ""), reason: String(toolResult.reason ?? "管理员换房请求"), expiresAt: String(toolResult.expires_at ?? "") });
-        setAdminReply(`换房方案已生成：客人手机号尾号 ${String((toolResult.guest as Record<string, unknown> | undefined)?.phone ?? "")}，${String(toolResult.from_room)} → ${String(toolResult.to_room)}。请核对无误后说“确认执行”，系统会弹出确认窗口，当前没有修改 PMS。`);
-      } else if (result.tool_name === "admin.confirm_room_change") {
-        if (!pendingAdminChange) throw new Error("确认单已失效，请重新准备换房");
-        setConfirmChangeOpen(true);
-        setAdminReply("已收到“确认执行”。请在弹窗中核对修改内容，再点击“确认修改”或“取消”。在点击前不会修改 PMS。");
-      } else if (result.tool_name === "admin.cancel_room_change") { setPendingAdminActionId(null); setAdminReply("已取消待确认换房，没有修改 PMS。"); }
+        const guest = toolResult.guest as Record<string, unknown> | undefined;
+        const fields = (toolResult.fields as Array<{ label: string; value: string }> | undefined) ?? [];
+        const impacts = (toolResult.impacts as string[] | undefined) ?? [];
+        setPendingAdminAction({ actionId, actionType: String(toolResult.action_type ?? "admin_action"), title: String(toolResult.title ?? "确认执行该操作吗？"), riskLevel: String(toolResult.risk_level ?? "medium"), requiredPermission: String(toolResult.required_permission ?? "admin"), phone: String(guest?.phone ?? "***未知"), orderCode: String(toolResult.order_code ?? ""), fields, impacts, confirmLabel: String(toolResult.confirm_label ?? "确认执行"), cancelLabel: String(toolResult.cancel_label ?? "取消"), reason: String(toolResult.reason ?? "管理员指令"), expiresAt: String(toolResult.expires_at ?? "") });
+        setAdminReply(`${String(toolResult.title ?? "动作确认单")}已生成。请核对无误后说“确认执行”，系统会弹出确认窗口；点击确认前不会修改 PMS、金额、公安或房卡设备。`);
+      } else if (result.tool_name === "admin.confirm_pending_action" || result.tool_name === "admin.confirm_room_change") {
+        if (!pendingAdminAction) throw new Error("确认单已失效，请重新准备操作");
+        setConfirmActionOpen(true);
+        setAdminReply("已收到“确认执行”。请在弹窗中核对修改内容，再点击确认或取消。在点击前不会修改任何业务数据。");
+      } else if (result.tool_name === "admin.cancel_pending_action" || result.tool_name === "admin.cancel_room_change") { setPendingAdminActionId(null); setPendingAdminAction(null); setAdminReply("已取消待确认动作，没有修改 PMS、金额、公安或房卡设备。"); }
     } catch (error) { setAdminReply(error instanceof Error ? error.message : "管理员操作失败，请转人工核对"); }
     finally { setAdminBusy(false); setAdminUtterance(""); }
   }
@@ -1533,7 +1542,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     await loadFaults();
   }
   return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台 · {adminUser.display_name}（{adminUser.role}）</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button>{adminUser.permissions.includes("admin:manage_faults") && <button onClick={() => setConfirmReset(true)} className="rounded-lg bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">重置演示数据</button>}<button onClick={() => void logout()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">退出登录</button></div></div></header>
-    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 工具确认 → PMS 执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；查询会立即返回，换房等写操作先生成确认单。说“确认执行”只会打开确认窗口，点击“确认修改”后才改 PMS。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button>{pendingAdminActionId && pendingAdminChange && <button type="button" onClick={() => setConfirmChangeOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认修改 {pendingAdminChange.fromRoom} → {pendingAdminChange.toRoom}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：查一下尾号4821，或者把他换到1306" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} /><button type="submit" disabled={adminBusy || !adminUtterance.trim()} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : "发送"}</button></form><div className="mt-4 rounded-xl bg-[#f5f8fb] px-4 py-3 text-sm leading-6 text-[#334e68]">{adminReply}</div></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
+    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 动作确认 → PMS / 设备 / 公安执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；AI 先生成待确认动作，改库、改金额、发卡、公安提交都必须弹窗核对后才执行。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821的总金额改成680")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备改金额</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366重新发房卡")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备发卡</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366提交广州公安登记")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备公安登记</button>{pendingAdminActionId && pendingAdminAction && <button type="button" onClick={() => setConfirmActionOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行：{pendingAdminAction.title}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：把尾号4821换到1306，或把尾号4821的总金额改成680" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} /><button type="submit" disabled={adminBusy || !adminUtterance.trim()} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : "发送"}</button></form><div className="mt-4 rounded-xl bg-[#f5f8fb] px-4 py-3 text-sm leading-6 text-[#334e68]">{adminReply}</div></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#3b78a8]">AI Native</p><h2 className="mt-1 font-semibold">意图识别与动作对齐审计</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">只保留脱敏表达</span></div><div className="divide-y divide-[#edf2f7]">{intentEvents.length ? intentEvents.slice(0, 8).map((event) => <div key={event.id} className="grid gap-2 px-5 py-4 md:grid-cols-[1fr_auto]"><div><p className="text-sm leading-6 text-[#334e68]">{event.detail}</p><p className="mt-1 text-xs text-[#9fb3c8]">顾客表达 → 意图 → 置信度 → 受控业务动作</p></div><span className="font-mono text-xs text-[#829ab1]">#{event.id}</span></div>) : <Empty text="与AI说一句话后，这里会显示脱敏的意图识别和动作对齐记录" />}</div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>
       <section className="mt-7"><p className="text-sm text-[#627d98]">系统运行</p><h2 className="mt-1 text-xl font-semibold">实时业务数据</h2><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div></section>
@@ -1541,15 +1550,15 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       <div className="mt-7 grid gap-7 lg:grid-cols-[1fr_.85fr]"><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">办理任务</p><h2 className="mt-1 font-semibold">数据库状态机</h2></div><div className="divide-y divide-[#edf2f7]">{snapshot.cases.length ? snapshot.cases.map((item) => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="font-mono text-xs text-[#627d98]">{item.id.slice(0, 12)}… · v{item.version}</p><p className="mt-1 text-sm">房间 {item.room_number ?? "未锁定"} · 硬件 {item.hardware_status}</p></div><StatusPill value={item.status} /></div>) : <Empty text="尚无办理任务" />}</div></section>
         <section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">不可篡改式演示记录</p><h2 className="mt-1 font-semibold">最近审计事件</h2></div><div className="max-h-[430px] divide-y divide-[#edf2f7] overflow-y-auto">{snapshot.auditEvents.length ? snapshot.auditEvents.map((event) => <div key={event.id} className="px-5 py-4"><div className="flex justify-between gap-3"><p className="text-sm font-medium">{event.event_type}</p><span className="font-mono text-[10px] text-[#829ab1]">#{event.id}</span></div><p className="mt-1 text-xs leading-5 text-[#627d98]">{event.detail}</p><p className="mt-1 text-[10px] text-[#9fb3c8]">{new Date(event.created_at).toLocaleString("zh-CN")}</p></div>) : <Empty text="尚无审计事件" />}</div></section></div>
     </div>
-    <AlertDialog open={confirmChangeOpen} onOpenChange={(open) => { if (!changeActionBusy) setConfirmChangeOpen(open); }}>
+    <AlertDialog open={confirmActionOpen} onOpenChange={(open) => { if (!adminActionBusy) setConfirmActionOpen(open); }}>
       <AlertDialogContent className="border-[#cfe0f2] p-0 text-[#102a43]">
         <AlertDialogHeader className="border-b border-[#e8eef3] bg-[#f7fbff] p-6 text-left">
           <p className="text-xs font-medium uppercase tracking-[.16em] text-[#1769aa]">管理员确认</p>
-          <AlertDialogTitle className="mt-2 text-xl">确认修改房间吗？</AlertDialogTitle>
-          <AlertDialogDescription className="mt-2 text-sm leading-6 text-[#627d98]">请核对下面的脱敏信息。点击“确认修改”后，系统才会调用 PMS 更新房态；在此之前不会修改任何数据。</AlertDialogDescription>
+          <AlertDialogTitle className="mt-2 text-xl">{pendingAdminAction?.title ?? "确认执行该操作吗？"}</AlertDialogTitle>
+          <AlertDialogDescription className="mt-2 text-sm leading-6 text-[#627d98]">请核对下面的脱敏信息。点击确认后，系统才会调用受控工具；在此之前不会修改任何业务数据。</AlertDialogDescription>
         </AlertDialogHeader>
-        {pendingAdminChange && <div className="grid gap-3 p-6 text-sm"><div className="rounded-2xl border border-[#d9e2ec] bg-white p-4"><div className="grid gap-3 sm:grid-cols-2"><div><p className="text-xs text-[#829ab1]">客人手机号</p><p className="mt-1 font-medium">{pendingAdminChange.phone}</p></div><div><p className="text-xs text-[#829ab1]">订单号</p><p className="mt-1 font-mono text-xs">{pendingAdminChange.orderCode || "已匹配订单"}</p></div><div><p className="text-xs text-[#829ab1]">当前房间</p><p className="mt-1 text-lg font-semibold">{pendingAdminChange.fromRoom}</p></div><div><p className="text-xs text-[#829ab1]">目标房间</p><p className="mt-1 text-lg font-semibold text-[#007aff]">{pendingAdminChange.toRoom}</p></div></div></div><div className="rounded-xl bg-[#fff8e7] px-4 py-3 text-xs leading-5 text-[#8a6417]">操作原因：{pendingAdminChange.reason}<br />确认单有效期至：{pendingAdminChange.expiresAt ? new Date(pendingAdminChange.expiresAt).toLocaleString("zh-CN") : "5分钟内"}</div></div>}
-        <AlertDialogFooter className="border-t border-[#e8eef3] p-6 sm:justify-end"><AlertDialogCancel disabled={changeActionBusy} onClick={(event) => { event.preventDefault(); void cancelPendingRoomChange(); }} className="rounded-xl border-[#cbd9e5]">取消</AlertDialogCancel><AlertDialogAction disabled={changeActionBusy} onClick={(event) => { event.preventDefault(); void executePendingRoomChange(); }} className="rounded-xl bg-[#007aff]">{changeActionBusy ? "处理中…" : "确认修改"}</AlertDialogAction></AlertDialogFooter>
+        {pendingAdminAction && <div className="grid gap-3 p-6 text-sm"><div className="rounded-2xl border border-[#d9e2ec] bg-white p-4"><div className="grid gap-3 sm:grid-cols-2"><div><p className="text-xs text-[#829ab1]">客人手机号</p><p className="mt-1 font-medium">{pendingAdminAction.phone}</p></div><div><p className="text-xs text-[#829ab1]">订单号</p><p className="mt-1 font-mono text-xs">{pendingAdminAction.orderCode || "已匹配订单"}</p></div><div><p className="text-xs text-[#829ab1]">风险等级</p><p className={pendingAdminAction.riskLevel === "high" ? "mt-1 font-semibold text-[#b63d13]" : "mt-1 font-semibold text-[#1769aa]"}>{pendingAdminAction.riskLevel === "high" ? "高" : "中"}</p></div><div><p className="text-xs text-[#829ab1]">需要权限</p><p className="mt-1 font-mono text-xs">{pendingAdminAction.requiredPermission}</p></div>{pendingAdminAction.fields.map((field) => <div key={`${field.label}-${field.value}`}><p className="text-xs text-[#829ab1]">{field.label}</p><p className="mt-1 font-medium">{field.value}</p></div>)}</div></div><div className="rounded-xl bg-[#fff8e7] px-4 py-3 text-xs leading-5 text-[#8a6417]">操作原因：{pendingAdminAction.reason}<br />确认单有效期至：{pendingAdminAction.expiresAt ? new Date(pendingAdminAction.expiresAt).toLocaleString("zh-CN") : "5分钟内"}</div><div className="rounded-xl bg-[#f5f8fb] px-4 py-3 text-xs leading-6 text-[#334e68]">{pendingAdminAction.impacts.length ? pendingAdminAction.impacts.map((impact) => <p key={impact}>· {impact}</p>) : <p>· 系统将执行受控工具并写入管理员审计。</p>}</div></div>}
+        <AlertDialogFooter className="border-t border-[#e8eef3] p-6 sm:justify-end"><AlertDialogCancel disabled={adminActionBusy} onClick={(event) => { event.preventDefault(); void cancelPendingAdminAction(); }} className="rounded-xl border-[#cbd9e5]">{pendingAdminAction?.cancelLabel ?? "取消"}</AlertDialogCancel><AlertDialogAction disabled={adminActionBusy} onClick={(event) => { event.preventDefault(); void executePendingAdminAction(); }} className="rounded-xl bg-[#007aff]">{adminActionBusy ? "处理中…" : pendingAdminAction?.confirmLabel ?? "确认执行"}</AlertDialogAction></AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
     {confirmReset && <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 p-5" role="dialog" aria-modal="true" aria-labelledby="reset-title"><section className="w-full max-w-md rounded-3xl bg-white p-6 shadow-2xl"><div className="flex items-start justify-between"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#b63d13]">需要确认</p><h2 id="reset-title" className="mt-2 text-xl font-semibold">重置本次演示数据？</h2></div><button onClick={() => setConfirmReset(false)} aria-label="关闭"><X size={19} /></button></div><p className="mt-4 text-sm leading-6 text-[#627d98]">当前浏览器会话的办理任务、浏览器任务和审计记录会被删除，假订单恢复到初始状态。不会影响其他会话。</p><div className="mt-6 flex justify-end gap-3"><button onClick={() => setConfirmReset(false)} className="rounded-xl border border-[#cbd9e5] px-4 py-2.5 text-sm">取消</button><button onClick={() => void resetData()} disabled={resetting} className="rounded-xl bg-[#b63d13] px-4 py-2.5 text-sm text-white disabled:opacity-50">{resetting ? "重置中…" : "确认重置"}</button></div></section></div>}
