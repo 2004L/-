@@ -1494,6 +1494,20 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       setConfirmActionOpen(false);
     } finally { setAdminActionBusy(false); }
   }
+  async function fetchAdminStep(input: RequestInfo | URL, init: RequestInit, runningMessage: string, timeoutMessage: string) {
+    const controller = new AbortController();
+    const slowNotice = window.setTimeout(() => setAdminReply(`${runningMessage} · 仍在处理，请稍候…`), 3000);
+    const timeout = window.setTimeout(() => controller.abort(), 20000);
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw new Error(timeoutMessage);
+      throw error;
+    } finally {
+      window.clearTimeout(slowNotice);
+      window.clearTimeout(timeout);
+    }
+  }
   async function submitAdminCommand(command = adminUtterance, options: { fromVoiceFinal?: boolean } = {}) {
     const text = command.trim();
     if (adminVoiceListening && !options.fromVoiceFinal) {
@@ -1503,13 +1517,15 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     }
     if (!text || adminBusy) return;
     setAdminBusy(true);
+    setAdminReply("正在理解管理员意图…");
     try {
-      const routed = await fetch("/api/admin/agent/turn", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: text }], pending_action_id: pendingAdminActionId ?? undefined }) });
+      const routed = await fetchAdminStep("/api/admin/agent/turn", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: text }], pending_action_id: pendingAdminActionId ?? undefined }) }, "正在理解管理员意图", "AI 理解请求超时，本次没有执行任何操作，请重试");
       const routedData = await routed.json() as { response?: AdminResponse; error?: string };
       if (!routed.ok || !routedData.response) throw new Error(routedData.error ?? "管理员意图识别失败");
       const result = routedData.response;
       if (result.type !== "tool_call") { setAdminReply(result.message); return; }
-      const executed = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: result.tool_name, arguments: result.arguments }) });
+      setAdminReply(`已理解为“${result.tool_name}”，正在校验权限和业务状态…`);
+      const executed = await fetchAdminStep("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: result.tool_name, arguments: result.arguments }) }, "正在校验权限和业务状态", "工具执行等待超时，结果未确认，请查看审计记录后再处理；系统不会自动重试");
       const executedData = await executed.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
       if (!executed.ok || !executedData.ok) throw new Error(executedData.error ?? "管理员工具执行失败");
       const toolResult = executedData.result ?? {};
