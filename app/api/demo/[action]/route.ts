@@ -1,4 +1,5 @@
 import { getD1 } from "@/db";
+import { ensureAdminSchema, requireAdmin } from "@/lib/admin-auth";
 
 export const runtime = "edge";
 
@@ -421,6 +422,11 @@ export async function GET(request: Request, context: RouteContext) {
 
 export async function POST(request: Request, context: RouteContext) {
   const { action } = await context.params;
+  if (action === "reset") {
+    await ensureAdminSchema();
+    const auth = await requireAdmin(request, "admin:manage_faults");
+    if ("response" in auth) return auth.response;
+  }
   try {
     const body = await readBody(request);
     const sessionId = requireSession(body.session_id);

@@ -1,10 +1,14 @@
 import { faultSchema } from "@/lib/contracts";
 import { auditSimulator, ensureSession, now } from "@/lib/simulator";
 import { getD1 } from "@/db";
+import { ensureAdminSchema, requireAdmin } from "@/lib/admin-auth";
 
 export const runtime = "edge";
 
 export async function GET(request: Request) {
+  await ensureAdminSchema();
+  const auth = await requireAdmin(request, "admin:manage_faults");
+  if ("response" in auth) return auth.response;
   const sessionId = new URL(request.url).searchParams.get("session_id");
   if (!sessionId) return Response.json({ ok: false, error: "session_id_required" }, { status: 400 });
   const rows = await getD1().prepare("SELECT id, session_id, case_id, target, fault_type, trigger_on_call, repeat_count, call_count, enabled, auto_reset, created_at, updated_at FROM simulator_faults WHERE session_id = ? ORDER BY created_at DESC").bind(sessionId).all();
@@ -12,6 +16,9 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  await ensureAdminSchema();
+  const auth = await requireAdmin(request, "admin:manage_faults");
+  if ("response" in auth) return auth.response;
   try {
     const input = faultSchema.parse(await request.json());
     await ensureSession(input.session_id);

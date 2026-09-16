@@ -22,6 +22,13 @@
       "when": 1789545600000,
       "tag": "0002_walk_in_payments",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789560000000,
+      "tag": "0003_admin_auth",
+      "breakpoints": true
     }
   ]
 }
