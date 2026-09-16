@@ -1,6 +1,6 @@
 "use client";
 
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -152,6 +152,7 @@ type AsrSocketMessage = {
 };
 
 type AudioInputDevice = { deviceId: string; label: string };
+type AdminUser = { id: string; hotel_code: string; username: string; display_name: string; role: "owner" | "manager" | "frontdesk" | "housekeeping"; permissions: string[] };
 
 type PairingCheckStatus = "pending" | "checking" | "passed" | "warning" | "failed";
 type PairingCheck = { id: "context" | "microphone" | "certificate" | "service" | "connection"; label: string; status: PairingCheckStatus; detail: string };
@@ -1363,12 +1364,25 @@ function RiskCard({ title, text, orders }: { title: string; text: string; orders
 }
 
 function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack, onPairing, onReconfigure }: { sessionId: string; adapter: AdapterConfig; snapshot: Snapshot; loading: boolean; onRefresh: () => Promise<void>; onBack: () => void; onPairing: () => void; onReconfigure: () => void }) {
+  const [adminUser, setAdminUser] = useState<AdminUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
+  const [username, setUsername] = useState("admin-owner-demo");
+  const [password, setPassword] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [faultTarget, setFaultTarget] = useState("reader");
   const [faultType, setFaultType] = useState("reader_timeout");
   const [faults, setFaults] = useState<Array<{ id: string; target: string; fault_type: string; call_count: number; enabled: number }>>([]);
   const [faultMessage, setFaultMessage] = useState("");
+  useEffect(() => {
+    void fetch("/api/admin/auth/me", { cache: "no-store" })
+      .then((response) => response.ok ? response.json() as Promise<{ user?: AdminUser }> : Promise.reject(new Error("auth_required")))
+      .then((data) => setAdminUser(data.user ?? null))
+      .catch(() => setAdminUser(null))
+      .finally(() => setAuthLoading(false));
+  }, []);
   const intentEvents = snapshot.auditEvents.filter((event) => event.event_type.startsWith("INTENT_"));
   const completedCases = snapshot.cases.filter((item) => item.status === "CHECKIN_COMPLETE").length;
   const estimatedMinutesSaved = completedCases * 6;
@@ -1388,10 +1402,30 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     setFaults(data.faults ?? []);
   }
   useEffect(() => {
+    if (!adminUser) return;
     void fetch(`/api/simulator/faults?session_id=${encodeURIComponent(sessionId)}`, { cache: "no-store" })
       .then((response) => response.json() as Promise<{ faults?: typeof faults }>)
       .then((data) => setFaults(data.faults ?? []));
-  }, [sessionId]);
+  }, [sessionId, adminUser]);
+  async function login(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLoggingIn(true);
+    setAuthError("");
+    try {
+      const response = await fetch("/api/admin/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) });
+      const data = await response.json() as { user?: AdminUser; error?: string };
+      if (!response.ok || !data.user) throw new Error(data.error ?? "登录失败，请检查账号和口令");
+      setAdminUser(data.user);
+      setPassword("");
+    } catch (error) { setAuthError(error instanceof Error ? error.message : "登录失败"); }
+    finally { setLoggingIn(false); }
+  }
+  async function logout() {
+    await fetch("/api/admin/auth/logout", { method: "POST" });
+    setAdminUser(null);
+  }
+  if (authLoading) return <main className="grid min-h-screen place-items-center bg-[#f3f6f8] text-[#627d98]"><LoaderCircle className="animate-spin" /> 正在验证管理员会话…</main>;
+  if (!adminUser) return <main className="grid min-h-screen place-items-center bg-[#f3f6f8] p-5 text-[#102a43]"><form onSubmit={login} className="w-full max-w-md rounded-3xl border border-[#d9e2ec] bg-white p-7 shadow-xl"><button type="button" onClick={onBack} className="text-sm text-[#627d98]">← 返回入住终端</button><p className="mt-8 text-sm text-[#627d98]">独立管理后台</p><h1 className="mt-1 text-2xl font-semibold">管理员登录</h1><p className="mt-2 text-sm leading-6 text-[#829ab1]">登录后才能查看后台数据、配置仿真故障和执行管理员工具。会话 8 小时后自动失效。</p><label className="mt-6 block text-sm">账号<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" className="mt-2 w-full rounded-xl border border-[#cbd9e5] px-4 py-3 outline-none focus:border-[#007aff]" /></label><label className="mt-4 block text-sm">管理员口令<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" className="mt-2 w-full rounded-xl border border-[#cbd9e5] px-4 py-3 outline-none focus:border-[#007aff]" /></label>{authError && <p className="mt-3 rounded-xl bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">{authError}</p>}<button disabled={loggingIn} className="mt-6 w-full rounded-xl bg-[#007aff] px-4 py-3 font-medium text-white disabled:opacity-50">{loggingIn ? "验证中…" : "登录管理后台"}</button><p className="mt-4 text-xs leading-5 text-[#829ab1]">演示环境已预置四种角色账号；生产环境请在部署配置中替换口令并关闭演示账号。</p></form></main>;
   async function configureFault() {
     setFaultMessage("");
     const response = await fetch("/api/simulator/faults", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, target: faultTarget, fault_type: faultType, trigger_on_call: 1, repeat_count: 1, auto_reset: true }) });
@@ -1404,7 +1438,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     setFaultMessage("已恢复正常仿真");
     await loadFaults();
   }
-  return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button><button onClick={() => setConfirmReset(true)} className="rounded-lg bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">重置演示数据</button></div></div></header>
+  return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台 · {adminUser.display_name}（{adminUser.role}）</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button>{adminUser.permissions.includes("admin:manage_faults") && <button onClick={() => setConfirmReset(true)} className="rounded-lg bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">重置演示数据</button>}<button onClick={() => void logout()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">退出登录</button></div></div></header>
     <div className="mx-auto max-w-7xl p-5 md:p-9"><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#3b78a8]">AI Native</p><h2 className="mt-1 font-semibold">意图识别与动作对齐审计</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">只保留脱敏表达</span></div><div className="divide-y divide-[#edf2f7]">{intentEvents.length ? intentEvents.slice(0, 8).map((event) => <div key={event.id} className="grid gap-2 px-5 py-4 md:grid-cols-[1fr_auto]"><div><p className="text-sm leading-6 text-[#334e68]">{event.detail}</p><p className="mt-1 text-xs text-[#9fb3c8]">顾客表达 → 意图 → 置信度 → 受控业务动作</p></div><span className="font-mono text-xs text-[#829ab1]">#{event.id}</span></div>) : <Empty text="与AI说一句话后，这里会显示脱敏的意图识别和动作对齐记录" />}</div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>

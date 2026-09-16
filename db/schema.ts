@@ -213,3 +213,35 @@ export const walkInPayments = sqliteTable(
   },
   (table) => [uniqueIndex("walk_in_payments_draft_uq").on(table.draftId)]
 );
+
+export const adminUsers = sqliteTable("admin_users", {
+  id: text("id").primaryKey(),
+  hotelCode: text("hotel_code").notNull(),
+  username: text("username").notNull().unique(),
+  displayName: text("display_name").notNull(),
+  role: text("role").notNull(),
+  passwordHash: text("password_hash").notNull(),
+  enabled: integer("enabled").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const adminSessions = sqliteTable("admin_sessions", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  sessionTokenHash: text("session_token_hash").notNull().unique(),
+  expiresAt: text("expires_at").notNull(),
+  createdAt: text("created_at").notNull(),
+  lastSeenAt: text("last_seen_at").notNull(),
+  revokedAt: text("revoked_at"),
+});
+
+export const adminAuditEvents = sqliteTable("admin_audit_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: text("user_id"),
+  username: text("username"),
+  role: text("role"),
+  eventType: text("event_type").notNull(),
+  detail: text("detail").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [index("admin_audit_created_idx").on(table.createdAt, table.id)]);
