@@ -931,6 +931,24 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     } catch (error) {
       stopListening();
       const code = error instanceof Error ? error.message : "";
+      const deviceError = error instanceof DOMException ? error.name : "";
+      if (deviceError === "NotAllowedError" || deviceError === "PermissionDeniedError") {
+        setVoiceBackend("unavailable");
+        setAudioCaptureStatus("error");
+        setMessage("麦克风权限被拒绝，请在地址栏的锁形图标中允许麦克风后再试");
+        return;
+      }
+      if (deviceError === "NotFoundError" || deviceError === "DevicesNotFoundError") {
+        setVoiceBackend("unavailable");
+        setAudioCaptureStatus("error");
+        setMessage("没有找到麦克风，请检查设备是否插好，并在系统声音设置中选中输入设备");
+        return;
+      }
+      if (deviceError === "NotReadableError" || deviceError === "TrackStartError") {
+        setAudioCaptureStatus("error");
+        setMessage("麦克风被其他程序占用或无法读取，请关闭占用麦克风的应用后再试");
+        return;
+      }
       if (code === "secure_context_required") {
         setVoiceBackend("unavailable");
         setMessage("当前预览环境不开放麦克风，请用部署机的 HTTPS Chrome/Edge 访问");
