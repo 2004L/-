@@ -62,12 +62,14 @@ export const adminTurnSchema = z.object({
 export type AdminToolCall = { type: "tool_call"; tool_call_id: string; tool_name: AdminToolName; arguments: Record<string, unknown>; response_hint?: string };
 export type AdminAssistantResult = AdminToolCall | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
 
-const digits = (value: string) => value.replace(/[^0-9]/g, "");
-const findLast4 = (value: string) => value.match(/(?:尾号|后四位|后四个数字|手机号)[^0-9零〇一二两三四五六七八九]{0,4}([0-9]{4})/)?.[1] ?? (digits(value).length === 4 ? digits(value) : null);
-const findRoom = (value: string) => value.match(/(?:房间|房号|换到|改到|搬到|调到)\s*([0-9]{3,5})/)?.[1] ?? null;
+const spokenDigitMap: Record<string, string> = { 零: "0", 〇: "0", 一: "1", 幺: "1", 二: "2", 两: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9" };
+const normalizeSpokenDigits = (value: string) => [...value].map((character) => spokenDigitMap[character] ?? character).join("");
+const digits = (value: string) => normalizeSpokenDigits(value).replace(/[^0-9]/g, "");
+const findLast4 = (value: string) => { const normalized = normalizeSpokenDigits(value); return normalized.match(/(?:尾号|后四位|后四个数字|手机号)[^0-9]{0,4}([0-9]{4})/)?.[1] ?? (digits(normalized).length === 4 ? digits(normalized) : null); };
+const findRoom = (value: string) => normalizeSpokenDigits(value).match(/(?:房间|房号|换到|改到|搬到|调到)\s*([0-9]{3,5})/)?.[1] ?? null;
 
 export function routeAdminIntent(text: string, context?: { pending_action_id?: string }): AdminAssistantResult {
-  const normalized = text.trim().replace(/\s+/g, " ");
+  const normalized = normalizeSpokenDigits(text.trim().replace(/\s+/g, " "));
   const phoneLast4 = findLast4(normalized);
   if (/(确认|确定|执行|没问题|可以)/.test(normalized) && context?.pending_action_id) {
     return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "admin.confirm_room_change", arguments: { action_id: context.pending_action_id, confirmation: "CONFIRM" }, response_hint: "将重新核对房态后执行换房，并写入管理员审计。" };
