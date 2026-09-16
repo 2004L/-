@@ -115,6 +115,7 @@ type IntentResponse = Partial<MatchResponse> & {
 };
 
 type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
+type AdminResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
 type AgentHistoryMessage = { role: "user" | "assistant" | "tool"; content: string };
 type TranscriptEntry = { id: string; role: "user" | "assistant" | "tool"; content: string };
 
@@ -1376,6 +1377,12 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   const [faultType, setFaultType] = useState("reader_timeout");
   const [faults, setFaults] = useState<Array<{ id: string; target: string; fault_type: string; call_count: number; enabled: number }>>([]);
   const [faultMessage, setFaultMessage] = useState("");
+  const [adminUtterance, setAdminUtterance] = useState("");
+  const [adminReply, setAdminReply] = useState("管理员模式已就绪。您可以说：查询尾号4821，或把尾号4821换到1306。");
+  const [adminListening, setAdminListening] = useState(false);
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [pendingAdminActionId, setPendingAdminActionId] = useState<string | null>(null);
+  const adminRecognitionRef = useRef<RecognitionLike | null>(null);
   useEffect(() => {
     void fetch("/api/admin/auth/me", { cache: "no-store" })
       .then((response) => response.ok ? response.json() as Promise<{ user?: AdminUser }> : Promise.reject(new Error("auth_required")))
@@ -1421,8 +1428,59 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     finally { setLoggingIn(false); }
   }
   async function logout() {
+    adminRecognitionRef.current?.abort?.();
     await fetch("/api/admin/auth/logout", { method: "POST" });
     setAdminUser(null);
+  }
+  function toggleAdminListening() {
+    if (adminListening) { adminRecognitionRef.current?.stop(); setAdminListening(false); return; }
+    const browserWindow = window as Window & { SpeechRecognition?: RecognitionConstructor; webkitSpeechRecognition?: RecognitionConstructor };
+    const Constructor = browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition;
+    if (!Constructor) { setAdminReply("当前浏览器不支持语音识别，请直接输入文字。"); return; }
+    const recognition = new Constructor();
+    recognition.lang = "zh-CN";
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    recognition.onresult = (event) => {
+      const text = [...Array.from({ length: event.results.length }, (_, index) => event.results[index]?.[0]?.transcript ?? "")].join("").trim();
+      if (text) setAdminUtterance(text);
+    };
+    recognition.onerror = () => { setAdminListening(false); setAdminReply("没有听清，请再说一次或直接输入。"); };
+    recognition.onend = () => setAdminListening(false);
+    adminRecognitionRef.current = recognition;
+    setAdminListening(true);
+    recognition.start();
+  }
+  async function submitAdminCommand(command = adminUtterance) {
+    const text = command.trim();
+    if (!text || adminBusy) return;
+    setAdminBusy(true);
+    try {
+      const routed = await fetch("/api/admin/agent/turn", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: text }], pending_action_id: pendingAdminActionId ?? undefined }) });
+      const routedData = await routed.json() as { response?: AdminResponse; error?: string };
+      if (!routed.ok || !routedData.response) throw new Error(routedData.error ?? "管理员意图识别失败");
+      const result = routedData.response;
+      if (result.type !== "tool_call") { setAdminReply(result.message); return; }
+      const executed = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: result.tool_name, arguments: result.arguments }) });
+      const executedData = await executed.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
+      if (!executed.ok || !executedData.ok) throw new Error(executedData.error ?? "管理员工具执行失败");
+      const toolResult = executedData.result ?? {};
+      if (result.tool_name === "admin.search_guest") {
+        const orders = (toolResult.orders as Array<Record<string, unknown>> | undefined) ?? [];
+        setAdminReply(orders.length ? orders.map((order) => `找到${String(order.source)}订单 ${String(order.order_code)}：客人${String(order.guest_label)}，手机号尾号${String(order.phone).replace(/^\*+/, "")}，房间${String(order.room_number ?? "未分配")}，状态${String(order.status)}`).join("；") : "没有找到符合条件的客人或订单。");
+      } else if (result.tool_name === "admin.get_room_status") {
+        setAdminReply(toolResult.status === "occupied" ? `房间 ${String(toolResult.room_number)} 当前有人入住，已隐藏完整客人信息。` : `房间 ${String(toolResult.room_number)} 当前空闲，可继续核对。`);
+      } else if (result.tool_name === "admin.prepare_room_change") {
+        const actionId = String(toolResult.action_id ?? "");
+        setPendingAdminActionId(actionId || null);
+        setAdminReply(`换房方案已生成：客人手机号尾号 ${String((toolResult.guest as Record<string, unknown> | undefined)?.phone ?? "")}，${String(toolResult.from_room)} → ${String(toolResult.to_room)}。请核对无误后明确说“确认执行”，5分钟内有效，当前没有修改 PMS。`);
+      } else if (result.tool_name === "admin.confirm_room_change") {
+        setPendingAdminActionId(null);
+        setAdminReply(`换房已执行：${String(toolResult.from_room)} → ${String(toolResult.to_room)}。PMS 已更新，操作已写入审计。`);
+        await onRefresh();
+      } else if (result.tool_name === "admin.cancel_room_change") { setPendingAdminActionId(null); setAdminReply("已取消待确认换房，没有修改 PMS。"); }
+    } catch (error) { setAdminReply(error instanceof Error ? error.message : "管理员操作失败，请转人工核对"); }
+    finally { setAdminBusy(false); setAdminUtterance(""); }
   }
   if (authLoading) return <main className="grid min-h-screen place-items-center bg-[#f3f6f8] text-[#627d98]"><LoaderCircle className="animate-spin" /> 正在验证管理员会话…</main>;
   if (!adminUser) return <main className="grid min-h-screen place-items-center bg-[#f3f6f8] p-5 text-[#102a43]"><form onSubmit={login} className="w-full max-w-md rounded-3xl border border-[#d9e2ec] bg-white p-7 shadow-xl"><button type="button" onClick={onBack} className="text-sm text-[#627d98]">← 返回入住终端</button><p className="mt-8 text-sm text-[#627d98]">独立管理后台</p><h1 className="mt-1 text-2xl font-semibold">管理员登录</h1><p className="mt-2 text-sm leading-6 text-[#829ab1]">登录后才能查看后台数据、配置仿真故障和执行管理员工具。会话 8 小时后自动失效。</p><label className="mt-6 block text-sm">账号<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" className="mt-2 w-full rounded-xl border border-[#cbd9e5] px-4 py-3 outline-none focus:border-[#007aff]" /></label><label className="mt-4 block text-sm">管理员口令<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" className="mt-2 w-full rounded-xl border border-[#cbd9e5] px-4 py-3 outline-none focus:border-[#007aff]" /></label>{authError && <p className="mt-3 rounded-xl bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">{authError}</p>}<button disabled={loggingIn} className="mt-6 w-full rounded-xl bg-[#007aff] px-4 py-3 font-medium text-white disabled:opacity-50">{loggingIn ? "验证中…" : "登录管理后台"}</button><p className="mt-4 text-xs leading-5 text-[#829ab1]">演示环境已预置四种角色账号；生产环境请在部署配置中替换口令并关闭演示账号。</p></form></main>;
@@ -1439,7 +1497,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     await loadFaults();
   }
   return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台 · {adminUser.display_name}（{adminUser.role}）</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button>{adminUser.permissions.includes("admin:manage_faults") && <button onClick={() => setConfirmReset(true)} className="rounded-lg bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">重置演示数据</button>}<button onClick={() => void logout()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">退出登录</button></div></div></header>
-    <div className="mx-auto max-w-7xl p-5 md:p-9"><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
+    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 工具确认 → PMS 执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；查询会立即返回，换房等写操作先生成确认单，明确说“确认执行”后才改 PMS。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button>{pendingAdminActionId && <button type="button" onClick={() => void submitAdminCommand("确认执行")} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行换房</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：查一下尾号4821，或者把他换到1306" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><button type="button" onClick={toggleAdminListening} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${adminListening ? "bg-[#ff3b30] text-white" : "bg-[#eef4f9] text-[#102a43]"}`} aria-label={adminListening ? "停止管理员语音输入" : "开始管理员语音输入"}>{adminListening ? <X size={18} /> : <Mic size={18} />}</button><button type="submit" disabled={adminBusy || !adminUtterance.trim()} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : "发送"}</button></form><div className="mt-4 rounded-xl bg-[#f5f8fb] px-4 py-3 text-sm leading-6 text-[#334e68]">{adminReply}</div></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#3b78a8]">AI Native</p><h2 className="mt-1 font-semibold">意图识别与动作对齐审计</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">只保留脱敏表达</span></div><div className="divide-y divide-[#edf2f7]">{intentEvents.length ? intentEvents.slice(0, 8).map((event) => <div key={event.id} className="grid gap-2 px-5 py-4 md:grid-cols-[1fr_auto]"><div><p className="text-sm leading-6 text-[#334e68]">{event.detail}</p><p className="mt-1 text-xs text-[#9fb3c8]">顾客表达 → 意图 → 置信度 → 受控业务动作</p></div><span className="font-mono text-xs text-[#829ab1]">#{event.id}</span></div>) : <Empty text="与AI说一句话后，这里会显示脱敏的意图识别和动作对齐记录" />}</div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>
       <section className="mt-7"><p className="text-sm text-[#627d98]">系统运行</p><h2 className="mt-1 text-xl font-semibold">实时业务数据</h2><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div></section>

@@ -245,3 +245,15 @@ export const adminAuditEvents = sqliteTable("admin_audit_events", {
   detail: text("detail").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [index("admin_audit_created_idx").on(table.createdAt, table.id)]);
+
+export const adminActions = sqliteTable("admin_actions", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  toolName: text("tool_name").notNull(),
+  status: text("status").notNull(),
+  requestJson: text("request_json").notNull(),
+  resultJson: text("result_json"),
+  expiresAt: text("expires_at").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [index("admin_actions_user_status_idx").on(table.userId, table.status, table.createdAt)]);
