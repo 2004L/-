@@ -148,6 +148,7 @@ type RecognitionResultEvent = {
   resultIndex?: number;
   results: ArrayLike<{ isFinal?: boolean; 0: { transcript: string } }>;
 };
+type RecognitionErrorEvent = { error?: string };
 type RecognitionLike = {
   lang: string;
   interimResults: boolean;
@@ -156,7 +157,7 @@ type RecognitionLike = {
   stop: () => void;
   abort?: () => void;
   onresult: ((event: RecognitionResultEvent) => void) | null;
-  onerror: (() => void) | null;
+  onerror: ((event?: RecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
 };
 type RecognitionConstructor = new () => RecognitionLike;
@@ -1732,6 +1733,7 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
       return;
     }
     submitAfterStopRef.current = shouldSubmit;
+    setStatus(shouldSubmit ? "正在整理管理员语音，识别完成后自动发送…" : "正在整理管理员语音…");
     if (backend === "browser") {
       setStopping(true);
       recognitionRef.current?.stop?.();
@@ -1744,13 +1746,15 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
       recorder.onstop = () => { void audioTailRef.current.then(() => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" })); }); };
       recorder.stop();
     } else if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
+    // Qwen ASR 服务端需要先解码完整音频，再执行模型推理；3060/CPU fallback
+    // 的耗时可能超过几秒。不能像旧逻辑一样 4.5 秒就关闭 socket，否则最终结果会被丢弃。
     stopTimerRef.current = window.setTimeout(() => {
       const hadText = latestTextRef.current.trim();
       release();
-      setStatus(hadText ? "语音已结束，请确认文字后点击发送" : "没有识别到内容，请重新录音或输入文字");
+      setStatus(hadText ? "语音已识别，请确认文字后点击发送" : "本地语音识别超时，请重新录音或输入文字");
       if (hadText) maybeSubmitRecognizedText();
       else submitAfterStopRef.current = false;
-    }, 4500);
+    }, 25000);
   }
   function startBrowser() {
     const browserWindow = window as Window & { SpeechRecognition?: RecognitionConstructor; webkitSpeechRecognition?: RecognitionConstructor };
@@ -1759,14 +1763,38 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
     const recognition = new Constructor();
     recognition.lang = "zh-CN";
     recognition.interimResults = true;
-    recognition.continuous = false;
+    // 管理后台也要和用户端一样支持停顿后继续说；真正结束由“结束并发送”触发。
+    recognition.continuous = true;
     recognition.onresult = (event) => {
       const text = Array.from({ length: event.results.length }, (_, index) => event.results[index]?.[0]?.transcript ?? "").join("").trim();
       if (text) acceptText(text);
     };
-    recognition.onerror = () => { submitAfterStopRef.current = false; setStopping(false); setListening(false); setStatus("浏览器备用识别失败，请直接输入文字"); };
+    recognition.onerror = (event) => {
+      const errorCode = String(event?.error || "");
+      if (submitAfterStopRef.current) {
+        // stop() 后浏览器可能先触发 error 再触发 end；保留提交标记，交给 onend 收尾。
+        setStatus("正在整理浏览器语音…");
+        return;
+      }
+      if (["no-speech", "aborted"].includes(errorCode)) {
+        setStatus("暂时没有听清，请继续说");
+        return;
+      }
+      setStopping(false);
+      setListening(false);
+      recognitionRef.current = null;
+      setStatus("浏览器备用识别失败，请检查麦克风权限或直接输入文字");
+    };
     recognition.onend = () => {
       const hadText = latestTextRef.current.trim();
+      if (!submitAfterStopRef.current && recognitionRef.current === recognition) {
+        // Edge 会在短暂停顿时结束一次识别；自动续接，避免后台只收到半句话。
+        window.setTimeout(() => {
+          if (recognitionRef.current !== recognition || submitAfterStopRef.current) return;
+          try { recognition.start(); } catch { setStatus("语音通道正在恢复，请继续说"); }
+        }, 120);
+        return;
+      }
       setStopping(false);
       setListening(false);
       if (!maybeSubmitRecognizedText()) setStatus(hadText ? "语音已识别，请确认文字后点击发送" : "没有识别到内容，请重新录音或输入文字");
@@ -1796,7 +1824,7 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(resolveAsrWebSocketUrl(adapter.asrWsUrl));
       socketRef.current = socket;
-      const timer = window.setTimeout(() => { socket.close(); reject(new Error("local_asr_timeout")); }, 1800);
+      const timer = window.setTimeout(() => { socket.close(); reject(new Error("local_asr_timeout")); }, 3000);
       socket.onopen = () => { window.clearTimeout(timer); resolve(); };
       socket.onerror = () => { window.clearTimeout(timer); reject(new Error("local_asr_socket_error")); };
     });
@@ -1857,7 +1885,7 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => () => release(), []);
   const selectedLabel = inputs.find((device) => device.deviceId === selectedDeviceId)?.label || "系统默认麦克风";
-  return <div className="flex flex-wrap items-center gap-2"><select value={selectedDeviceId} onChange={(event) => { const value = event.target.value; setSelectedDeviceId(value); localStorage.setItem("hotel_admin_audio_input_device", value); setStatus(value ? "已选择管理员输入设备" : "已恢复系统默认麦克风"); }} className="max-w-[190px] rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-3 py-3 text-xs" aria-label="管理员输入设备"><option value="">系统默认麦克风</option>{inputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select><button type="button" onClick={toggle} disabled={stopping} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30] text-white" : "bg-[#eef4f9] text-[#102a43]"}`} aria-label={listening ? "停止管理员语音输入" : "开始管理员语音输入"}>{listening ? <X size={18} /> : <Mic size={18} />}</button><span className="min-w-[180px] text-xs text-[#627d98]">{status} · {selectedLabel}{listening && <span className="ml-2 inline-block h-1.5 w-12 overflow-hidden rounded-full bg-[#e5e5ea] align-middle"><span className="block h-full bg-[#34c759]" style={{ width: `${Math.max(5, Math.round(level * 100))}%` }} /></span>}</span><span className="sr-only">当前语音后端：{backend}</span></div>;
+  return <div className="flex flex-wrap items-center gap-2"><select value={selectedDeviceId} onChange={(event) => { const value = event.target.value; setSelectedDeviceId(value); localStorage.setItem("hotel_admin_audio_input_device", value); setStatus(value ? "已选择管理员输入设备" : "已恢复系统默认麦克风"); }} className="max-w-[190px] rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-3 py-3 text-xs" aria-label="管理员输入设备"><option value="">系统默认麦克风</option>{inputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select><button type="button" onClick={toggle} disabled={stopping} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30] text-white" : "bg-[#eef4f9] text-[#102a43]"}`} aria-label={listening ? "取消管理员语音输入" : "开始管理员语音输入"}>{listening ? <X size={18} /> : <Mic size={18} />}</button><span className="min-w-[180px] text-xs text-[#627d98]">{status} · {selectedLabel}{listening && <span className="ml-2 inline-block h-1.5 w-12 overflow-hidden rounded-full bg-[#e5e5ea] align-middle"><span className="block h-full bg-[#34c759]" style={{ width: `${Math.max(5, Math.round(level * 100))}%` }} /></span>}</span><span className="sr-only">当前语音后端：{backend}</span></div>;
 }
 
 type AdminChartDatum = { name: string; value: number };
