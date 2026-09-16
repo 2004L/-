@@ -33,6 +33,12 @@ type CommandRow = {
 const SESSION_PATTERN = /^[a-zA-Z0-9_-]{8,80}$/;
 const LAST4_PATTERN = /^\d{4}$/;
 
+const ROOM_TYPE_OPTIONS = [
+  { code: "STD-KING", name: "标准大床房", nightlyRate: 260, deposit: 200, available: 3 },
+  { code: "DLX-KING", name: "高级大床房", nightlyRate: 380, deposit: 300, available: 2 },
+  { code: "DLX-TWIN", name: "豪华双床房", nightlyRate: 420, deposit: 300, available: 1 },
+] as const;
+
 const STATE_LABELS: Record<string, string> = {
   ORDER_MATCHED: "订单已匹配",
   IDENTITY_READING: "正在读取身份证",
@@ -80,6 +86,30 @@ function requireLast4(value: unknown) {
     throw new Error("invalid_phone_last4");
   }
   return value;
+}
+
+function requireFullPhone(value: unknown) {
+  if (typeof value !== "string") throw new Error("invalid_phone_number");
+  const digitMap: Record<string, string> = { 零: "0", 〇: "0", 一: "1", 幺: "1", 二: "2", 两: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9" };
+  const digits = [...value].map((character) => digitMap[character] ?? character).join("").replace(/\D/g, "");
+  const phone = digits.match(/1[3-9]\d{9}/)?.[0];
+  if (!phone) throw new Error("invalid_phone_number");
+  return phone;
+}
+
+async function phoneToken(phone: string) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(phone));
+  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function ensureWalkInSchema() {
+  const db = getD1();
+  await db.batch([
+    db.prepare("CREATE TABLE IF NOT EXISTS walk_in_drafts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, phone_token TEXT NOT NULL, phone_last4 TEXT NOT NULL, phone_masked TEXT NOT NULL, stay_date TEXT NOT NULL, nights INTEGER NOT NULL DEFAULT 1, room_count INTEGER NOT NULL DEFAULT 1, room_type_code TEXT, room_type_name TEXT, nightly_rate INTEGER, room_amount INTEGER, deposit_amount INTEGER, total_amount INTEGER, status TEXT NOT NULL, payment_id TEXT, order_id TEXT, idempotency_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS walk_in_drafts_session_status_idx ON walk_in_drafts(session_id, status, created_at)"),
+    db.prepare("CREATE TABLE IF NOT EXISTS walk_in_payments (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, draft_id TEXT NOT NULL, method TEXT NOT NULL, amount INTEGER NOT NULL, status TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, receipt TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"),
+    db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS walk_in_payments_draft_uq ON walk_in_payments(draft_id)"),
+  ]);
 }
 
 function requireUtterance(value: unknown) {
@@ -142,6 +172,7 @@ async function readBody(request: Request) {
 
 async function seedSession(sessionId: string) {
   const db = getD1();
+  await ensureWalkInSchema();
   const timestamp = now();
   await db
     .prepare("INSERT OR IGNORE INTO demo_sessions (id, hotel_code, city, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
@@ -181,6 +212,51 @@ async function snapshot(sessionId: string) {
     db.prepare("SELECT id, case_id, event_type, from_state, to_state, detail, created_at FROM audit_events WHERE session_id = ? ORDER BY id DESC LIMIT 80").bind(sessionId).all(),
   ]);
   return { orders: orders.results, cases: cases.results, browserJobs: jobs.results, auditEvents: audit.results };
+}
+
+type WalkInDraftRow = {
+  id: string; session_id: string; phone_token: string; phone_last4: string; phone_masked: string; stay_date: string;
+  nights: number; room_count: number; room_type_code: string | null; room_type_name: string | null; nightly_rate: number | null;
+  room_amount: number | null; deposit_amount: number | null; total_amount: number | null; status: string; payment_id: string | null;
+  order_id: string | null; idempotency_key: string; created_at: string; updated_at: string;
+};
+
+type WalkInPaymentRow = {
+  id: string; session_id: string; draft_id: string; method: string; amount: number; status: string; idempotency_key: string;
+  receipt: string | null; created_at: string; updated_at: string;
+};
+
+function serializeDraft(row: WalkInDraftRow) {
+  return {
+    id: row.id, phone_masked: row.phone_masked, stay_date: row.stay_date, nights: row.nights, room_count: row.room_count,
+    room_type_code: row.room_type_code, room_type_name: row.room_type_name, nightly_rate: row.nightly_rate,
+    room_amount: row.room_amount, deposit_amount: row.deposit_amount, total_amount: row.total_amount,
+    status: row.status, payment_id: row.payment_id, order_id: row.order_id, updated_at: row.updated_at,
+  };
+}
+
+function roomOption(code: unknown) {
+  if (typeof code !== "string") throw new Error("invalid_room_type");
+  const option = ROOM_TYPE_OPTIONS.find((item) => item.code === code);
+  if (!option) throw new Error("invalid_room_type");
+  return option;
+}
+
+function positiveInteger(value: unknown, name: string, min: number, max: number) {
+  const number = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(number) || number < min || number > max) throw new Error(`invalid_${name}`);
+  return number;
+}
+
+async function loadDraft(sessionId: string, draftId: unknown) {
+  if (typeof draftId !== "string" || draftId.length < 8) throw new Error("invalid_draft_id");
+  const row = await getD1().prepare("SELECT * FROM walk_in_drafts WHERE id = ? AND session_id = ?").bind(draftId, sessionId).first<WalkInDraftRow>();
+  if (!row) throw new Error("draft_not_found");
+  return row;
+}
+
+function roomTypes() {
+  return ROOM_TYPE_OPTIONS.map((item) => ({ code: item.code, name: item.name, nightly_rate: item.nightlyRate, deposit: item.deposit, available: item.available }));
 }
 
 async function audit(sessionId: string, caseId: string | null, eventType: string, fromState: string | null, toState: string | null, detail: string) {
@@ -351,6 +427,8 @@ export async function POST(request: Request, context: RouteContext) {
     await seedSession(sessionId);
 
     if (action === "reset") {
+      await getD1().prepare("DELETE FROM walk_in_payments WHERE session_id = ?").bind(sessionId).run();
+      await getD1().prepare("DELETE FROM walk_in_drafts WHERE session_id = ?").bind(sessionId).run();
       await getD1().prepare("DELETE FROM demo_sessions WHERE id = ?").bind(sessionId).run();
       await seedSession(sessionId);
       return json({ ok: true, ...(await snapshot(sessionId)) });
@@ -386,6 +464,80 @@ export async function POST(request: Request, context: RouteContext) {
         return json({ ...classified, assistantMessage: "我理解您想停止办理。取消可能涉及退款或解除锁房，需要您再次确认，演示系统不会直接执行。" });
       }
       return json({ ...classified, assistantMessage: classified.answer ?? "可以直接告诉我您想入住、查询订单，或者询问早餐、停车、押金和退房。" });
+    }
+    if (action === "walk-in-draft") {
+      const phone = requireFullPhone(body.phone_number);
+      const token = await phoneToken(phone);
+      const idempotencyKey = typeof body.idempotency_key === "string" && body.idempotency_key.length <= 160 ? body.idempotency_key : `walk-in-draft:${sessionId}:${token}`;
+      const existing = await getD1().prepare("SELECT * FROM walk_in_drafts WHERE session_id = ? AND idempotency_key = ?").bind(sessionId, idempotencyKey).first<WalkInDraftRow>();
+      if (existing) return json({ ok: true, reused: true, draft: serializeDraft(existing), room_types: roomTypes() });
+      const draftId = crypto.randomUUID();
+      const timestamp = now();
+      await getD1().prepare("INSERT INTO walk_in_drafts (id, session_id, phone_token, phone_last4, phone_masked, stay_date, nights, room_count, status, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'DRAFT', ?, ?, ?)")
+        .bind(draftId, sessionId, token, phone.slice(-4), `1** **** ${phone.slice(-4)}`, timestamp.slice(0, 10), idempotencyKey, timestamp, timestamp).run();
+      await audit(sessionId, null, "WALK_IN_DRAFT_CREATED", null, "DRAFT", "已确认完整手机号并创建现场办理草稿；手机号仅保存为掩码和不可逆令牌");
+      const draft = await loadDraft(sessionId, draftId);
+      return json({ ok: true, reused: false, draft: serializeDraft(draft), room_types: roomTypes() }, 201);
+    }
+    if (action === "walk-in-quote") {
+      const draft = await loadDraft(sessionId, body.draft_id);
+      if (!["DRAFT", "QUOTED"].includes(draft.status)) throw new Error(`invalid_draft_status:${draft.status}`);
+      const option = roomOption(body.room_type_code);
+      const nights = positiveInteger(body.nights, "nights", 1, 30);
+      const roomCount = positiveInteger(body.room_count, "room_count", 1, 4);
+      const roomAmount = option.nightlyRate * nights * roomCount;
+      const depositAmount = option.deposit * roomCount;
+      const totalAmount = roomAmount + depositAmount;
+      if (draft.status === "QUOTED" && draft.room_type_code === option.code && draft.nights === nights && draft.room_count === roomCount && draft.total_amount === totalAmount) {
+        return json({ ok: true, reused: true, draft: serializeDraft(draft), room_types: roomTypes() });
+      }
+      const timestamp = now();
+      await getD1().prepare("UPDATE walk_in_drafts SET room_type_code = ?, room_type_name = ?, nightly_rate = ?, room_amount = ?, deposit_amount = ?, total_amount = ?, nights = ?, room_count = ?, status = 'QUOTED', updated_at = ? WHERE id = ? AND session_id = ? AND status IN ('DRAFT','QUOTED')")
+        .bind(option.code, option.name, option.nightlyRate, roomAmount, depositAmount, totalAmount, nights, roomCount, timestamp, draft.id, sessionId).run();
+      await audit(sessionId, null, "WALK_IN_QUOTED", "DRAFT", "QUOTED", `已生成${option.name}报价：${nights}晚、${roomCount}间；金额以后台计算为准，支付前不创建正式订单`);
+      const updated = await loadDraft(sessionId, draft.id);
+      return json({ ok: true, reused: false, draft: serializeDraft(updated), room_types: roomTypes() });
+    }
+    if (action === "walk-in-payment") {
+      const draft = await loadDraft(sessionId, body.draft_id);
+      if (draft.status !== "QUOTED" || !draft.total_amount) throw new Error(`payment_requires_quote:${draft.status}`);
+      const method = body.method === "alipay" || body.method === "wechat" ? body.method : null;
+      if (!method) throw new Error("invalid_payment_method");
+      const idempotencyKey = typeof body.idempotency_key === "string" && body.idempotency_key.length <= 160 ? body.idempotency_key : `payment:${draft.id}`;
+      const db = getD1();
+      const existing = await db.prepare("SELECT * FROM walk_in_payments WHERE draft_id = ?").bind(draft.id).first<WalkInPaymentRow>();
+      if (existing) return json({ ok: true, reused: true, draft: serializeDraft(draft), payment: { id: existing.id, method: existing.method, amount: existing.amount, status: existing.status, receipt: existing.receipt, qr_token: `DEMO-${existing.id.slice(0, 8)}` } });
+      const paymentId = crypto.randomUUID();
+      const timestamp = now();
+      await db.prepare("INSERT INTO walk_in_payments (id, session_id, draft_id, method, amount, status, idempotency_key, receipt, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, NULL, ?, ?)")
+        .bind(paymentId, sessionId, draft.id, method, draft.total_amount, idempotencyKey, timestamp, timestamp).run();
+      await db.prepare("UPDATE walk_in_drafts SET status = 'AWAITING_PAYMENT', payment_id = ?, updated_at = ? WHERE id = ? AND session_id = ? AND status = 'QUOTED'").bind(paymentId, timestamp, draft.id, sessionId).run();
+      await audit(sessionId, null, "PAYMENT_STARTED", "QUOTED", "AWAITING_PAYMENT", `已生成${method === "wechat" ? "微信" : "支付宝"}模拟支付页面；应付金额由报价单锁定`);
+      const updated = await loadDraft(sessionId, draft.id);
+      return json({ ok: true, reused: false, draft: serializeDraft(updated), payment: { id: paymentId, method, amount: draft.total_amount, status: "PENDING", qr_token: `DEMO-${paymentId.slice(0, 8)}` } }, 201);
+    }
+    if (action === "walk-in-payment-complete") {
+      if (typeof body.payment_id !== "string") throw new Error("invalid_payment_id");
+      const db = getD1();
+      const payment = await db.prepare("SELECT * FROM walk_in_payments WHERE id = ? AND session_id = ?").bind(body.payment_id, sessionId).first<WalkInPaymentRow>();
+      if (!payment) throw new Error("payment_not_found");
+      const draft = await loadDraft(sessionId, payment.draft_id);
+      if (payment.status === "PAID" && draft.order_id) return json({ ok: true, reused: true, draft: serializeDraft(draft), payment: { id: payment.id, method: payment.method, amount: payment.amount, status: payment.status, receipt: payment.receipt }, ...(await matchOrder(sessionId, draft.phone_last4, "现场办理")) });
+      if (payment.status !== "PENDING" || draft.status !== "AWAITING_PAYMENT") throw new Error(`invalid_payment_status:${payment.status}:${draft.status}`);
+      const timestamp = now();
+      const receipt = `DEMO-PAY-${Date.now().toString().slice(-8)}`;
+      const paid = await db.prepare("UPDATE walk_in_payments SET status = 'PAID', receipt = ?, updated_at = ? WHERE id = ? AND session_id = ? AND status = 'PENDING'").bind(receipt, timestamp, payment.id, sessionId).run();
+      if ((paid.meta.changes ?? 0) !== 1) throw new Error("concurrent_payment");
+      const orderId = crypto.randomUUID();
+      const orderCode = `WALKIN-${Date.now()}`;
+      await db.prepare("INSERT INTO demo_orders (id, session_id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number, created_at, updated_at) VALUES (?, ?, ?, '现场办理', '现场演示住客', ?, ?, ?, ?, ?, ?, 'awaiting_arrival', NULL, ?, ?)")
+        .bind(orderId, sessionId, orderCode, draft.phone_last4, draft.phone_masked, draft.stay_date, draft.nights, draft.room_count, draft.room_type_name ?? "标准大床房", timestamp, timestamp).run();
+      await db.prepare("UPDATE walk_in_drafts SET status = 'ORDER_CREATED', order_id = ?, updated_at = ? WHERE id = ? AND session_id = ? AND status = 'AWAITING_PAYMENT'").bind(orderId, timestamp, draft.id, sessionId).run();
+      await audit(sessionId, null, "PAYMENT_CONFIRMED", "AWAITING_PAYMENT", "PAID", `模拟支付成功，回执 ${receipt}`);
+      await audit(sessionId, null, "WALK_IN_ORDER_CREATED", "PAID", "ORDER_CREATED", `支付成功后创建现场订单 ${orderCode}；未支付不会创建正式订单`);
+      const matched = await matchOrder(sessionId, draft.phone_last4, "现场办理");
+      const updated = await loadDraft(sessionId, draft.id);
+      return json({ ok: true, reused: false, draft: serializeDraft(updated), payment: { id: payment.id, method: payment.method, amount: payment.amount, status: "PAID", receipt }, ...matched }, 201);
     }
     if (action === "walk-in") {
       const phoneLast4 = requireLast4(body.phone_last4);
@@ -454,9 +606,9 @@ export async function POST(request: Request, context: RouteContext) {
 
 function handleError(error: unknown) {
   const message = error instanceof Error ? error.message : "internal_error";
-  if (message === "invalid_json" || message.startsWith("invalid_")) return json({ error: message }, 400);
-  if (message === "case_not_found") return json({ error: message }, 404);
-  if (message === "concurrent_update") return json({ error: message, error_code: "CONCURRENT_UPDATE", retryable: true }, 409);
+  if (message === "invalid_json" || message.startsWith("invalid_") || message.startsWith("payment_requires_quote") || message.startsWith("invalid_draft_status")) return json({ error: message }, 400);
+  if (message === "case_not_found" || message === "draft_not_found" || message === "payment_not_found") return json({ error: message }, 404);
+  if (message === "concurrent_update" || message === "concurrent_payment") return json({ error: message, error_code: "CONCURRENT_UPDATE", retryable: true }, 409);
   if (message.startsWith("invalid_transition")) {
     const [, currentState, expectedNext] = message.split(":");
     return json({ error: "invalid_transition", error_code: "INVALID_TRANSITION", current_state: currentState, expected_next: expectedNext, retryable: false }, 409);

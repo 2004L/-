@@ -169,3 +169,47 @@ export const manualTasks = sqliteTable(
   },
   (table) => [index("manual_tasks_session_status_idx").on(table.sessionId, table.status, table.createdAt)]
 );
+
+export const walkInDrafts = sqliteTable(
+  "walk_in_drafts",
+  {
+    id: text("id").primaryKey(),
+    sessionId: text("session_id").notNull().references(() => demoSessions.id, { onDelete: "cascade" }),
+    phoneToken: text("phone_token").notNull(),
+    phoneLast4: text("phone_last4").notNull(),
+    phoneMasked: text("phone_masked").notNull(),
+    stayDate: text("stay_date").notNull(),
+    nights: integer("nights").notNull().default(1),
+    roomCount: integer("room_count").notNull().default(1),
+    roomTypeCode: text("room_type_code"),
+    roomTypeName: text("room_type_name"),
+    nightlyRate: integer("nightly_rate"),
+    roomAmount: integer("room_amount"),
+    depositAmount: integer("deposit_amount"),
+    totalAmount: integer("total_amount"),
+    status: text("status").notNull(),
+    paymentId: text("payment_id"),
+    orderId: text("order_id"),
+    idempotencyKey: text("idempotency_key").notNull().unique(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("walk_in_drafts_session_status_idx").on(table.sessionId, table.status, table.createdAt)]
+);
+
+export const walkInPayments = sqliteTable(
+  "walk_in_payments",
+  {
+    id: text("id").primaryKey(),
+    sessionId: text("session_id").notNull().references(() => demoSessions.id, { onDelete: "cascade" }),
+    draftId: text("draft_id").notNull().references(() => walkInDrafts.id, { onDelete: "cascade" }),
+    method: text("method").notNull(),
+    amount: integer("amount").notNull(),
+    status: text("status").notNull(),
+    idempotencyKey: text("idempotency_key").notNull().unique(),
+    receipt: text("receipt"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("walk_in_payments_draft_uq").on(table.draftId)]
+);
