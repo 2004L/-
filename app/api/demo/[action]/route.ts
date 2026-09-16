@@ -485,6 +485,7 @@ export async function POST(request: Request, context: RouteContext) {
       const option = roomOption(body.room_type_code);
       const nights = positiveInteger(body.nights, "nights", 1, 30);
       const roomCount = positiveInteger(body.room_count, "room_count", 1, 4);
+      if (roomCount > option.available) throw new Error("room_not_available");
       const roomAmount = option.nightlyRate * nights * roomCount;
       const depositAmount = option.deposit * roomCount;
       const totalAmount = roomAmount + depositAmount;
@@ -606,7 +607,7 @@ export async function POST(request: Request, context: RouteContext) {
 
 function handleError(error: unknown) {
   const message = error instanceof Error ? error.message : "internal_error";
-  if (message === "invalid_json" || message.startsWith("invalid_") || message.startsWith("payment_requires_quote") || message.startsWith("invalid_draft_status")) return json({ error: message }, 400);
+  if (message === "invalid_json" || message.startsWith("invalid_") || message === "room_not_available" || message.startsWith("payment_requires_quote") || message.startsWith("invalid_draft_status")) return json({ error: message }, 400);
   if (message === "case_not_found" || message === "draft_not_found" || message === "payment_not_found") return json({ error: message }, 404);
   if (message === "concurrent_update" || message === "concurrent_payment") return json({ error: message, error_code: "CONCURRENT_UPDATE", retryable: true }, 409);
   if (message.startsWith("invalid_transition")) {

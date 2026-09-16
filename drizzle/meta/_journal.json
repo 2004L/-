@@ -15,6 +15,13 @@
       "when": 1789380000000,
       "tag": "0001_simulator_contracts",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789545600000,
+      "tag": "0002_walk_in_payments",
+      "breakpoints": true
     }
   ]
 }
