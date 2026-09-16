@@ -14,7 +14,7 @@ for (const name of ["admin.search_guest", "admin.get_room_status", "admin.prepar
   if (!adminTools.includes(name)) throw new Error(`缺少管理员工具契约：${name}`);
 }
 const auth = readFileSync("lib/admin-auth.ts", "utf8");
-for (const guard of ["admin_users", "admin_sessions", "admin_audit_events", "HttpOnly", "admin_permission_denied", "password_salt", "pbkdf2", "SESSION_IDLE_MINUTES", "adminLoginThrottled"]) {
+for (const guard of ["admin_users", "admin_sessions", "admin_audit_events", "HttpOnly", "admin_permission_denied", "password_salt", "pbkdf2", "PBKDF2_ITERATIONS", "100000", "SESSION_IDLE_MINUTES", "adminLoginThrottled"]) {
   if (!auth.includes(guard)) throw new Error(`缺少管理员安全边界：${guard}`);
 }
 if (!readFileSync("app/api/admin/auth/login/route.ts", "utf8").includes("Retry-After")) throw new Error("管理员登录限流未声明 Retry-After");

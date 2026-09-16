@@ -4,6 +4,8 @@ import { rolePermissions, type AdminPermission, type AdminRole } from "@/lib/adm
 export const ADMIN_COOKIE = "hotel_admin_session";
 const SESSION_HOURS = 8;
 const SESSION_IDLE_MINUTES = 30;
+// Cloudflare/Edge Web Crypto 的 PBKDF2 上限为 100000。
+const PBKDF2_ITERATIONS = 100000;
 const DEMO_SEED = "hotel-demo-2026";
 
 export type AdminUser = { id: string; hotel_code: string; username: string; display_name: string; role: AdminRole; permissions: readonly AdminPermission[] };
@@ -27,18 +29,22 @@ function hex(bytes: Uint8Array) { return [...bytes].map((byte) => byte.toString(
 
 async function hashPassword(value: string, salt = crypto.randomUUID().replaceAll("-", "")) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(value), "PBKDF2", false, ["deriveBits"]);
-  const derived = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 120000, hash: "SHA-256" }, key, 256);
-  return { hash: `pbkdf2$120000$${salt}$${hex(new Uint8Array(derived))}`, salt };
+  const derived = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" }, key, 256);
+  return { hash: `pbkdf2$${PBKDF2_ITERATIONS}$${salt}$${hex(new Uint8Array(derived))}`, salt };
 }
 
 async function verifyPassword(value: string, stored: string, salt: string | null) {
   if (stored.startsWith("pbkdf2$") && salt) {
     const [scheme, iterationsText, encodedSalt, encodedHash] = stored.split("$");
     const iterations = Number(iterationsText);
-    if (scheme !== "pbkdf2" || !Number.isInteger(iterations) || iterations < 100000 || !encodedSalt || !encodedHash) return false;
-    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(value), "PBKDF2", false, ["deriveBits"]);
-    const derived = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(encodedSalt), iterations, hash: "SHA-256" }, key, 256);
-    return hex(new Uint8Array(derived)) === encodedHash;
+    if (scheme !== "pbkdf2" || !Number.isInteger(iterations) || iterations < 100000 || iterations > PBKDF2_ITERATIONS || !encodedSalt || !encodedHash) return false;
+    try {
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(value), "PBKDF2", false, ["deriveBits"]);
+      const derived = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(encodedSalt), iterations, hash: "SHA-256" }, key, 256);
+      return hex(new Uint8Array(derived)) === encodedHash;
+    } catch {
+      return false;
+    }
   }
   return (await hashSecret(value)) === stored;
 }
