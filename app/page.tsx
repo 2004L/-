@@ -1406,6 +1406,8 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   const [adminUtterance, setAdminUtterance] = useState("");
   const [adminReply, setAdminReply] = useState("管理员模式已就绪。您可以说：查询尾号4821，或把尾号4821换到1306。");
   const [adminBusy, setAdminBusy] = useState(false);
+  const [adminVoiceListening, setAdminVoiceListening] = useState(false);
+  const [adminVoiceSubmitSignal, setAdminVoiceSubmitSignal] = useState(0);
   const [pendingAdminActionId, setPendingAdminActionId] = useState<string | null>(null);
   const [pendingAdminAction, setPendingAdminAction] = useState<PendingAdminAction | null>(null);
   const [confirmActionOpen, setConfirmActionOpen] = useState(false);
@@ -1492,8 +1494,13 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       setConfirmActionOpen(false);
     } finally { setAdminActionBusy(false); }
   }
-  async function submitAdminCommand(command = adminUtterance) {
+  async function submitAdminCommand(command = adminUtterance, options: { fromVoiceFinal?: boolean } = {}) {
     const text = command.trim();
+    if (adminVoiceListening && !options.fromVoiceFinal) {
+      setAdminReply("正在结束管理员录音并整理文字，识别完成后会自动发送。");
+      setAdminVoiceSubmitSignal((value) => value + 1);
+      return;
+    }
     if (!text || adminBusy) return;
     setAdminBusy(true);
     try {
@@ -1542,7 +1549,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     await loadFaults();
   }
   return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台 · {adminUser.display_name}（{adminUser.role}）</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button>{adminUser.permissions.includes("admin:manage_faults") && <button onClick={() => setConfirmReset(true)} className="rounded-lg bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">重置演示数据</button>}<button onClick={() => void logout()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">退出登录</button></div></div></header>
-    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 动作确认 → PMS / 设备 / 公安执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；AI 先生成待确认动作，改库、改金额、发卡、公安提交都必须弹窗核对后才执行。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821的总金额改成680")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备改金额</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366重新发房卡")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备发卡</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366提交广州公安登记")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备公安登记</button>{pendingAdminActionId && pendingAdminAction && <button type="button" onClick={() => setConfirmActionOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行：{pendingAdminAction.title}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：把尾号4821换到1306，或把尾号4821的总金额改成680" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} /><button type="submit" disabled={adminBusy || !adminUtterance.trim()} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : "发送"}</button></form><div className="mt-4 rounded-xl bg-[#f5f8fb] px-4 py-3 text-sm leading-6 text-[#334e68]">{adminReply}</div></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
+    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 动作确认 → PMS / 设备 / 公安执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；AI 先生成待确认动作，改库、改金额、发卡、公安提交都必须弹窗核对后才执行。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821的总金额改成680")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备改金额</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366重新发房卡")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备发卡</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366提交广州公安登记")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备公安登记</button>{pendingAdminActionId && pendingAdminAction && <button type="button" onClick={() => setConfirmActionOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行：{pendingAdminAction.title}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：把尾号4821换到1306，或把尾号4821的总金额改成680" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} onListeningChange={setAdminVoiceListening} submitSignal={adminVoiceSubmitSignal} onSubmitText={(text) => void submitAdminCommand(text, { fromVoiceFinal: true })} /><button type="submit" disabled={adminBusy || (!adminUtterance.trim() && !adminVoiceListening)} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : adminVoiceListening ? "结束并发送" : "发送"}</button></form><div className="mt-4 rounded-xl bg-[#f5f8fb] px-4 py-3 text-sm leading-6 text-[#334e68]">{adminReply}</div></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#3b78a8]">AI Native</p><h2 className="mt-1 font-semibold">意图识别与动作对齐审计</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">只保留脱敏表达</span></div><div className="divide-y divide-[#edf2f7]">{intentEvents.length ? intentEvents.slice(0, 8).map((event) => <div key={event.id} className="grid gap-2 px-5 py-4 md:grid-cols-[1fr_auto]"><div><p className="text-sm leading-6 text-[#334e68]">{event.detail}</p><p className="mt-1 text-xs text-[#9fb3c8]">顾客表达 → 意图 → 置信度 → 受控业务动作</p></div><span className="font-mono text-xs text-[#829ab1]">#{event.id}</span></div>) : <Empty text="与AI说一句话后，这里会显示脱敏的意图识别和动作对齐记录" />}</div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>
       <section className="mt-7"><p className="text-sm text-[#627d98]">系统运行</p><h2 className="mt-1 text-xl font-semibold">实时业务数据</h2><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div></section>
@@ -1565,7 +1572,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   </main>;
 }
 
-function AdminVoiceInputControls({ adapter, onText }: { adapter: AdapterConfig; onText: (text: string) => void }) {
+function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSignal = 0, onSubmitText }: { adapter: AdapterConfig; onText: (text: string) => void; onListeningChange?: (listening: boolean) => void; submitSignal?: number; onSubmitText?: (text: string) => void }) {
   const [inputs, setInputs] = useState<AudioInputDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState(() => typeof window !== "undefined" ? localStorage.getItem("hotel_admin_audio_input_device") || "" : "");
   const [listening, setListening] = useState(false);
@@ -1582,6 +1589,8 @@ function AdminVoiceInputControls({ adapter, onText }: { adapter: AdapterConfig; 
   const audioTailRef = useRef(Promise.resolve());
   const resultSeenRef = useRef(false);
   const stopTimerRef = useRef<number | null>(null);
+  const latestTextRef = useRef("");
+  const submitAfterStopRef = useRef(false);
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) { setStatus("当前浏览器不支持输入设备枚举"); return; }
     const devices = await navigator.mediaDevices.enumerateDevices();
@@ -1646,6 +1655,50 @@ function AdminVoiceInputControls({ adapter, onText }: { adapter: AdapterConfig; 
     setListening(false);
     setStopping(false);
   }
+  function acceptText(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    latestTextRef.current = trimmed;
+    onText(trimmed);
+  }
+  function maybeSubmitRecognizedText() {
+    const text = latestTextRef.current.trim();
+    const shouldSubmit = submitAfterStopRef.current;
+    submitAfterStopRef.current = false;
+    if (shouldSubmit && text) {
+      setStatus("语音已识别，正在发送给管理员 AI…");
+      onSubmitText?.(text);
+      return true;
+    }
+    return false;
+  }
+  function finishRecording(shouldSubmit: boolean) {
+    if (stopping) return;
+    if (!listening) {
+      if (shouldSubmit) maybeSubmitRecognizedText();
+      return;
+    }
+    submitAfterStopRef.current = shouldSubmit;
+    if (backend === "browser") {
+      setStopping(true);
+      recognitionRef.current?.stop?.();
+      return;
+    }
+    const recorder = recorderRef.current;
+    const socket = socketRef.current;
+    setStopping(true);
+    if (recorder && recorder.state !== "inactive") {
+      recorder.onstop = () => { void audioTailRef.current.then(() => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" })); }); };
+      recorder.stop();
+    } else if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
+    stopTimerRef.current = window.setTimeout(() => {
+      const hadText = latestTextRef.current.trim();
+      release();
+      setStatus(hadText ? "语音已结束，请确认文字后点击发送" : "没有识别到内容，请重新录音或输入文字");
+      if (hadText) maybeSubmitRecognizedText();
+      else submitAfterStopRef.current = false;
+    }, 4500);
+  }
   function startBrowser() {
     const browserWindow = window as Window & { SpeechRecognition?: RecognitionConstructor; webkitSpeechRecognition?: RecognitionConstructor };
     const Constructor = browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition;
@@ -1656,10 +1709,15 @@ function AdminVoiceInputControls({ adapter, onText }: { adapter: AdapterConfig; 
     recognition.continuous = false;
     recognition.onresult = (event) => {
       const text = Array.from({ length: event.results.length }, (_, index) => event.results[index]?.[0]?.transcript ?? "").join("").trim();
-      if (text) onText(text);
+      if (text) acceptText(text);
     };
-    recognition.onerror = () => { setListening(false); setStatus("浏览器备用识别失败，请直接输入文字"); };
-    recognition.onend = () => setListening(false);
+    recognition.onerror = () => { submitAfterStopRef.current = false; setStopping(false); setListening(false); setStatus("浏览器备用识别失败，请直接输入文字"); };
+    recognition.onend = () => {
+      const hadText = latestTextRef.current.trim();
+      setStopping(false);
+      setListening(false);
+      if (!maybeSubmitRecognizedText()) setStatus(hadText ? "语音已识别，请确认文字后点击发送" : "没有识别到内容，请重新录音或输入文字");
+    };
     recognitionRef.current = recognition;
     setBackend("browser");
     setListening(true);
@@ -1699,11 +1757,11 @@ function AdminVoiceInputControls({ adapter, onText }: { adapter: AdapterConfig; 
       if (payload.type === "ready") setStatus(`本地 Qwen ASR 已就绪${payload.device ? ` · ${payload.device}` : ""}，请说话`);
       if (payload.type === "result" && payload.text?.trim()) {
         resultSeenRef.current = true;
-        onText(payload.text.trim());
-        setStatus("语音已识别，请确认文字后点击发送");
+        acceptText(payload.text.trim());
         release();
+        if (!maybeSubmitRecognizedText()) setStatus("语音已识别，请确认文字后点击发送");
       }
-      if (payload.type === "error") { setStatus(payload.message || "本地 ASR 返回错误"); release(); }
+      if (payload.type === "error") { submitAfterStopRef.current = false; setStatus(payload.message || "本地 ASR 返回错误"); release(); }
     };
     socket.onclose = () => { if (!resultSeenRef.current && recorderRef.current) { setStatus("本地 ASR 连接中断，请重试或改用文字"); setListening(false); } };
     socket.send(JSON.stringify({ type: "start", language: "Chinese", sample_rate: 16000 }));
@@ -1723,21 +1781,25 @@ function AdminVoiceInputControls({ adapter, onText }: { adapter: AdapterConfig; 
   function toggle() {
     if (stopping) return;
     if (listening) {
-      if (backend === "browser") { recognitionRef.current?.stop(); setListening(false); return; }
-      const recorder = recorderRef.current;
-      const socket = socketRef.current;
-      setStopping(true);
-      if (recorder && recorder.state !== "inactive") {
-        recorder.onstop = () => { void audioTailRef.current.then(() => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" })); }); };
-        recorder.stop();
-      } else if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
-      stopTimerRef.current = window.setTimeout(() => { release(); setStatus("语音已结束，请确认文字后点击发送"); }, 4500);
+      submitAfterStopRef.current = false;
+      release();
+      setStatus("已取消本次管理员语音输入");
       return;
     }
+    latestTextRef.current = "";
+    submitAfterStopRef.current = false;
     setBackend("connecting");
     setStatus("正在连接所选输入设备和本地 ASR…");
     void startLocal().catch((error) => { release(); if (error instanceof DOMException && ["NotAllowedError", "PermissionDeniedError"].includes(error.name)) { setBackend("unavailable"); setStatus("麦克风权限被拒绝，请在地址栏允许麦克风"); return; } setStatus("本地 ASR 不可用，已切换浏览器备用识别"); startBrowser(); });
   }
+  useEffect(() => { onListeningChange?.(listening); }, [listening, onListeningChange]);
+  useEffect(() => {
+    if (submitSignal <= 0) return undefined;
+    const timer = window.setTimeout(() => finishRecording(true), 0);
+    return () => window.clearTimeout(timer);
+    // finishRecording 使用当前录音资源句柄，不能放入依赖导致录音过程中重复绑定。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [submitSignal]);
   // release 仅用于组件卸载清理，避免把每次录音状态变化带入订阅依赖。
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => () => release(), []);
