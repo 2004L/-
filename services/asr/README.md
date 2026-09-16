@@ -19,6 +19,8 @@ python server.py
 D:\AI-Hotel-Models\asr-venv\Scripts\python.exe server.py
 ```
 
+同一台自助机只能运行一个 ASR 进程。`start-on-d.ps1` 会在启动前检查 `127.0.0.1:8765`；如果端口已被其他 Python 进程占用，会直接提示 PID，不会让浏览器误连到另一套模型。
+
 首次启动会下载 `Qwen/Qwen3-ASR-0.6B` 权重。建议把缓存或本地目录放在 `D:\AI-Hotel-Models\qwen3-asr-0.6b`，再把 `QWEN_ASR_MODEL` 指向该目录。国内网络可以先通过 ModelScope 下载到本地。
 
 默认地址是 `wss://127.0.0.1:8765/asr`。如果只在本地 HTTP 页面测试，可填写 `ws://127.0.0.1:8765/asr`；正式网页使用 HTTPS 时必须使用 WSS，并配置浏览器信任的本地证书（`ASR_TLS_CERT`、`ASR_TLS_KEY`）。可同时设置 `ASR_ALLOWED_ORIGIN` 和 `ASR_AUTH_TOKEN`，限制来源并完成设备配对，避免其他网页调用本地语音服务。

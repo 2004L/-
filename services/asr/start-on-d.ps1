@@ -13,6 +13,11 @@ if (-not (Test-Path -LiteralPath $modelPath)) { throw "ASR model directory not f
 
 $env:ASR_HOST = "127.0.0.1"
 $env:ASR_PORT = "8765"
+$existingListener = Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort ([int]$env:ASR_PORT) -State Listen -ErrorAction SilentlyContinue
+if ($existingListener) {
+    $owners = ($existingListener | Select-Object -ExpandProperty OwningProcess -Unique) -join ", "
+    throw "ASR port $($env:ASR_PORT) is already in use by PID $owners. Stop the old ASR process before starting the D-drive service."
+}
 $env:QWEN_ASR_MODEL = $modelPath
 $cuda = & $python -c "import torch; print('1' if torch.cuda.is_available() else '0')"
 if ($cuda.Trim() -eq "1") {

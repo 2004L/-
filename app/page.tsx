@@ -539,6 +539,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [flowStep, setFlowStep] = useState(0);
   const [flowError, setFlowError] = useState<{ step: FlowStepInfo; code: string; retryable: boolean; status: string; reconciliation?: ReconcileResponse | null } | null>(null);
   const [voiceBackend, setVoiceBackend] = useState<"local" | "browser" | "unavailable" | null>(null);
+  const [audioCaptureStatus, setAudioCaptureStatus] = useState<"unknown" | "checking" | "ok" | "silent" | "error">("unknown");
+  const [audioDeviceLabel, setAudioDeviceLabel] = useState("");
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionRef = useRef<RecognitionLike | null>(null);
   const asrSocketRef = useRef<WebSocket | null>(null);
@@ -550,6 +552,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const asrChunkTailRef = useRef(Promise.resolve());
   const asrAudioBytesRef = useRef(0);
   const asrAudioChunksRef = useRef(0);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioMonitorFrameRef = useRef<number | null>(null);
+  const audioSignalSeenRef = useRef(false);
   const browserFinalTranscriptRef = useRef("");
   const browserInterimTranscriptRef = useRef("");
   const submitInFlightRef = useRef<string | null>(null);
@@ -602,6 +607,45 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     silenceTimerRef.current = null;
   }
 
+  function stopAudioMonitor() {
+    if (audioMonitorFrameRef.current !== null) window.cancelAnimationFrame(audioMonitorFrameRef.current);
+    audioMonitorFrameRef.current = null;
+    if (audioContextRef.current) void audioContextRef.current.close().catch(() => undefined);
+    audioContextRef.current = null;
+  }
+
+  function startAudioMonitor(stream: MediaStream) {
+    stopAudioMonitor();
+    audioSignalSeenRef.current = false;
+    setAudioCaptureStatus("checking");
+    const track = stream.getAudioTracks()[0];
+    setAudioDeviceLabel(track?.label || "默认麦克风");
+    const AudioContextConstructor = window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextConstructor) return;
+    const context = new AudioContextConstructor();
+    audioContextRef.current = context;
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    const source = context.createMediaStreamSource(stream);
+    source.connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    const monitor = () => {
+      analyser.getByteTimeDomainData(samples);
+      let sum = 0;
+      for (const sample of samples) {
+        const centered = (sample - 128) / 128;
+        sum += centered * centered;
+      }
+      if (Math.sqrt(sum / samples.length) >= 0.015) {
+        audioSignalSeenRef.current = true;
+        setAudioCaptureStatus("ok");
+      }
+      audioMonitorFrameRef.current = window.requestAnimationFrame(monitor);
+    };
+    void context.resume().catch(() => undefined);
+    audioMonitorFrameRef.current = window.requestAnimationFrame(monitor);
+  }
+
   function releaseVoiceResources(closeSocket = true) {
     clearVoiceTimer();
     recognitionRef.current?.abort?.();
@@ -611,6 +655,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     mediaRecorderRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
+    stopAudioMonitor();
     const socket = asrSocketRef.current;
     if (closeSocket && socket && socket.readyState === WebSocket.OPEN) socket.close();
     if (closeSocket) asrSocketRef.current = null;
@@ -726,6 +771,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     if (typeof MediaRecorder === "undefined") throw new Error("recorder_api_unavailable");
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     mediaStreamRef.current = stream;
+    startAudioMonitor(stream);
     const socket = new WebSocket(resolveAsrWebSocketUrl(adapter.asrWsUrl));
     const opened = new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(() => reject(new Error("local_asr_timeout")), 1400);
@@ -778,8 +824,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         if (isFillerTranscript(transcript)) {
           voiceSubmitRequestedRef.current = false;
           setUtterance("");
+          setAudioCaptureStatus(audioSignalSeenRef.current ? "ok" : "silent");
           releaseVoiceResources(true);
-          setMessage("只识别到很短的回应，请完整说出“手机尾号3452”或直接输入文字");
+          setMessage(audioSignalSeenRef.current ? "只识别到很短的回应，请完整说出要办理的事情或直接输入文字" : "没有检测到有效麦克风声音，请检查输入设备后再试");
           return;
         }
         setUtterance(transcript);
@@ -1116,7 +1163,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">{activeMessage}</h1>
       <p className="mt-4 text-base text-[#86868b]">系统理解您的意图，再由受控业务接口完成动作。</p>
 
-      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "取消语音输入" : "开始语音输入"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 说完后点击发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 说完后点击发送" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 浏览器识别备用 · 说完后点击发送"}</p>{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
+      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在美团订了房，手机号后四位4821" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "取消语音输入" : "开始语音输入"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 说完后点击发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 说完后点击发送" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 浏览器识别备用 · 说完后点击发送"}</p>{audioCaptureStatus !== "unknown" && <p className="mt-2 text-xs text-[#86868b]">麦克风：{audioCaptureStatus === "checking" ? "等待声音" : audioCaptureStatus === "ok" ? `已采到声音${audioDeviceLabel ? ` · ${audioDeviceLabel}` : ""}` : audioCaptureStatus === "silent" ? "未检测到有效声音" : "检测失败"}</p>}{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据：4821 正常 · 1188 重复 · 7366 已入住 · 4402 已取消</p></div>}
 
       {transcript.length > 0 && <section className="mt-8 w-full max-w-2xl rounded-[2rem] bg-white p-5 text-left shadow-sm"><div className="flex items-center justify-between"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">完整对话记录</p><span className="text-xs text-[#a1a1a6]">本次会话 · {transcript.length} 条</span></div><div className="mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">{transcript.map((entry) => <div key={entry.id} className={`whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${entry.role === "user" ? "ml-8 bg-[#eaf4ff] text-[#174a72]" : entry.role === "tool" ? "mr-8 bg-[#f5f5f7] text-[#6e6e73]" : "mr-8 bg-[#eefaf2] text-[#245d38]"}`}><p className="mb-1 text-[10px] uppercase tracking-[.14em] opacity-60">{entry.role === "user" ? "您" : entry.role === "tool" ? "系统动作" : "AI"}</p>{entry.content}</div>)}</div></section>}
       {matchedOrder && (phase === "matched" || phase === "processing" || phase === "complete" || phase === "error") && <section className="mt-9 w-full max-w-3xl rounded-[2rem] bg-white p-6 text-left shadow-sm md:p-8"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">已匹配订单</p><h2 className="mt-2 text-2xl font-semibold">{matchedOrder.source} · {matchedOrder.order_code}</h2></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">手机号 {matchedOrder.phone_masked}</span></div><div className="mt-6 grid grid-cols-2 gap-4 border-y border-[#ededf0] py-5 text-sm md:grid-cols-4"><Info label="入住日期" value={matchedOrder.stay_date} /><Info label="房型" value={matchedOrder.room_type} /><Info label="晚数" value={`${matchedOrder.nights} 晚`} /><Info label="订单状态" value={STATUS_LABELS[matchedOrder.status] ?? matchedOrder.status} /></div>{phase === "matched" && <button onClick={runCheckin} className="mt-6 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white"><IdCard size={18} className="mr-2 inline" />模拟身份证放入读卡器</button>}{phase === "matched" && <p className="mt-3 text-center text-xs text-[#86868b]">检测到证件后，读卡、核验、登记和发卡将自动完成，无需再次操作。</p>}</section>}
