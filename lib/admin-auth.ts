@@ -3,6 +3,7 @@ import { rolePermissions, type AdminPermission, type AdminRole } from "@/lib/adm
 
 export const ADMIN_COOKIE = "hotel_admin_session";
 const SESSION_HOURS = 8;
+const SESSION_IDLE_MINUTES = 30;
 const DEMO_SEED = "hotel-demo-2026";
 
 export type AdminUser = { id: string; hotel_code: string; username: string; display_name: string; role: AdminRole; permissions: readonly AdminPermission[] };
@@ -15,6 +16,33 @@ export async function hashSecret(value: string) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function envBoolean(name: string, fallback: boolean) {
+  try {
+    const value = (typeof process !== "undefined" ? process.env?.[name] : undefined)?.trim().toLowerCase();
+    return value ? value === "true" : fallback;
+  } catch { return fallback; }
+}
+
+function hex(bytes: Uint8Array) { return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join(""); }
+
+async function hashPassword(value: string, salt = crypto.randomUUID().replaceAll("-", "")) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(value), "PBKDF2", false, ["deriveBits"]);
+  const derived = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 120000, hash: "SHA-256" }, key, 256);
+  return { hash: `pbkdf2$120000$${salt}$${hex(new Uint8Array(derived))}`, salt };
+}
+
+async function verifyPassword(value: string, stored: string, salt: string | null) {
+  if (stored.startsWith("pbkdf2$") && salt) {
+    const [scheme, iterationsText, encodedSalt, encodedHash] = stored.split("$");
+    const iterations = Number(iterationsText);
+    if (scheme !== "pbkdf2" || !Number.isInteger(iterations) || iterations < 100000 || !encodedSalt || !encodedHash) return false;
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(value), "PBKDF2", false, ["deriveBits"]);
+    const derived = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(encodedSalt), iterations, hash: "SHA-256" }, key, 256);
+    return hex(new Uint8Array(derived)) === encodedHash;
+  }
+  return (await hashSecret(value)) === stored;
+}
+
 export async function ensureAdminSchema() {
   const db = getD1();
   await db.batch([
@@ -24,17 +52,22 @@ export async function ensureAdminSchema() {
     db.prepare("CREATE INDEX IF NOT EXISTS admin_sessions_token_idx ON admin_sessions(session_token_hash)"),
     db.prepare("CREATE INDEX IF NOT EXISTS admin_audit_created_idx ON admin_audit_events(created_at, id)"),
   ]);
+  try { await db.prepare("ALTER TABLE admin_users ADD COLUMN password_salt TEXT").run(); } catch { /* 已存在 */ }
   const count = await db.prepare("SELECT COUNT(*) AS count FROM admin_users").first<{ count: number }>();
+  if (!envBoolean("ADMIN_DEMO_ENABLED", true)) {
+    await db.prepare("UPDATE admin_users SET enabled = 0, updated_at = ? WHERE id LIKE 'admin-%-demo'").bind(new Date().toISOString()).run();
+  }
   if (!Number(count?.count ?? 0)) {
     const stamp = new Date().toISOString();
-    const passwordHash = await hashSecret(DEMO_SEED);
+    const password = (typeof process !== "undefined" ? process.env?.ADMIN_DEMO_PASSWORD : undefined)?.trim() || DEMO_SEED;
+    const passwordData = await hashPassword(password);
     const users = [
       ["admin-owner-demo", "GZ-HAOS-001", "owner", "老板/所有者", "owner"],
       ["admin-manager-demo", "GZ-HAOS-001", "manager", "店长", "manager"],
       ["admin-frontdesk-demo", "GZ-HAOS-001", "frontdesk", "前台", "frontdesk"],
       ["admin-housekeeping-demo", "GZ-HAOS-001", "housekeeping", "客房", "housekeeping"],
     ];
-    await db.batch(users.map(([id, hotel, username, display, role]) => db.prepare("INSERT INTO admin_users (id, hotel_code, username, display_name, role, password_hash, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)").bind(id, hotel, username, display, role, passwordHash, stamp, stamp)));
+    await db.batch(users.map(([id, hotel, username, display, role]) => db.prepare("INSERT INTO admin_users (id, hotel_code, username, display_name, role, password_hash, password_salt, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, hotel, username, display, role, passwordData.hash, passwordData.salt, envBoolean("ADMIN_DEMO_ENABLED", true) ? 1 : 0, stamp, stamp)));
   }
 }
 
@@ -45,8 +78,12 @@ function toUser(row: { id: string; hotel_code: string; username: string; display
 }
 
 export async function authenticateAdmin(username: string, password: string) {
-  const row = await getD1().prepare("SELECT id, hotel_code, username, display_name, role, password_hash FROM admin_users WHERE username = ? AND enabled = 1 LIMIT 1").bind(username.trim()).first<{ id: string; hotel_code: string; username: string; display_name: string; role: string; password_hash: string }>();
-  if (!row || (await hashSecret(password)) !== row.password_hash) return null;
+  const row = await getD1().prepare("SELECT id, hotel_code, username, display_name, role, password_hash, password_salt FROM admin_users WHERE username = ? AND enabled = 1 LIMIT 1").bind(username.trim()).first<{ id: string; hotel_code: string; username: string; display_name: string; role: string; password_hash: string; password_salt: string | null }>();
+  if (!row || !(await verifyPassword(password, row.password_hash, row.password_salt))) return null;
+  if (!row.password_hash.startsWith("pbkdf2$") || !row.password_salt) {
+    const upgraded = await hashPassword(password);
+    await getD1().prepare("UPDATE admin_users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?").bind(upgraded.hash, upgraded.salt, new Date().toISOString(), row.id).run();
+  }
   return toUser(row);
 }
 
@@ -67,7 +104,9 @@ function readCookie(request: Request) {
 export async function getAdminFromRequest(request: Request) {
   const token = readCookie(request);
   if (!token) return null;
-  const row = await getD1().prepare("SELECT u.id, u.hotel_code, u.username, u.display_name, u.role, s.id AS session_id FROM admin_sessions s JOIN admin_users u ON u.id = s.user_id WHERE s.session_token_hash = ? AND s.revoked_at IS NULL AND u.enabled = 1 AND s.expires_at > ? LIMIT 1").bind(await hashSecret(token), new Date().toISOString()).first<{ id: string; hotel_code: string; username: string; display_name: string; role: string; session_id: string }>();
+  const now = new Date();
+  const idleCutoff = new Date(now.getTime() - SESSION_IDLE_MINUTES * 60 * 1000).toISOString();
+  const row = await getD1().prepare("SELECT u.id, u.hotel_code, u.username, u.display_name, u.role, s.id AS session_id FROM admin_sessions s JOIN admin_users u ON u.id = s.user_id WHERE s.session_token_hash = ? AND s.revoked_at IS NULL AND u.enabled = 1 AND s.expires_at > ? AND s.last_seen_at > ? LIMIT 1").bind(await hashSecret(token), now.toISOString(), idleCutoff).first<{ id: string; hotel_code: string; username: string; display_name: string; role: string; session_id: string }>();
   if (!row) return null;
   await getD1().prepare("UPDATE admin_sessions SET last_seen_at = ? WHERE id = ?").bind(new Date().toISOString(), row.session_id).run();
   const user = toUser(row);
@@ -78,6 +117,12 @@ export function hasPermission(user: AdminUser, permission: AdminPermission) { re
 
 export async function auditAdmin(user: AdminUser | null, eventType: string, detail: string) {
   await getD1().prepare("INSERT INTO admin_audit_events (user_id, username, role, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(user?.id ?? null, user?.username ?? null, user?.role ?? null, eventType, detail.slice(0, 500), new Date().toISOString()).run();
+}
+
+export async function adminLoginThrottled() {
+  const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const row = await getD1().prepare("SELECT COUNT(*) AS count FROM admin_audit_events WHERE event_type = 'ADMIN_LOGIN_FAILED' AND created_at > ?").bind(cutoff).first<{ count: number }>();
+  return Number(row?.count ?? 0) >= 20;
 }
 
 export async function revokeAdminSession(request: Request) {

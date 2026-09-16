@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 
-const files = ["lib/contracts.ts", "lib/tools.ts", "lib/admin-tools.ts", "lib/admin-auth.ts", "app/api/agent/turn/route.ts", "app/api/device/reader/route.ts", "app/api/device/encoder/route.ts", "app/api/police/submit/route.ts"];
+const files = ["lib/contracts.ts", "lib/tools.ts", "lib/admin-tools.ts", "lib/admin-auth.ts", "app/api/agent/turn/route.ts", "app/api/device/reader/route.ts", "app/api/device/encoder/route.ts", "app/api/police/submit/route.ts", "app/api/health/route.ts", "app/api/admin/metrics/route.ts"];
 for (const file of files) {
   const text = readFileSync(file, "utf8");
-  if (!text.includes("idempotency") && file.includes("route.ts") && !file.includes("app/api/agent/turn")) throw new Error(`${file} 未声明幂等键`);
+  if (!text.includes("idempotency") && file.includes("route.ts") && !file.includes("app/api/agent/turn") && !file.includes("app/api/health") && !file.includes("app/api/admin/metrics")) throw new Error(`${file} 未声明幂等键`);
 }
 const tools = readFileSync("lib/tools.ts", "utf8");
 for (const name of ["pms.search_order", "hotel.policy_answer", "device.reader.read_identity", "device.encoder.issue_keycard", "police.submit_registration"]) {
@@ -14,9 +14,12 @@ for (const name of ["admin.search_guest", "admin.get_room_status", "admin.prepar
   if (!adminTools.includes(name)) throw new Error(`缺少管理员工具契约：${name}`);
 }
 const auth = readFileSync("lib/admin-auth.ts", "utf8");
-for (const guard of ["admin_users", "admin_sessions", "admin_audit_events", "HttpOnly", "admin_permission_denied"]) {
+for (const guard of ["admin_users", "admin_sessions", "admin_audit_events", "HttpOnly", "admin_permission_denied", "password_salt", "pbkdf2", "SESSION_IDLE_MINUTES", "adminLoginThrottled"]) {
   if (!auth.includes(guard)) throw new Error(`缺少管理员安全边界：${guard}`);
 }
+if (!readFileSync("app/api/admin/auth/login/route.ts", "utf8").includes("Retry-After")) throw new Error("管理员登录限流未声明 Retry-After");
+const ops = readFileSync("lib/ops.ts", "utf8");
+for (const guard of ["ai_request_metrics", "requestId", "keyConfigured"]) if (!ops.includes(guard)) throw new Error(`缺少生产可观测能力：${guard}`);
 for (const route of ["app/api/admin/auth/login/route.ts", "app/api/admin/auth/me/route.ts", "app/api/admin/auth/logout/route.ts"]) {
   if (!readFileSync(route, "utf8").includes("ensureAdminSchema")) throw new Error(`管理员认证接口未初始化数据库：${route}`);
 }

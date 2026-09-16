@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { authenticateAdmin, auditAdmin, createAdminSession, ensureAdminSchema, sessionCookie } from "@/lib/admin-auth";
+import { adminLoginThrottled, authenticateAdmin, auditAdmin, createAdminSession, ensureAdminSchema, sessionCookie } from "@/lib/admin-auth";
 
 export const runtime = "edge";
 const loginSchema = z.object({ username: z.string().trim().min(3).max(80), password: z.string().min(1).max(200) }).strict();
@@ -8,6 +8,7 @@ export async function POST(request: Request) {
   await ensureAdminSchema();
   try {
     const input = loginSchema.parse(await request.json());
+    if (await adminLoginThrottled()) return Response.json({ ok: false, error: "admin_login_rate_limited" }, { status: 429, headers: { "Retry-After": "900" } });
     const user = await authenticateAdmin(input.username, input.password);
     if (!user) {
       await auditAdmin(null, "ADMIN_LOGIN_FAILED", "管理员登录失败");

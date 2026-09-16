@@ -221,6 +221,7 @@ export const adminUsers = sqliteTable("admin_users", {
   displayName: text("display_name").notNull(),
   role: text("role").notNull(),
   passwordHash: text("password_hash").notNull(),
+  passwordSalt: text("password_salt"),
   enabled: integer("enabled").notNull().default(1),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
@@ -257,3 +258,17 @@ export const adminActions = sqliteTable("admin_actions", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [index("admin_actions_user_status_idx").on(table.userId, table.status, table.createdAt)]);
+
+export const aiRequestMetrics = sqliteTable("ai_request_metrics", {
+  id: text("id").primaryKey(),
+  requestId: text("request_id").notNull().unique(),
+  sessionId: text("session_id"),
+  route: text("route").notNull(),
+  model: text("model").notNull(),
+  latencyMs: integer("latency_ms").notNull(),
+  promptTokens: integer("prompt_tokens"),
+  completionTokens: integer("completion_tokens"),
+  totalTokens: integer("total_tokens"),
+  outcome: text("outcome").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [index("ai_request_metrics_created_idx").on(table.createdAt)]);

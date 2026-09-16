@@ -20,6 +20,7 @@
     "test:replay": "node scripts/test-cases.mjs",
     "test:contracts": "node scripts/test-contracts.mjs",
     "test:concurrency": "node scripts/test-concurrency.mjs",
+    "test:hardening": "node scripts/test-hardening.mjs",
     "test:invariants": "node scripts/test-invariants.mjs",
     "test:intents": "node --experimental-strip-types scripts/test-intent-rules.mjs",
     "test:asr": "node scripts/test-asr-accuracy.mjs",
