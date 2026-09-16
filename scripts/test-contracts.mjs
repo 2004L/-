@@ -20,6 +20,13 @@ for (const guard of ["admin_users", "admin_sessions", "admin_audit_events", "Htt
 for (const route of ["app/api/admin/auth/login/route.ts", "app/api/admin/auth/me/route.ts", "app/api/admin/auth/logout/route.ts"]) {
   if (!readFileSync(route, "utf8").includes("ensureAdminSchema")) throw new Error(`管理员认证接口未初始化数据库：${route}`);
 }
+const adminService = readFileSync("lib/admin-service.ts", "utf8");
+for (const guard of ["AWAITING_CONFIRMATION", "room_change_conflict", "idempotent", "ADMIN_ROOM_CHANGE_EXECUTED", "NOT EXISTS"]) {
+  if (!adminService.includes(guard)) throw new Error(`管理员换房安全门禁缺失：${guard}`);
+}
+for (const route of ["app/api/admin/agent/turn/route.ts", "app/api/admin/tools/execute/route.ts"]) {
+  if (!readFileSync(route, "utf8").includes("admin_auth_required")) throw new Error(`管理员工具接口未校验会话：${route}`);
+}
 const demo = readFileSync("app/api/demo/[action]/route.ts", "utf8");
 for (const action of ["walk-in-draft", "walk-in-quote", "walk-in-payment", "walk-in-payment-complete"]) {
   if (!demo.includes(`action === "${action}"`)) throw new Error(`缺少现场办理阶段接口：${action}`);
