@@ -26,6 +26,7 @@ const suites = [
   ["orders-d1", [STRIP_TYPES], "test-orders-d1.mjs"],
   ["checkin-d1", [STRIP_TYPES], "test-checkin-d1.mjs"],
   ["data-governance-d1", [STRIP_TYPES], "test-data-governance-d1.mjs"],
+  ["handoff-d1", [STRIP_TYPES], "test-handoff-d1.mjs"],
 ];
 
 const failures = [];

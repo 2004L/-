@@ -1,6 +1,7 @@
 import { getD1 } from "@/db";
 import { ensureAdminSchema, requireAdmin } from "@/lib/admin-auth";
 import { confirmFormalCheckin, ensureFormalCheckinOrder, holdFormalRoom, projectCheckinToLegacy } from "@/lib/checkin";
+import { checkinCommandKey, runDeviceCommand } from "@/lib/device-commands";
 import { ORDER_STATUS, RESERVATION_STATUS } from "@/lib/hotel-core";
 import { DEFAULT_HOTEL_CODE, DEFAULT_HOTEL_ID, DEFAULT_TENANT_ID, ensureTenantFoundation } from "@/lib/tenant";
 
@@ -54,6 +55,7 @@ const STATE_LABELS: Record<string, string> = {
   KEYCARD_WRITING: "正在制作房卡",
   KEYCARD_DISPENSED: "房卡已送达取卡口",
   CHECKIN_COMPLETE: "入住完成",
+  HANDOFF_REQUIRED: "需要现场人工接手",
 };
 
 const SEED_ORDERS = [
@@ -134,6 +136,18 @@ async function projectFormal(scope: DemoOrderScope, orderNo: string, patch: { st
   } catch (error) {
     console.warn(`[checkin][projection] ${orderNo} failed: ${error instanceof Error ? error.message : "unknown_error"}`);
   }
+}
+
+/** Everything that used to strand a case mid-flow now stops here and dispatches a task. */
+async function requireHandoff(sessionId: string, caseId: string, reason: string) {
+  const current = await loadCase(sessionId, caseId);
+  if (current.status === "HANDOFF_REQUIRED") return current;
+  return transition({ sessionId, caseId: current.id, expected: current.status, next: "HANDOFF_REQUIRED", eventType: "HANDOFF_REQUIRED", detail: reason, fields: { hardwareStatus: "onsite_team_required" } });
+}
+
+function handoffPayload(outcome: { failure: { department: string; reason: string; code: string } | null; record: { id: string } } | null) {
+  if (!outcome?.failure) return {};
+  return { handoff: { required: true, department: outcome.failure.department, reason: outcome.failure.reason, error_code: outcome.failure.code, command_id: outcome.record.id } };
 }
 
 function requireSession(value: unknown) {
@@ -286,13 +300,14 @@ async function seedSession(sessionId: string) {
 
 async function snapshot(sessionId: string) {
   const db = getD1();
-  const [orders, cases, jobs, audit] = await Promise.all([
+  const [orders, cases, jobs, audit, manualTasks] = await Promise.all([
     db.prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number, updated_at FROM demo_orders WHERE session_id = ? ORDER BY created_at, order_code").bind(sessionId).all(),
     db.prepare("SELECT id, order_id, mode, status, phone_last4, identity_result, room_number, police_receipt, hardware_status, version, updated_at FROM checkin_cases WHERE session_id = ? ORDER BY created_at DESC").bind(sessionId).all(),
     db.prepare("SELECT id, case_id, region, status, attempt, receipt, last_error, updated_at FROM browser_jobs WHERE session_id = ? ORDER BY created_at DESC").bind(sessionId).all(),
     db.prepare("SELECT id, case_id, event_type, from_state, to_state, detail, created_at FROM audit_events WHERE session_id = ? ORDER BY id DESC LIMIT 80").bind(sessionId).all(),
+    db.prepare("SELECT id, case_id, command_id, department, reason, status, created_at FROM manual_tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").bind(sessionId).all(),
   ]);
-  return { orders: orders.results, cases: cases.results, browserJobs: jobs.results, auditEvents: audit.results };
+  return { orders: orders.results, cases: cases.results, browserJobs: jobs.results, auditEvents: audit.results, manualTasks: manualTasks.results };
 }
 
 type WalkInDraftRow = {
@@ -454,17 +469,21 @@ async function reconcileCase(sessionId: string, caseId: unknown) {
   if (["PMS_CHECKIN_CONFIRMED", "KEYCARD_WRITING", "KEYCARD_DISPENSED", "CHECKIN_COMPLETE"].includes(current.status) && !current.police_receipt) invariantFailures.push("没有公安登记回执却已确认入住");
   if (["KEYCARD_WRITING", "KEYCARD_DISPENSED", "CHECKIN_COMPLETE"].includes(current.status) && (!current.room_number || order?.status !== "checkin_confirmed")) invariantFailures.push("房卡阶段缺少已确认的房间或订单状态");
   const consistency = invariantFailures.length === 0;
-  const recommendedAction = !consistency || unknownExternal
-    ? "manual_verify_external"
-    : current.status === "CHECKIN_COMPLETE"
-      ? "no_action"
-      : lastCommand?.status === "FAILED" && Boolean(lastCommand.retryable)
-        ? "retry_current_step"
-        : "resume_from_confirmed_state";
+  const recommendedAction = current.status === "HANDOFF_REQUIRED"
+    ? "handoff_pending"
+    : !consistency || unknownExternal
+      ? "manual_verify_external"
+      : current.status === "CHECKIN_COMPLETE"
+        ? "no_action"
+        : lastCommand?.status === "FAILED" && Boolean(lastCommand.retryable)
+          ? "retry_current_step"
+          : "resume_from_confirmed_state";
   await audit(sessionId, current.id, "FLOW_RECONCILED", current.status, current.status, `自查完成：${consistency ? "状态一致" : invariantFailures.join("；")}；建议 ${recommendedAction}`);
   return {
-    ok: consistency && !unknownExternal,
+    ok: consistency && !unknownExternal && current.status !== "HANDOFF_REQUIRED",
     case_id: current.id,
+    external_command_count: commandList.length,
+    external_command_note: commandList.length ? null : "该办理任务没有任何外部命令记录：设备/公安步骤未经过命令层，无法对账",
     current_case: {
       id: current.id,
       order_id: current.order_id,
@@ -672,7 +691,24 @@ export async function POST(request: Request, context: RouteContext) {
       return json({ checkinCase: updated });
     }
     if (action === "identity-detected") {
-      const updated = await transition({ sessionId, caseId: body.case_id, expected: "ORDER_MATCHED", next: "IDENTITY_READING", eventType: "IDENTITY_CARD_DETECTED", detail: "读卡器检测到新放置的身份证；已通过遗留证件、重复读卡和会话归属模拟检查", fields: { hardwareStatus: "identity_card_detected" } });
+      const current = await loadCase(sessionId, body.case_id);
+      const outcome = await runDeviceCommand({
+        sessionId,
+        caseId: current.id,
+        target: "reader",
+        operation: "read_identity",
+        idempotencyKey: checkinCommandKey(current.id, "reader"),
+        request: { case_id: current.id, expected_state: "IDENTITY_READING" },
+        successResult: { card_present: true, read_verified: true, identity_token: "DEMO-ID-TOKEN" },
+        successEvent: "READER_READ_SUCCEEDED",
+        successDetail: "读卡器仿真读取成功；未返回真实身份证字段",
+        faultEvent: "READER_FAULT_INJECTED",
+      });
+      if (outcome.requiresHandoff) {
+        const handed = await requireHandoff(sessionId, current.id, `读卡器步骤失败：${outcome.failure?.reason ?? "结果未知"}，已生成人工任务`);
+        return json({ checkinCase: handed, ...handoffPayload(outcome) });
+      }
+      const updated = await transition({ sessionId, caseId: current.id, expected: "ORDER_MATCHED", next: "IDENTITY_READING", eventType: "IDENTITY_CARD_DETECTED", detail: "读卡器检测到新放置的身份证；已通过遗留证件、重复读卡和会话归属模拟检查", fields: { hardwareStatus: "identity_card_detected" } });
       return json({ checkinCase: updated });
     }
     if (action === "hold-room") {
@@ -689,7 +725,24 @@ export async function POST(request: Request, context: RouteContext) {
       return json({ checkinCase: updated });
     }
     if (action === "browser-start") {
-      const updated = await transition({ sessionId, caseId: body.case_id, expected: "ROOM_HELD", next: "POLICE_RUNNING", eventType: "POLICE_BROWSER_STARTED", detail: "广州隔离演示浏览器已启动；未连接真实公安系统" });
+      const current = await loadCase(sessionId, body.case_id);
+      const outcome = await runDeviceCommand({
+        sessionId,
+        caseId: current.id,
+        target: "police",
+        operation: "submit_registration",
+        idempotencyKey: checkinCommandKey(current.id, "police"),
+        request: { case_id: current.id, actual_identity_verified: true },
+        successResult: { submitted: true, receipt: `SIM-POLICE-${Date.now().toString().slice(-8)}`, actual_identity_fields_sent: true },
+        successEvent: "POLICE_SUBMIT_SUCCEEDED",
+        successDetail: "公安登记仿真提交成功并生成回执；真实环境需替换浏览器适配器",
+        faultEvent: "POLICE_FAULT_INJECTED",
+      });
+      if (outcome.requiresHandoff) {
+        const handed = await requireHandoff(sessionId, current.id, `公安登记步骤失败：${outcome.failure?.reason ?? "结果未知"}，已生成人工任务`);
+        return json({ checkinCase: handed, ...handoffPayload(outcome) });
+      }
+      const updated = await transition({ sessionId, caseId: current.id, expected: "ROOM_HELD", next: "POLICE_RUNNING", eventType: "POLICE_BROWSER_STARTED", detail: "广州隔离演示浏览器已启动；未连接真实公安系统" });
       const jobId = crypto.randomUUID();
       const timestamp = now();
       await getD1().prepare("INSERT OR IGNORE INTO browser_jobs (id, session_id, case_id, region, status, attempt, receipt, last_error, created_at, updated_at) VALUES (?, ?, ?, '广州-演示隔离环境', 'running', 1, NULL, NULL, ?, ?)").bind(jobId, sessionId, updated.id, timestamp, timestamp).run();
@@ -715,7 +768,26 @@ export async function POST(request: Request, context: RouteContext) {
       return json({ checkinCase: updated });
     }
     if (action === "keycard-start") {
-      const updated = await transition({ sessionId, caseId: body.case_id, expected: "PMS_CHECKIN_CONFIRMED", next: "KEYCARD_WRITING", eventType: "KEYCARD_WRITE_STARTED", detail: "自动发卡机已锁定一个空白卡槽，并按房号和有效期开始写卡", fields: { hardwareStatus: "keycard_writing" } });
+      const current = await loadCase(sessionId, body.case_id);
+      const roomNumber = String(current.room_number ?? "");
+      if (!/^\d{3,5}$/.test(roomNumber)) throw new Error("room_number_missing");
+      const outcome = await runDeviceCommand({
+        sessionId,
+        caseId: current.id,
+        target: "encoder",
+        operation: "issue_keycard",
+        idempotencyKey: checkinCommandKey(current.id, "keycard"),
+        request: { case_id: current.id, room_number: roomNumber },
+        successResult: { room_number: roomNumber, write_verified: true, readback_verified: true, dispensed: true, collected: false },
+        successEvent: "ENCODER_SUCCEEDED",
+        successDetail: `房卡仿真写入 ${roomNumber} 并完成回读校验`,
+        faultEvent: "ENCODER_FAULT_INJECTED",
+      });
+      if (outcome.requiresHandoff) {
+        const handed = await requireHandoff(sessionId, current.id, `发卡步骤失败：${outcome.failure?.reason ?? "结果未知"}，已生成人工任务`);
+        return json({ checkinCase: handed, ...handoffPayload(outcome) });
+      }
+      const updated = await transition({ sessionId, caseId: current.id, expected: "PMS_CHECKIN_CONFIRMED", next: "KEYCARD_WRITING", eventType: "KEYCARD_WRITE_STARTED", detail: "自动发卡机已锁定一个空白卡槽，并按房号和有效期开始写卡", fields: { hardwareStatus: "keycard_writing" } });
       return json({ checkinCase: updated });
     }
     if (action === "keycard-complete") {
