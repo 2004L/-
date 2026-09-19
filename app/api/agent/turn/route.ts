@@ -1,8 +1,36 @@
-import { agentTurnSchema, extractPhoneNumber, routeIntent, toolArgumentSchemas, toolNames } from "@/lib/tools";
+import { agentTurnSchema, extractPhoneNumber, routeIntent, toolArgumentSchemas, toolNames, type AssistantMessage, type Clarification, type ToolCall } from "@/lib/tools";
 import { llmConfig, streamModel } from "@/lib/llm";
 import { recordAiMetric, requestId } from "@/lib/ops";
+import { withIntentEnvelope, type IntentSource } from "@/lib/intent-envelope";
 
 export const runtime = "edge";
+
+type AgentResult = ToolCall | Clarification | AssistantMessage;
+
+const criticalFields = ["phone_last4", "phone_number", "from_room", "to_room", "room_number", "new_amount", "amount_type", "region"];
+
+function reconcileAgentResult(modelResult: AgentResult | null, fallbackResult: AgentResult): { result: AgentResult; source: IntentSource } {
+  // The model is the primary interpreter. Rules only provide a safe, schema-checked
+  // fallback when the model is unavailable or fails to produce a usable plan.
+  if (!modelResult) return { result: fallbackResult, source: "rule_fallback" };
+  if (modelResult.type === "tool_call" && fallbackResult.type === "tool_call") {
+    const conflicts = criticalFields.filter((field) => {
+      const modelValue = modelResult.arguments[field];
+      const fallbackValue = fallbackResult.arguments[field];
+      return modelValue !== undefined && fallbackValue !== undefined && String(modelValue) !== String(fallbackValue);
+    });
+    if (conflicts.length > 0) {
+      return {
+        result: { type: "clarification", message: `我识别到${conflicts.join("、")}存在差异，请核对数字后再继续。`, intent: "critical_field_conflict", confidence: 0.4 },
+        source: "safety_guard",
+      };
+    }
+  }
+  // A model refusal or empty natural-language answer must not hide a hotel action.
+  // In that case the validated rule result is a controlled fallback, never a direct DB write.
+  if (modelResult.type === "assistant_message" && fallbackResult.type === "tool_call") return { result: fallbackResult, source: "rule_fallback" };
+  return { result: modelResult, source: "model" };
+}
 
 export async function POST(request: Request) {
   const rid = requestId(request);
@@ -25,7 +53,8 @@ export async function POST(request: Request) {
       const modelResult = await streamModel(input.messages, { case_id: input.case_id });
       if (!modelResult) {
         await recordAiMetric({ requestId: rid, sessionId: metricSessionId, route: "/api/agent/turn", model, latencyMs: Date.now() - startedAt, outcome: "fallback" });
-        return Response.json(ruleResult, { headers: { "X-Request-ID": rid } });
+        const fallback = withIntentEnvelope(ruleResult, "rule_fallback");
+        return Response.json(fallback, { headers: { "X-Request-ID": rid } });
       }
       const encoder = new TextEncoder();
       const send = (controller: ReadableStreamDefaultController<Uint8Array>, event: Record<string, unknown>) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
@@ -44,20 +73,19 @@ export async function POST(request: Request) {
                 send(controller, { type: "text_delta", delta: part.text });
               } else if (part.type === "tool-call") {
                 const toolName = toolNames.find((candidate) => candidate.replaceAll(".", "_") === part.toolName);
-                const parsed = toolName ? toolArgumentSchemas[toolName].safeParse(part.input) : { success: false };
-                if (toolName && parsed.success) toolResponse = { type: "tool_call", tool_call_id: part.toolCallId, tool_name: toolName, arguments: parsed.data, implementation: toolName.startsWith("device.") || toolName.startsWith("police.") ? "simulator" : "business_api" };
+                const parsed = toolName ? toolArgumentSchemas[toolName].safeParse(part.input) : null;
+                if (toolName && parsed?.success) toolResponse = { type: "tool_call", tool_call_id: part.toolCallId, tool_name: toolName, arguments: parsed.data, implementation: toolName.startsWith("device.") || toolName.startsWith("police.") ? "simulator" : "business_api" };
               } else if (part.type === "error") {
                 send(controller, { type: "error", message: "模型暂时不可用" });
               }
             }
-            const looksLikeRefusal = /只能处理酒店|无法为您编写|不能编写|酒店自助入住助手/.test(text);
-            // 订单、身份、公安和房卡动作以本地规则为准；模型只能补充话术，不能把安全动作改成普通回复。
-            const deterministicSafetyResult = ruleResult.type === "tool_call" || (ruleResult.type === "clarification" && ruleResult.intent !== "general_assistance") ? ruleResult : null;
-            const response = deterministicSafetyResult ?? toolResponse ?? (ruleResult.type === "assistant_message" && looksLikeRefusal ? ruleResult : text.trim() ? { type: "assistant_message", message: text.trim() } : ruleResult);
+            const modelResponse = toolResponse as AgentResult | null ?? (text.trim() ? { type: "assistant_message" as const, message: text.trim() } : null);
+            const reconciled = reconcileAgentResult(modelResponse, ruleResult);
+            const response = withIntentEnvelope(reconciled.result, reconciled.source);
             send(controller, { type: "done", response });
           } catch (error) {
             outcome = "fallback";
-            send(controller, { type: "fallback", response: ruleResult, message: error instanceof Error ? error.message : "stream_failed" });
+            send(controller, { type: "fallback", response: withIntentEnvelope(ruleResult, "rule_fallback"), message: error instanceof Error ? error.message : "stream_failed" });
           } finally {
             clearInterval(heartbeat);
             await recordAiMetric({ requestId: rid, sessionId: metricSessionId, route: "/api/agent/turn", model, latencyMs: Date.now() - startedAt, outcome });
@@ -70,7 +98,7 @@ export async function POST(request: Request) {
       console.warn("llm_unavailable_fallback_to_rules", error instanceof Error ? error.message : "unknown");
     }
     await recordAiMetric({ requestId: rid, sessionId: metricSessionId, route: "/api/agent/turn", model, latencyMs: Date.now() - startedAt, outcome: "fallback" });
-    return Response.json(ruleResult, { headers: { "X-Request-ID": rid } });
+    return Response.json(withIntentEnvelope(ruleResult, "rule_fallback"), { headers: { "X-Request-ID": rid } });
   } catch {
     await recordAiMetric({ requestId: rid, sessionId: metricSessionId, route: "/api/agent/turn", model, latencyMs: Date.now() - startedAt, outcome: "error" });
     return Response.json({ type: "clarification", message: "我没有安全解析这句话，请换一种说法。", intent: "invalid_input", confidence: 0 }, { status: 400, headers: { "X-Request-ID": rid } });

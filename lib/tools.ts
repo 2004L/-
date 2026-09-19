@@ -60,6 +60,26 @@ const normalizeDigits = (text: string) => {
   return [...text].map((character) => digitMap[character] ?? character).join("").replace(/\D/g, "");
 };
 
+function parseSpokenNumber(value: string) {
+  const token = value.replace(/\s+/g, "");
+  if (!token) return "";
+  if (!/[十百千万]/.test(token)) return normalizeDigits(token);
+  const digitMap: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 幺: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  let total = 0;
+  let section = 0;
+  let current = 0;
+  for (const character of token) {
+    if (/^\d$/.test(character)) { current = current * 10 + Number(character); continue; }
+    if (digitMap[character] !== undefined) { current = current * 10 + digitMap[character]; continue; }
+    const unit = character === "十" ? 10 : character === "百" ? 100 : character === "千" ? 1000 : character === "万" ? 10000 : 0;
+    if (!unit) continue;
+    if (unit === 10000) { section = (section + current) * unit; total += section; section = 0; }
+    else section += (current || 1) * unit;
+    current = 0;
+  }
+  return String(total + section + current);
+}
+
 const fullPhone = (text: string) => normalizeDigits(text).match(/1[3-9]\d{9}/)?.[0] ?? null;
 export function extractPhoneNumber(text: string) {
   const digits = normalizeDigits(text);
@@ -73,8 +93,7 @@ const last4 = (text: string) => {
 const spokenCount = (text: string, pattern: RegExp, fallback: number) => {
   const match = text.match(pattern);
   if (!match) return fallback;
-  const digits = normalizeDigits(match[1] ?? "");
-  const value = Number(digits);
+  const value = Number(parseSpokenNumber(match[1] ?? ""));
   return Number.isInteger(value) && value > 0 ? value : fallback;
 };
 

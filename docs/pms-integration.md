@@ -21,13 +21,18 @@ PMS_API_KEY=TEMP_PMS_API_KEY_REPLACE_ME
 
 前端只调用本项目的 `/api/pms/*`，由适配器转换为具体 PMS API，避免把 PMS 结构写死在前端。
 
-| 本项目接口 | 作用 | 关键字段 |
-| --- | --- | --- |
-| `GET /api/pms/orders?phone=` | 手机号优先匹配订单 | `orderId`、`source`、`status`、`guestPhone` |
-| `GET /api/pms/rooms` | 查询指定日期可售房间 | `propertyCode`、`roomTypeCode`、`roomNumber`、`status` |
-| `POST /api/pms/hold` | 临时锁房 | `reservationId`、`roomNumber`、`expiresInSeconds`、`idempotencyKey` |
-| `POST /api/pms/checkin` | 登记实际入住 | `reservationId`、`policeReceipt`、`actualCheckInAt` |
-| `POST /api/pms/checkout` | 登记退房并触发保洁 | `reservationId`、`actualCheckOutAt` |
+| 本项目接口 | 鉴权 | 作用 | 关键字段 |
+| --- | --- | --- | --- |
+| `GET /api/pms/ping` | 无需 | 适配器连通性检查，不返回业务数据 | `adapter`、`pmsVersion`、`mode`、`traceId` |
+| `GET /api/pms/orders?phone_last4=` | 管理员 | 从正式 `reservations` 读取 | `orderId`、`source`、`status`、`guestPhone` |
+| `GET /api/pms/rooms` | 管理员 | 从正式 `rooms` 读取房态 | `number`、`roomTypeCode`、`pmsCode`、`status`、`version`、`holdable` |
+| `POST /api/pms/hold` | 管理员 | 预留（等待正式流程） | 当前返回 501 `pms_write_requires_formal_flow` |
+| `POST /api/pms/checkin` | 管理员 | 登记实际入住（等待正式流程） | 当前返回 501 `pms_write_requires_formal_flow` |
+| `POST /api/pms/checkout` | 管理员 | 登记退房（等待正式流程） | 当前返回 501 `pms_write_requires_formal_flow` |
+
+房态与预订的写入由正式领域工作流执行（`workflow_runs`、`rooms` 版本号 CAS、`room_status_logs`）。
+PMS 适配层只负责读取投影和故障注入演示，不再直接修改内存或投影数据；外部 PMS 是否为权威来源需要单独决策，
+不能由适配层绕过业务规则。
 
 ## 酒店编码设计
 

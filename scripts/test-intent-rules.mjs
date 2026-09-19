@@ -12,6 +12,11 @@ const cases = [
     assert: (result) => result.type === "tool_call" && result.tool_name === "pms.search_order" && result.arguments.phone_last4 === "3452",
   },
   {
+    id: "reservation-tail-compound-spoken",
+    result: routeIntent("我在平台订了房，手机号尾号三千四百五十二"),
+    assert: (result) => result.type === "tool_call" && result.tool_name === "pms.search_order" && result.arguments.phone_last4 === "3452",
+  },
+  {
     id: "walk-in-requires-full-phone",
     result: routeIntent("我没有预订，想现场入住"),
     assert: (result) => result.type === "clarification" && result.intent === "walk_in" && result.message.includes("完整手机号"),

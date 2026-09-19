@@ -37,6 +37,7 @@ MAX_AUDIO_BYTES = int(os.getenv("ASR_MAX_AUDIO_BYTES", str(8 * 1024 * 1024)))
 MIN_AUDIO_BYTES = int(os.getenv("ASR_MIN_AUDIO_BYTES", "800"))
 MIN_AUDIO_DURATION_MS = int(os.getenv("ASR_MIN_AUDIO_DURATION_MS", "350"))
 TRANSCRIBE_TIMEOUT = float(os.getenv("ASR_TRANSCRIBE_TIMEOUT", "20"))
+ASR_PARTIAL_INTERVAL = float(os.getenv("ASR_PARTIAL_INTERVAL", "2.0"))
 ASR_CONCURRENCY = max(1, int(os.getenv("ASR_CONCURRENCY", "1")))
 TLS_CERT = os.getenv("ASR_TLS_CERT", "").strip()
 TLS_KEY = os.getenv("ASR_TLS_KEY", "").strip()
@@ -129,6 +130,17 @@ def transcribe(audio: bytes, language: str | None, chunk_count: int) -> dict[str
     }
 
 
+def transcribe_text(audio: bytes, language: str | None) -> str:
+    """Return the transcript for the audio accumulated so far, or empty."""
+    if len(audio) < MIN_AUDIO_BYTES:
+        return ""
+    samples, sample_rate, duration_ms = decode_audio(audio)
+    if duration_ms < MIN_AUDIO_DURATION_MS:
+        return ""
+    result = MODEL.transcribe(audio=(samples, sample_rate), language=language or None)
+    return str(getattr(result[0], "text", "") or "").strip()
+
+
 async def send_error(websocket: ServerConnection, code: str, message: str) -> None:
     await websocket.send(json.dumps({"type": "error", "code": code, "message": message}, ensure_ascii=False))
 
@@ -148,6 +160,30 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
     chunks: list[bytes] = []
     language: str | None = "Chinese"
     started = False
+    partial_task: asyncio.Task | None = None
+
+    async def partial_loop() -> None:
+        last_audio = b""
+        while True:
+            await asyncio.sleep(ASR_PARTIAL_INTERVAL)
+            if not started or not chunks:
+                continue
+            audio = b"".join(chunks)
+            if len(audio) < MIN_AUDIO_BYTES or audio == last_audio:
+                continue
+            try:
+                async with TRANSCRIBE_SEMAPHORE:
+                    text = await asyncio.wait_for(asyncio.to_thread(transcribe_text, audio, language), min(TRANSCRIBE_TIMEOUT, 8.0))
+            except Exception:
+                continue
+            if not text or not started:
+                continue
+            last_audio = audio
+            try:
+                await websocket.send(json.dumps({"type": "result", "text": text, "is_final": False}, ensure_ascii=False))
+            except Exception:
+                return
+
     async for message in websocket:
         if isinstance(message, bytes):
             if not started:
@@ -170,6 +206,9 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
             chunks.clear()
             language = payload.get("language") or "Chinese"
             started = True
+            if partial_task and not partial_task.done():
+                partial_task.cancel()
+            partial_task = asyncio.create_task(partial_loop()) if ASR_PARTIAL_INTERVAL > 0 else None
             await websocket.send(json.dumps({
                 "type": "ready",
                 "service": "qwen3-asr",
@@ -182,6 +221,9 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
                 await send_error(websocket, "empty_audio", "没有听到语音，请再说一次")
                 continue
             started = False
+            if partial_task and not partial_task.done():
+                partial_task.cancel()
+            partial_task = None
             audio = b"".join(chunks)
             chunk_count = len(chunks)
             chunks.clear()
@@ -209,6 +251,9 @@ async def handler(websocket: ServerConnection, *_: Any) -> None:
                 await send_error(websocket, "transcribe_failed", "本地识别失败，请再说一次")
         else:
             await send_error(websocket, "unknown_message", "无法识别语音请求")
+
+    if partial_task and not partial_task.done():
+        partial_task.cancel()
 
 
 async def main() -> None:

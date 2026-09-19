@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const commandStatuses = ["ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED", "UNKNOWN", "MANUAL_REQUIRED"] as const;
+export const commandStatuses = ["PENDING", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED", "UNKNOWN", "MANUAL_REQUIRED"] as const;
 export const commandStatusSchema = z.enum(commandStatuses);
 export const targetSchema = z.enum(["reader", "encoder", "police"]);
 

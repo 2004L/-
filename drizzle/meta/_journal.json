@@ -1,5 +1,5 @@
 {
-  "version": "7",
+  "version": "8",
   "dialect": "sqlite",
   "entries": [
     {
@@ -49,6 +49,55 @@
       "version": "7",
       "when": 1789570800000,
       "tag": "0006_admin_sensitive_actions",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "8",
+      "when": 1789620000000,
+      "tag": "0007_ai_native_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "9",
+      "when": 1789623600000,
+      "tag": "0008_hotel_core_domain",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "10",
+      "when": 1789627200000,
+      "tag": "0009_legacy_core_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "11",
+      "when": 1789630800000,
+      "tag": "0010_core_backfill_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "12",
+      "when": 1789634400000,
+      "tag": "0011_legacy_duplicate_canonicalization",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "13",
+      "when": 1789638000000,
+      "tag": "0012_admin_confirmation_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "14",
+      "when": 1789641600000,
+      "tag": "0013_orders",
       "breakpoints": true
     }
   ]

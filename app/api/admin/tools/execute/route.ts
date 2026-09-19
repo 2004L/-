@@ -16,7 +16,7 @@ export async function POST(request: Request) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "admin_tool_failed";
     await auditAdmin(auth.user, "ADMIN_TOOL_FAILED", message);
-    const status = message === "admin_permission_denied" ? 403 : message.includes("conflict") ? 409 : 400;
+    const status = message === "admin_permission_denied" ? 403 : message === "admin_action_expired" ? 410 : message.includes("conflict") ? 409 : 400;
     return Response.json({ ok: false, error: message }, { status });
   }
 }

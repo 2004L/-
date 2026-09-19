@@ -1,5 +1,8 @@
 import { getD1 } from "@/db";
 import { ensureAdminSchema, requireAdmin } from "@/lib/admin-auth";
+import { confirmFormalCheckin, ensureFormalCheckinOrder, holdFormalRoom, projectCheckinToLegacy } from "@/lib/checkin";
+import { ORDER_STATUS, RESERVATION_STATUS } from "@/lib/hotel-core";
+import { DEFAULT_HOTEL_CODE, DEFAULT_HOTEL_ID, DEFAULT_TENANT_ID, ensureTenantFoundation } from "@/lib/tenant";
 
 export const runtime = "edge";
 
@@ -73,6 +76,64 @@ function json(data: unknown, status = 200) {
 
 function now() {
   return new Date().toISOString();
+}
+
+type DemoOrderScope = { tenantId: string; hotelId: string; hotelCode: string };
+
+/** The guest flow writes the formal tables; the demo tables are projections. */
+async function sessionScope(sessionId: string): Promise<DemoOrderScope> {
+  const read = () => getD1().prepare("SELECT tenant_id, hotel_id, hotel_code FROM demo_sessions WHERE id = ?").bind(sessionId).first<{ tenant_id: string | null; hotel_id: string | null; hotel_code: string | null }>();
+  let row = await read();
+  if (!row?.hotel_id) {
+    await ensureTenantFoundation();
+    row = await read();
+  }
+  return { tenantId: row?.tenant_id ?? DEFAULT_TENANT_ID, hotelId: row?.hotel_id ?? DEFAULT_HOTEL_ID, hotelCode: row?.hotel_code ?? DEFAULT_HOTEL_CODE };
+}
+
+async function syncFormal(sessionId: string, caseId: string | null, label: string, run: () => Promise<unknown>) {
+  try {
+    await run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown_error";
+    console.warn(`[checkin][formal] ${label} failed: ${message}`);
+    void audit(sessionId, caseId, "FORMAL_SYNC_FAILED", null, null, `正式表同步失败（${label}）：${message}；演示投影仍可用`).catch(() => undefined);
+  }
+}
+
+type FormalOrderSeed = { orderNo: string; source: string; guestLabel: string; phoneLast4: string; stayDate: string; nights: number; roomTypeName: string; roomAmount: number; depositAmount: number; totalAmount: number; roomCount?: number; orderStatus?: number; reservationStatus?: number };
+
+async function ensureFormalForOrder(scope: DemoOrderScope, seed: FormalOrderSeed) {
+  await ensureFormalCheckinOrder({
+    tenantId: scope.tenantId,
+    hotelId: scope.hotelId,
+    orderNo: seed.orderNo,
+    source: seed.source,
+    guestLabel: seed.guestLabel,
+    phoneLast4: seed.phoneLast4,
+    stayDate: seed.stayDate,
+    nights: seed.nights,
+    roomCount: seed.roomCount ?? 1,
+    roomTypeName: seed.roomTypeName,
+    roomAmount: seed.roomAmount,
+    depositAmount: seed.depositAmount,
+    totalAmount: seed.totalAmount,
+    orderStatus: seed.orderStatus,
+    reservationStatus: seed.reservationStatus,
+  });
+}
+
+async function legacyOrderRef(orderId: string) {
+  const row = await getD1().prepare("SELECT order_code, room_type FROM demo_orders WHERE id = ? LIMIT 1").bind(orderId).first<{ order_code: string; room_type: string }>();
+  return row ? { orderCode: row.order_code, roomTypeName: row.room_type } : null;
+}
+
+async function projectFormal(scope: DemoOrderScope, orderNo: string, patch: { status?: string; roomNumber?: string | null }) {
+  try {
+    await projectCheckinToLegacy({ hotelId: scope.hotelId, orderNo, ...patch });
+  } catch (error) {
+    console.warn(`[checkin][projection] ${orderNo} failed: ${error instanceof Error ? error.message : "unknown_error"}`);
+  }
 }
 
 function requireSession(value: unknown) {
@@ -202,6 +263,25 @@ async function seedSession(sessionId: string) {
         )
     )
   );
+
+  const scope = await sessionScope(sessionId);
+  await Promise.all(SEED_ORDERS.map((order) => syncFormal(sessionId, null, `seed:${order[0]}`, () => {
+    const cancelled = order[8] === "cancelled";
+    return ensureFormalForOrder(scope, {
+      orderNo: order[0],
+      source: order[1],
+      guestLabel: order[2],
+      phoneLast4: order[3],
+      stayDate: order[5],
+      nights: order[6],
+      roomTypeName: order[7],
+      roomAmount: 380,
+      depositAmount: 300,
+      totalAmount: 680,
+      orderStatus: cancelled ? ORDER_STATUS.CANCELLED : undefined,
+      reservationStatus: cancelled ? RESERVATION_STATUS.CANCELLED : undefined,
+    });
+  })));
 }
 
 async function snapshot(sessionId: string) {
@@ -539,6 +619,20 @@ export async function POST(request: Request, context: RouteContext) {
       const orderCode = `WALKIN-${Date.now()}`;
       await db.prepare("INSERT INTO demo_orders (id, session_id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number, created_at, updated_at) VALUES (?, ?, ?, '现场办理', '现场演示住客', ?, ?, ?, ?, ?, ?, 'awaiting_arrival', NULL, ?, ?)")
         .bind(orderId, sessionId, orderCode, draft.phone_last4, draft.phone_masked, draft.stay_date, draft.nights, draft.room_count, draft.room_type_name ?? "标准大床房", timestamp, timestamp).run();
+      const scope = await sessionScope(sessionId);
+      await syncFormal(sessionId, null, "walk-in-order", () => ensureFormalForOrder(scope, {
+        orderNo: orderCode,
+        source: "现场办理",
+        guestLabel: "现场演示住客",
+        phoneLast4: draft.phone_last4,
+        stayDate: draft.stay_date,
+        nights: draft.nights,
+        roomTypeName: draft.room_type_name ?? "标准大床房",
+        roomCount: draft.room_count,
+        roomAmount: draft.room_amount ?? 380,
+        depositAmount: draft.deposit_amount ?? 300,
+        totalAmount: draft.total_amount ?? 680,
+      }));
       await db.prepare("UPDATE walk_in_drafts SET status = 'ORDER_CREATED', order_id = ?, updated_at = ? WHERE id = ? AND session_id = ? AND status = 'AWAITING_PAYMENT'").bind(orderId, timestamp, draft.id, sessionId).run();
       await audit(sessionId, null, "PAYMENT_CONFIRMED", "AWAITING_PAYMENT", "PAID", `模拟支付成功，回执 ${receipt}`);
       await audit(sessionId, null, "WALK_IN_ORDER_CREATED", "PAID", "ORDER_CREATED", `支付成功后创建现场订单 ${orderCode}；未支付不会创建正式订单`);
@@ -551,11 +645,25 @@ export async function POST(request: Request, context: RouteContext) {
       const existing = await getD1().prepare("SELECT id FROM demo_orders WHERE session_id = ? AND source = '现场办理' AND phone_last4 = ? AND status = 'awaiting_arrival' ORDER BY created_at DESC LIMIT 1").bind(sessionId, phoneLast4).first<{ id: string }>();
       if (existing) return json(await matchOrder(sessionId, phoneLast4, "现场办理"));
       const orderId = crypto.randomUUID();
+      const orderCode = `WALKIN-${Date.now()}`;
       const timestamp = now();
       await getD1()
         .prepare("INSERT INTO demo_orders (id, session_id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number, created_at, updated_at) VALUES (?, ?, ?, '现场办理', '现场演示住客', ?, ?, ?, 1, 1, '标准大床房', 'awaiting_arrival', NULL, ?, ?)")
-        .bind(orderId, sessionId, `WALKIN-${Date.now()}`, phoneLast4, `1** **** ${phoneLast4}`, timestamp.slice(0, 10), timestamp, timestamp)
+        .bind(orderId, sessionId, orderCode, phoneLast4, `1** **** ${phoneLast4}`, timestamp.slice(0, 10), timestamp, timestamp)
         .run();
+      const scope = await sessionScope(sessionId);
+      await syncFormal(sessionId, null, "walk-in", () => ensureFormalForOrder(scope, {
+        orderNo: orderCode,
+        source: "现场办理",
+        guestLabel: "现场演示住客",
+        phoneLast4,
+        stayDate: timestamp.slice(0, 10),
+        nights: 1,
+        roomTypeName: "标准大床房",
+        roomAmount: 380,
+        depositAmount: 300,
+        totalAmount: 680,
+      }));
       await audit(sessionId, null, "WALK_IN_CREATED", null, "AWAITING_ARRIVAL", `已创建末四位 ${phoneLast4} 的现场演示订单`);
       return json(await matchOrder(sessionId, phoneLast4, "现场办理"), 201);
     }
@@ -570,7 +678,14 @@ export async function POST(request: Request, context: RouteContext) {
     if (action === "hold-room") {
       const roomNumber = typeof body.room_number === "string" && /^\d{3,5}$/.test(body.room_number) ? body.room_number : "1208";
       const updated = await transition({ sessionId, caseId: body.case_id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail: `模拟 PMS 已临时锁定 ${roomNumber} 房`, fields: { roomNumber } });
-      await getD1().prepare("UPDATE demo_orders SET room_number = ?, updated_at = ? WHERE id = ? AND session_id = ?").bind(roomNumber, now(), updated.order_id, sessionId).run();
+      const ref = await legacyOrderRef(updated.order_id);
+      if (ref) {
+        const scope = await sessionScope(sessionId);
+        await syncFormal(sessionId, updated.id, "hold-room", () => holdFormalRoom({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, roomNumber, roomTypeName: ref.roomTypeName, requestId: `${sessionId}:${updated.id}:hold` }));
+        await projectFormal(scope, ref.orderCode, { roomNumber });
+      } else {
+        await getD1().prepare("UPDATE demo_orders SET room_number = ?, updated_at = ? WHERE id = ? AND session_id = ?").bind(roomNumber, now(), updated.order_id, sessionId).run();
+      }
       return json({ checkinCase: updated });
     }
     if (action === "browser-start") {
@@ -589,7 +704,14 @@ export async function POST(request: Request, context: RouteContext) {
     }
     if (action === "confirm-checkin") {
       const updated = await transition({ sessionId, caseId: body.case_id, expected: "POLICE_COMPLETED", next: "PMS_CHECKIN_CONFIRMED", eventType: "PMS_CHECKIN_CONFIRMED", detail: "模拟 PMS 入住确认成功；已核对订单、房间和登记回执" });
-      await getD1().prepare("UPDATE demo_orders SET status = 'checkin_confirmed', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
+      const ref = await legacyOrderRef(updated.order_id);
+      if (ref) {
+        const scope = await sessionScope(sessionId);
+        await syncFormal(sessionId, updated.id, "confirm-checkin", () => confirmFormalCheckin({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, requestId: `${sessionId}:${updated.id}:checkin` }));
+        await projectFormal(scope, ref.orderCode, { status: "checkin_confirmed" });
+      } else {
+        await getD1().prepare("UPDATE demo_orders SET status = 'checkin_confirmed', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
+      }
       return json({ checkinCase: updated });
     }
     if (action === "keycard-start") {
@@ -598,7 +720,13 @@ export async function POST(request: Request, context: RouteContext) {
     }
     if (action === "keycard-complete") {
       const updated = await transition({ sessionId, caseId: body.case_id, expected: "KEYCARD_WRITING", next: "KEYCARD_DISPENSED", eventType: "KEYCARD_DISPENSED", detail: "房卡写入后已回读校验，发卡机出卡传感器确认卡片到达取卡口", fields: { hardwareStatus: "keycard_dispensed" } });
-      await getD1().prepare("UPDATE demo_orders SET status = 'in_house', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
+      const ref = await legacyOrderRef(updated.order_id);
+      if (ref) {
+        const scope = await sessionScope(sessionId);
+        await projectFormal(scope, ref.orderCode, { status: "in_house" });
+      } else {
+        await getD1().prepare("UPDATE demo_orders SET status = 'in_house', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
+      }
       return json({ checkinCase: updated });
     }
     if (action === "pickup-confirmed") {

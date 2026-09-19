@@ -50,6 +50,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { isRoomNumber, parseAmount } from "@/lib/admin-tools";
 
 type AdapterConfig = {
   provider: string;
@@ -139,8 +140,9 @@ type IntentResponse = Partial<MatchResponse> & {
   assistantMessage: string;
 };
 
-type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
-type AdminResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; response_hint?: string } | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
+type IntentEnvelopeView = { intent: string; intent_class: "hotel" | "general"; entities: Record<string, string | number | null>; missing_fields: string[]; next_action: string; risk: "none" | "low" | "medium" | "high"; requires_confirmation: boolean; confidence: number; source: "model" | "rule_fallback" | "safety_guard" };
+type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string; intent_envelope?: IntentEnvelopeView } | { type: "clarification"; message: string; intent: string; confidence: number; intent_envelope?: IntentEnvelopeView } | { type: "assistant_message"; message: string; intent_envelope?: IntentEnvelopeView };
+type AdminResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; response_hint?: string; workflow?: { kind: "room_change"; target_room: string; stage: "guest_search" }; intent_envelope?: IntentEnvelopeView } | { type: "clarification"; message: string; intent: string; confidence: number; intent_envelope?: IntentEnvelopeView } | { type: "assistant_message"; message: string; intent_envelope?: IntentEnvelopeView };
 type AgentHistoryMessage = { role: "user" | "assistant" | "tool"; content: string };
 type TranscriptEntry = { id: string; role: "user" | "assistant" | "tool"; content: string };
 
@@ -165,6 +167,7 @@ type RecognitionConstructor = new () => RecognitionLike;
 type AsrSocketMessage = {
   type: "ready" | "result" | "error";
   text?: string;
+  is_final?: boolean;
   language?: string;
   latency_ms?: number;
   audio_chunks?: number;
@@ -183,6 +186,7 @@ type AdminUser = { id: string; hotel_code: string; username: string; display_nam
 
 type PendingAdminAction = {
   actionId: string;
+  orderId?: string;
   actionType: string;
   title: string;
   riskLevel: string;
@@ -195,12 +199,44 @@ type PendingAdminAction = {
   cancelLabel: string;
   reason: string;
   expiresAt: string;
+  fromRoom?: string;
+  toRoom?: string;
+  amountType?: string;
+  newAmount?: number;
+};
+
+type AdminConfirmationStatus = "AWAITING_CONFIRMATION" | "EXECUTED" | "CANCELLED" | "EXPIRED" | "CONFLICTED";
+type AdminConfirmationCardState = { action: PendingAdminAction; status: AdminConfirmationStatus; error?: string };
+type AdminAuditRecord = { id: number; action_id?: string | null; event_type: string; detail: string; username?: string | null; role?: string | null; created_at: string };
+
+type AdminWorkflowStep = "guest_search" | "guest_selection" | "room_check" | "confirmation" | "executing" | "completed" | "blocked";
+type AdminWorkflow = {
+  kind: "room_change";
+  step: AdminWorkflowStep;
+  targetRoom: string;
+  candidates: Array<Record<string, unknown>>;
+  selectedOrder: Record<string, unknown> | null;
+  room: { roomNumber: string; status: string; version?: number | null; guest?: Record<string, unknown> | null } | null;
+  message: string;
 };
 
 type AdminResult =
   | { type: "orders"; orders: Array<Record<string, unknown>> }
-  | { type: "room"; roomNumber: string; status: string }
+  | { type: "room"; roomNumber: string; status: string; version?: number | null }
+  | { type: "workflow"; workflow: AdminWorkflow }
   | null;
+
+type PipelineStageId = "mic" | "asr" | "model" | "tool" | "confirm";
+type PipelineStageStatus = "idle" | "connecting" | "normal" | "timeout" | "failed" | "cancelled";
+type PipelineStageState = { id: PipelineStageId; label: string; status: PipelineStageStatus; detail?: string; latencyMs?: number };
+
+const INITIAL_PIPELINE: PipelineStageState[] = [
+  { id: "mic", label: "麦克风", status: "idle" },
+  { id: "asr", label: "ASR", status: "idle" },
+  { id: "model", label: "模型", status: "idle" },
+  { id: "tool", label: "工具", status: "idle" },
+  { id: "confirm", label: "确认", status: "idle" },
+];
 
 type PairingCheckStatus = "pending" | "checking" | "passed" | "warning" | "failed";
 type PairingCheck = { id: "context" | "microphone" | "certificate" | "service" | "connection"; label: string; status: PairingCheckStatus; detail: string };
@@ -546,7 +582,8 @@ function AdapterWizard({ initial, onComplete }: { initial: AdapterConfig; onComp
   async function testAdapter() {
     setTesting(true);
     try {
-      await Promise.all(["orders", "rooms", "hold", "checkin", "checkout"].map((name) => fetch(`/api/pms/${name}`, { method: name === "orders" || name === "rooms" ? "GET" : "POST" })));
+      const response = await fetch("/api/pms/ping", { cache: "no-store" });
+      if (!response.ok) throw new Error("pms_ping_failed");
       setTested(true);
     } finally {
       setTesting(false);
@@ -685,7 +722,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setConversationId(`conv_${crypto.randomUUID().replaceAll("-", "")}`);
     setUtterance("");
     setIntentTrace(null);
-    setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "tool", content: `已开启新的业务对话：${reason}。上一位客人的对话不会用于本次办理。` }].slice(-40));
+    setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "tool" as const, content: `已开启新的业务对话：${reason}。上一位客人的对话不会用于本次办理。` }].slice(-40));
   }
 
   function clearVoiceTimer() {
@@ -762,11 +799,12 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
   function finishBrowserSubmission() {
     const finalText = [browserFinalTranscriptRef.current, browserInterimTranscriptRef.current].filter(Boolean).join(" ").trim();
-    if (finalText) setUtterance(finalText);
+    if (finalText) {
+      setUtterance(finalText);
+      setMessage("语音已识别，请检查文字后点击发送");
+    } else setMessage("没有听清内容，请再说一次，或直接输入文字");
     voiceSubmitRequestedRef.current = false;
     releaseVoiceResources(true);
-    if (finalText) void submitUtterance(finalText);
-    else setMessage("没有听清内容，请再说一次，或直接输入文字");
   }
 
   function finishListeningAndSubmit() {
@@ -774,8 +812,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       if (utterance.trim()) void submitUtterance();
       return;
     }
-    voiceSubmitRequestedRef.current = true;
-    setMessage("正在整理语音内容，请稍候…");
+    voiceSubmitRequestedRef.current = false;
+    setMessage("正在整理语音内容，请稍候；识别后可先修改文字");
     if (voiceBackend === "browser") {
       const recognition = recognitionRef.current;
       if (recognition) {
@@ -925,8 +963,15 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       let payload: AsrSocketMessage;
       try { payload = JSON.parse(String(event.data)) as AsrSocketMessage; } catch { return; }
       if (payload.type === "result" && payload.text?.trim()) {
+        const isFinal = payload.is_final !== false;
         localAsrResultRef.current = true;
         const transcript = payload.text.trim();
+        setUtterance(transcript);
+        if (!isFinal) {
+          setAudioCaptureStatus(audioSignalSeenRef.current ? "ok" : "silent");
+          setMessage("正在识别，临时文字会实时显示在输入框");
+          return;
+        }
         if (isFillerTranscript(transcript)) {
           voiceSubmitRequestedRef.current = false;
           setUtterance("");
@@ -935,7 +980,6 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
           setMessage(audioSignalSeenRef.current ? "只识别到很短的回应，请完整说出要办理的事情或直接输入文字" : "没有检测到有效麦克风声音，请检查输入设备后再试");
           return;
         }
-        setUtterance(transcript);
         releaseVoiceResources(true);
         if (voiceSubmitRequestedRef.current) {
           voiceSubmitRequestedRef.current = false;
@@ -986,6 +1030,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       stopListening();
       return;
     }
+    if (typeof window !== "undefined" && window.speechSynthesis) window.speechSynthesis.cancel();
     setListening(true);
     setMessage("正在连接本地语音识别…");
     try {
@@ -1051,6 +1096,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         setMessage(streamedText);
       });
       if (generation !== conversationGenerationRef.current) return;
+      if (agent.intent_envelope) setIntentTrace({ label: agent.intent_envelope.intent, confidence: agent.intent_envelope.confidence, action: agent.intent_envelope.next_action });
       if (agent.type === "clarification") {
         recordConversation("assistant", agent.message);
         setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
@@ -1427,14 +1473,21 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   const [adminUtterance, setAdminUtterance] = useState("");
   const [adminReply, setAdminReply] = useState("管理员模式已就绪。您可以说：查询尾号4821，或把尾号4821换到1306。");
   const [adminResult, setAdminResult] = useState<AdminResult>(null);
+  const [adminWorkflow, setAdminWorkflow] = useState<AdminWorkflow | null>(null);
   const [suggestionRoom, setSuggestionRoom] = useState("");
   const [adminBusy, setAdminBusy] = useState(false);
   const [adminVoiceListening, setAdminVoiceListening] = useState(false);
   const [adminVoiceSubmitSignal, setAdminVoiceSubmitSignal] = useState(0);
   const [pendingAdminActionId, setPendingAdminActionId] = useState<string | null>(null);
   const [pendingAdminAction, setPendingAdminAction] = useState<PendingAdminAction | null>(null);
+  const [pendingActionDirty, setPendingActionDirty] = useState(false);
   const [confirmActionOpen, setConfirmActionOpen] = useState(false);
   const [adminActionBusy, setAdminActionBusy] = useState(false);
+  const [confirmationCard, setConfirmationCard] = useState<AdminConfirmationCardState | null>(null);
+  const [auditDetails, setAuditDetails] = useState<AdminAuditRecord[] | null>(null);
+  const [auditDetailsBusy, setAuditDetailsBusy] = useState(false);
+  const [pipeline, setPipeline] = useState<PipelineStageState[]>(() => INITIAL_PIPELINE.map((stage) => ({ ...stage })));
+  const [adminVoiceRetrySignal, setAdminVoiceRetrySignal] = useState(0);
   useEffect(() => {
     void fetch("/api/admin/auth/me", { cache: "no-store" })
       .then((response) => response.ok ? response.json() as Promise<{ user?: AdminUser }> : Promise.reject(new Error("auth_required")))
@@ -1442,6 +1495,12 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       .catch(() => setAdminUser(null))
       .finally(() => setAuthLoading(false));
   }, []);
+  function updatePipelineStage(id: PipelineStageId, patch: Partial<PipelineStageState>) {
+    setPipeline((current) => current.map((stage) => (stage.id === id ? { ...stage, ...patch } : stage)));
+  }
+  function resetCommandPipeline() {
+    setPipeline((current) => current.map((stage) => (stage.id === "mic" || stage.id === "asr" ? stage : { id: stage.id, label: stage.label, status: "idle" as const, detail: undefined, latencyMs: undefined })));
+  }
   const intentEvents = snapshot.auditEvents.filter((event) => event.event_type.startsWith("INTENT_"));
   const completedCases = snapshot.cases.filter((item) => item.status === "CHECKIN_COMPLETE").length;
   const estimatedMinutesSaved = completedCases * 6;
@@ -1495,18 +1554,69 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   async function executePendingAdminAction() {
     if (!pendingAdminAction || adminActionBusy) return;
     setAdminActionBusy(true);
+    updatePipelineStage("confirm", { status: "connecting", detail: "正在执行" });
+    if (adminWorkflow?.kind === "room_change") setAdminWorkflow((current) => current ? { ...current, step: "executing", message: "正在调用 PMS 执行换房…" } : current);
     try {
-      const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.confirm_pending_action", arguments: { action_id: pendingAdminAction.actionId, confirmation: "CONFIRM" } }) });
+      let actionToExecute = pendingAdminAction;
+      if (pendingActionDirty) {
+        let toolName = "";
+        let args: Record<string, unknown> = {};
+        if (pendingAdminAction.actionType === "room_change") {
+          if (!pendingAdminAction.orderId || !pendingAdminAction.toRoom || !/^\d{3,5}$/.test(pendingAdminAction.toRoom)) throw new Error("请填写有效的目标房间");
+          toolName = "admin.prepare_room_change";
+          args = { order_id: pendingAdminAction.orderId, to_room: pendingAdminAction.toRoom, reason: "管理员在确认卡编辑后重新生成" };
+        } else if (pendingAdminAction.actionType === "amount_adjustment") {
+          if (!pendingAdminAction.orderId || !pendingAdminAction.amountType || !Number.isInteger(pendingAdminAction.newAmount)) throw new Error("请填写有效的整数金额");
+          toolName = "admin.prepare_amount_adjustment";
+          args = { order_id: pendingAdminAction.orderId, amount_type: pendingAdminAction.amountType, new_amount: pendingAdminAction.newAmount, reason: "管理员在确认卡编辑后重新生成" };
+        } else throw new Error("该操作暂不支持直接编辑，请取消后重新下达指令");
+        updatePipelineStage("tool", { status: "connecting", detail: "正在重新校验编辑后的字段", latencyMs: undefined });
+        const prepared = await fetchAdminStep("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: toolName, arguments: args }) }, "正在重新校验编辑后的字段", "字段重新校验超时，未执行任何修改");
+        const preparedData = await prepared.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
+        if (!prepared.ok || !preparedData.ok || !preparedData.result) throw new Error(preparedData.error ?? "编辑后的字段校验失败");
+        updatePipelineStage("tool", { status: "normal", detail: "字段重新校验通过" });
+        const oldActionId = pendingAdminAction.actionId;
+        const nextActionId = setPendingActionFromResult(preparedData.result);
+        actionToExecute = { ...pendingAdminAction, actionId: nextActionId };
+        setPendingActionDirty(false);
+        void fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.cancel_pending_action", arguments: { action_id: oldActionId, reason: "确认卡字段已编辑并生成新确认单" } }) });
+      }
+      const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.confirm_pending_action", arguments: { action_id: actionToExecute.actionId, confirmation: "CONFIRM" } }) });
       const data = await response.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
-      if (!response.ok || !data.ok) throw new Error(data.error ?? "执行失败，请重新核对业务状态");
+      if (!response.ok || !data.ok) {
+        const code = data.error ?? "admin_action_failed";
+        if (code === "admin_action_expired" || code === "room_change_conflict") {
+          const status: AdminConfirmationStatus = code === "admin_action_expired" ? "EXPIRED" : "CONFLICTED";
+          const message = code === "admin_action_expired" ? "确认单已过期，请重新生成后再执行。" : "目标房间已被提前占用，未修改任何房态，请刷新后重新生成确认单。";
+          setConfirmationCard((current) => current ? { ...current, status, error: message } : current);
+          updatePipelineStage("confirm", { status: "failed", detail: message });
+          setPendingAdminActionId(null);
+          setPendingAdminAction(null);
+          setConfirmActionOpen(false);
+          if (adminWorkflow?.kind === "room_change") {
+            const blocked: AdminWorkflow = { ...adminWorkflow, step: "blocked", message };
+            setAdminWorkflow(blocked); setAdminResult({ type: "workflow", workflow: blocked });
+          }
+          await onRefresh();
+          return;
+        }
+        throw new Error(code);
+      }
       const result = data.result ?? {};
       setConfirmActionOpen(false);
       setPendingAdminActionId(null);
       setPendingAdminAction(null);
+      setConfirmationCard((current) => current ? { ...current, status: "EXECUTED", error: undefined } : current);
+      updatePipelineStage("confirm", { status: "normal", detail: "已执行" });
       setAdminReply(`已执行：${String(result.title ?? pendingAdminAction.title)}。业务系统已更新，操作已写入审计。`);
+      if (adminWorkflow?.kind === "room_change") {
+        const completed: AdminWorkflow = { ...adminWorkflow, step: "completed", message: "换房已完成，PMS 状态和审计记录已更新。" };
+        setAdminWorkflow(completed); setAdminResult({ type: "workflow", workflow: completed });
+      }
       await onRefresh();
     } catch (error) {
       setAdminReply(error instanceof Error ? error.message : "执行失败，请转人工核对");
+      updatePipelineStage("confirm", { status: "failed", detail: error instanceof Error ? error.message : "执行失败" });
       setConfirmActionOpen(false);
     } finally { setAdminActionBusy(false); }
   }
@@ -1520,9 +1630,21 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       setConfirmActionOpen(false);
       setPendingAdminActionId(null);
       setPendingAdminAction(null);
+      setConfirmationCard((current) => current ? { ...current, status: "CANCELLED", error: undefined } : current);
+      updatePipelineStage("confirm", { status: "cancelled", detail: "已取消" });
       setAdminReply("已取消待确认动作，没有修改 PMS、金额、公安或房卡设备。 ");
+      if (adminWorkflow?.kind === "room_change") {
+        const cancelled: AdminWorkflow = { ...adminWorkflow, step: "blocked", message: "已取消换房，业务数据未修改。" };
+        setAdminWorkflow(cancelled); setAdminResult({ type: "workflow", workflow: cancelled });
+      }
     } catch (error) {
-      setAdminReply(error instanceof Error ? error.message : "取消失败，请转人工核对");
+      const message = error instanceof Error ? error.message : "admin_action_failed";
+      if (message === "admin_action_expired") {
+        setConfirmationCard((current) => current ? { ...current, status: "EXPIRED", error: "确认单已过期，请重新生成后再执行。" } : current);
+        setPendingAdminActionId(null);
+        setPendingAdminAction(null);
+      }
+      setAdminReply(message === "admin_action_expired" ? "确认单已过期，请重新生成。" : "取消失败，请转人工核对");
       setConfirmActionOpen(false);
     } finally { setAdminActionBusy(false); }
   }
@@ -1540,44 +1662,167 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       window.clearTimeout(timeout);
     }
   }
+  async function fetchAdminStreamStep(text: string): Promise<{ response?: AdminResponse; error?: string }> {
+    const controller = new AbortController();
+    const started = performance.now();
+    let firstTokenAt = 0;
+    const timeout = window.setTimeout(() => controller.abort(), 20000);
+    try {
+      const response = await fetch("/api/admin/agent/turn", { method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" }, body: JSON.stringify({ messages: [{ role: "user", content: text }], pending_action_id: pendingAdminActionId ?? undefined }), signal: controller.signal });
+      if (!response.ok || !response.body) throw new Error("管理员流式通道不可用，请重试");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let eventName = "";
+      let streamedText = "";
+      let result: { response?: AdminResponse; error?: string } | null = null;
+      const consume = (block: string) => {
+        let data = "";
+        for (const line of block.split("\n")) { if (line.startsWith("event:")) eventName = line.slice(6).trim(); if (line.startsWith("data:")) data += line.slice(5).trim(); }
+        if (!data) return;
+        try {
+          const payload = JSON.parse(data) as { status?: string; text?: string; stage?: string; latency_ms?: number; response?: AdminResponse; error?: string };
+          if (eventName === "status" && payload.status) {
+            const stage = payload.stage;
+            setAdminReply(payload.status);
+            updatePipelineStage("model", { status: stage === "awaiting_confirmation" || stage === "responding" ? "normal" : "connecting", detail: payload.status });
+          }
+          if (eventName === "text_delta" && payload.text) { if (!firstTokenAt) { firstTokenAt = performance.now(); updatePipelineStage("model", { detail: `模型首字 ${Math.round(firstTokenAt - started)}ms` }); } streamedText += payload.text; setAdminReply(streamedText); }
+          if (eventName === "done") { result = payload; updatePipelineStage("model", { status: "normal", detail: `模型 ${payload.latency_ms ?? Math.round(performance.now() - started)}ms`, latencyMs: payload.latency_ms ?? Math.round(performance.now() - started) }); }
+          if (eventName === "error") { result = { error: payload.error ?? "管理员模型流式失败" }; updatePipelineStage("model", { status: "failed", detail: result.error }); }
+        } catch { /* wait for the next complete SSE frame */ }
+      };
+      while (true) { const part = await reader.read(); if (part.done) break; buffer += decoder.decode(part.value, { stream: true }); const blocks = buffer.split("\n\n"); buffer = blocks.pop() ?? ""; blocks.forEach(consume); }
+      if (buffer.trim()) consume(buffer);
+      const totalMs = Math.round(performance.now() - started);
+      if (!streamedText) setAdminReply(`模型规划完成 · ${totalMs}ms${firstTokenAt ? ` · 首字 ${Math.round(firstTokenAt - started)}ms` : ""}`);
+      const completed = result as { response?: AdminResponse; error?: string } | null;
+      if (!completed?.response) throw new Error(completed?.error ?? "管理员意图识别失败");
+      return completed;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        updatePipelineStage("model", { status: "timeout", detail: "模型理解超时" });
+        throw new Error("AI 理解请求超时，本次没有执行任何操作，请重试");
+      }
+      updatePipelineStage("model", { status: "failed", detail: error instanceof Error ? error.message : "模型理解失败" });
+      throw error;
+    }
+    finally { window.clearTimeout(timeout); }
+  }
+  function setPendingActionFromResult(toolResult: Record<string, unknown>) {
+    const actionId = String(toolResult.action_id ?? "");
+    setPendingAdminActionId(actionId || null);
+    const guest = toolResult.guest as Record<string, unknown> | undefined;
+    const fields = (toolResult.fields as Array<{ label: string; value: string }> | undefined) ?? [];
+    const impacts = (toolResult.impacts as string[] | undefined) ?? [];
+    const action: PendingAdminAction = { actionId, orderId: toolResult.order_id ? String(toolResult.order_id) : undefined, actionType: String(toolResult.action_type ?? "admin_action"), title: String(toolResult.title ?? "确认执行该操作吗？"), riskLevel: String(toolResult.risk_level ?? "medium"), requiredPermission: String(toolResult.required_permission ?? "admin"), phone: String(guest?.phone ?? "***未知"), orderCode: String(toolResult.order_code ?? ""), fields, impacts, confirmLabel: String(toolResult.confirm_label ?? "确认执行"), cancelLabel: String(toolResult.cancel_label ?? "取消"), reason: String(toolResult.reason ?? "管理员指令"), expiresAt: String(toolResult.expires_at ?? ""), fromRoom: toolResult.from_room ? String(toolResult.from_room) : undefined, toRoom: toolResult.to_room ? String(toolResult.to_room) : undefined, amountType: toolResult.amount_type ? String(toolResult.amount_type) : undefined, newAmount: toolResult.new_amount === undefined ? undefined : Number(toolResult.new_amount) };
+    setPendingActionDirty(false);
+    setPendingAdminAction(action);
+    setConfirmationCard({ action, status: "AWAITING_CONFIRMATION" });
+    updatePipelineStage("confirm", { status: "normal", detail: "待确认" });
+    return actionId;
+  }
+  async function loadAuditDetails(actionId: string) {
+    setAuditDetailsBusy(true);
+    try {
+      const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.get_audit_records", arguments: { action_id: actionId, limit: 100 } }) });
+      const data = await response.json() as { ok?: boolean; result?: { events?: AdminAuditRecord[] }; error?: string };
+      if (!response.ok || !data.ok) throw new Error(data.error ?? "审计详情读取失败");
+      setAuditDetails(data.result?.events ?? []);
+    } catch (error) {
+      setAdminReply(error instanceof Error ? error.message : "审计详情读取失败");
+    } finally { setAuditDetailsBusy(false); }
+  }
+  function retryConfirmation(action: PendingAdminAction) {
+    const last4 = action.phone.replace(/\D/g, "").slice(-4);
+    if (action.actionType === "room_change" && last4 && action.toRoom) void submitAdminCommand(`把尾号${last4}换到${action.toRoom}`);
+    else setAdminReply("请重新说出完整的管理员指令，系统会重新核对业务状态。");
+  }
+  async function continueRoomChangeWorkflow(order: Record<string, unknown>, targetRoom: string) {
+    const orderId = String(order.id ?? order.order_code ?? "");
+    setAdminWorkflow({ kind: "room_change", step: "room_check", targetRoom, candidates: [order], selectedOrder: order, room: null, message: `正在核对目标房间 ${targetRoom}…` });
+    setAdminResult({ type: "workflow", workflow: { kind: "room_change", step: "room_check", targetRoom, candidates: [order], selectedOrder: order, room: null, message: `正在核对目标房间 ${targetRoom}…` } });
+    setAdminReply(`已选择订单 ${String(order.order_code ?? "")}，正在重新核对房间 ${targetRoom}…`);
+    try {
+      const roomResponse = await fetchAdminStep("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.get_room_status", arguments: { room_number: targetRoom } }) }, "正在核对目标房态", "房态查询超时，未生成换房确认单");
+      const roomData = await roomResponse.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
+      if (!roomResponse.ok || !roomData.ok || !roomData.result) throw new Error(roomData.error ?? "房态核验失败");
+      const roomResult = roomData.result;
+      const room = { roomNumber: String(roomResult.room_number ?? targetRoom), status: String(roomResult.status ?? "unknown"), version: roomResult.version === null || roomResult.version === undefined ? null : Number(roomResult.version), guest: roomResult.guest as Record<string, unknown> | null | undefined };
+      if (room.status !== "vacant-clean") {
+        const blocked: AdminWorkflow = { kind: "room_change", step: "blocked", targetRoom, candidates: [order], selectedOrder: order, room, message: `目标房间 ${targetRoom} 当前不可用，已停止换房。` };
+        setAdminWorkflow(blocked); setAdminResult({ type: "workflow", workflow: blocked }); setAdminReply(blocked.message); return;
+      }
+      setAdminWorkflow({ kind: "room_change", step: "confirmation", targetRoom, candidates: [order], selectedOrder: order, room, message: "房态核验通过，正在生成换房确认单…" });
+      const prepareResponse = await fetchAdminStep("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.prepare_room_change", arguments: { order_id: orderId, to_room: targetRoom, reason: "管理员确认订单后发起换房" } }) }, "正在生成换房确认单", "换房确认单生成超时，未修改任何数据");
+      const prepareData = await prepareResponse.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
+      if (!prepareResponse.ok || !prepareData.ok || !prepareData.result) throw new Error(prepareData.error ?? "换房确认单生成失败");
+      const actionId = setPendingActionFromResult(prepareData.result);
+      const confirmation: AdminWorkflow = { kind: "room_change", step: "confirmation", targetRoom, candidates: [order], selectedOrder: order, room, message: "确认单已生成，请核对后点击确认修改。" };
+      setAdminWorkflow(confirmation); setAdminResult({ type: "workflow", workflow: confirmation });
+      setAdminReply(`换房确认单已生成${actionId ? "，请核对后点击“确认修改”" : "，但未返回确认单编号，请重新查询"}。`);
+    } catch (error) {
+      const failed: AdminWorkflow = { kind: "room_change", step: "blocked", targetRoom, candidates: [order], selectedOrder: order, room: null, message: error instanceof Error ? error.message : "换房流程失败" };
+      setAdminWorkflow(failed); setAdminResult({ type: "workflow", workflow: failed }); setAdminReply(failed.message);
+    }
+  }
+  async function selectRoomChangeOrder(order: Record<string, unknown>) {
+    if (!adminWorkflow || adminWorkflow.kind !== "room_change" || adminBusy) return;
+    setAdminBusy(true);
+    try { await continueRoomChangeWorkflow(order, adminWorkflow.targetRoom); } finally { setAdminBusy(false); }
+  }
   async function submitAdminCommand(command = adminUtterance, options: { fromVoiceFinal?: boolean } = {}) {
+    if (command.startsWith("__select:")) {
+      const key = command.slice("__select:".length);
+      const order = adminWorkflow?.candidates.find((candidate) => String(candidate.id ?? candidate.order_code) === key);
+      if (order) await selectRoomChangeOrder(order);
+      return;
+    }
+    if (command === "__open_confirmation") { if (pendingAdminAction) setConfirmActionOpen(true); return; }
     const text = command.trim();
     if (adminVoiceListening && !options.fromVoiceFinal) {
-      setAdminReply("正在结束管理员录音并整理文字，识别完成后会自动发送。");
+      setAdminReply("正在结束管理员录音并整理文字；识别结果会先回填输入框，请检查后再点击发送。");
       setAdminVoiceSubmitSignal((value) => value + 1);
       return;
     }
     if (!text || adminBusy) return;
     setAdminBusy(true);
     setAdminResult(null);
+    setAdminWorkflow(null);
     setAdminReply("正在理解管理员意图…");
+    resetCommandPipeline();
+    updatePipelineStage("model", { status: "connecting", detail: "正在理解管理员意图", latencyMs: undefined });
     try {
-      const routed = await fetchAdminStep("/api/admin/agent/turn", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: text }], pending_action_id: pendingAdminActionId ?? undefined }) }, "正在理解管理员意图", "AI 理解请求超时，本次没有执行任何操作，请重试");
-      const routedData = await routed.json() as { response?: AdminResponse; error?: string };
-      if (!routed.ok || !routedData.response) throw new Error(routedData.error ?? "管理员意图识别失败");
+      const routedData = await fetchAdminStreamStep(text);
+      if (!routedData.response) throw new Error(routedData.error ?? "管理员意图识别失败");
       const result = routedData.response;
       if (result.type !== "tool_call") { setAdminReply(result.message); return; }
       setAdminReply(`已理解为“${result.tool_name}”，正在校验权限和业务状态…`);
+      const toolStartedAt = performance.now();
+      updatePipelineStage("tool", { status: "connecting", detail: "正在校验权限和业务状态", latencyMs: undefined });
       const executed = await fetchAdminStep("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: result.tool_name, arguments: result.arguments }) }, "正在校验权限和业务状态", "工具执行等待超时，结果未确认，请查看审计记录后再处理；系统不会自动重试");
       const executedData = await executed.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
       if (!executed.ok || !executedData.ok) throw new Error(executedData.error ?? "管理员工具执行失败");
+      const toolLatencyMs = Math.round(performance.now() - toolStartedAt);
+      updatePipelineStage("tool", { status: "normal", detail: `工具 ${toolLatencyMs}ms`, latencyMs: toolLatencyMs });
       const toolResult = executedData.result ?? {};
       if (result.tool_name === "admin.search_guest") {
         const orders = (toolResult.orders as Array<Record<string, unknown>> | undefined) ?? [];
         setAdminResult({ type: "orders", orders });
-        setAdminReply(orders.length ? `已找到 ${orders.length} 笔相关订单，请在下方核对。` : "没有找到符合条件的客人或订单。");
+        if (result.workflow?.kind === "room_change") {
+          const workflow: AdminWorkflow = { kind: "room_change", step: orders.length === 0 ? "blocked" : orders.length === 1 ? "room_check" : "guest_selection", targetRoom: result.workflow.target_room, candidates: orders, selectedOrder: null, room: null, message: orders.length === 1 ? "已找到唯一订单，正在核对目标房态…" : orders.length > 1 ? "找到多笔订单，请选择要换房的客人。" : "没有找到可换房订单。" };
+          setAdminWorkflow(workflow); setAdminResult({ type: "workflow", workflow });
+          setAdminReply(workflow.message);
+          if (orders.length === 1) await continueRoomChangeWorkflow(orders[0], result.workflow.target_room);
+        } else setAdminReply(orders.length ? `已找到 ${orders.length} 笔相关订单，请在下方核对。` : "没有找到符合条件的客人或订单。");
       } else if (result.tool_name === "admin.get_room_status") {
         const roomNumber = String(toolResult.room_number ?? "");
         const roomStatus = String(toolResult.status ?? "unknown");
-        setAdminResult({ type: "room", roomNumber, status: roomStatus });
+        setAdminResult({ type: "room", roomNumber, status: roomStatus, version: toolResult.version === null || toolResult.version === undefined ? null : Number(toolResult.version) });
         setAdminReply(roomStatus === "occupied" ? `房间 ${roomNumber} 当前有人入住，已隐藏完整客人信息。` : `房间 ${roomNumber} 当前空闲，可继续核对。`);
       } else if (result.tool_name.startsWith("admin.prepare_")) {
-        const actionId = String(toolResult.action_id ?? "");
-        setPendingAdminActionId(actionId || null);
-        const guest = toolResult.guest as Record<string, unknown> | undefined;
-        const fields = (toolResult.fields as Array<{ label: string; value: string }> | undefined) ?? [];
-        const impacts = (toolResult.impacts as string[] | undefined) ?? [];
-        setPendingAdminAction({ actionId, actionType: String(toolResult.action_type ?? "admin_action"), title: String(toolResult.title ?? "确认执行该操作吗？"), riskLevel: String(toolResult.risk_level ?? "medium"), requiredPermission: String(toolResult.required_permission ?? "admin"), phone: String(guest?.phone ?? "***未知"), orderCode: String(toolResult.order_code ?? ""), fields, impacts, confirmLabel: String(toolResult.confirm_label ?? "确认执行"), cancelLabel: String(toolResult.cancel_label ?? "取消"), reason: String(toolResult.reason ?? "管理员指令"), expiresAt: String(toolResult.expires_at ?? "") });
+        setPendingActionFromResult(toolResult);
+        if (String(toolResult.action_type ?? "") === "room_change") setAdminWorkflow({ kind: "room_change", step: "confirmation", targetRoom: String(toolResult.to_room ?? ""), candidates: [], selectedOrder: null, room: null, message: "换房确认单已生成，请核对后点击确认修改。" });
         setAdminReply(`${String(toolResult.title ?? "动作确认单")}已生成。请核对无误后说“确认执行”，系统会弹出确认窗口；点击确认前不会修改 PMS、金额、公安或房卡设备。`);
       } else if (result.tool_name === "admin.confirm_pending_action" || result.tool_name === "admin.confirm_room_change") {
         if (!pendingAdminAction) throw new Error("确认单已失效，请重新准备操作");
@@ -1601,8 +1846,8 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     setFaultMessage("已恢复正常仿真");
     await loadFaults();
   }
-  return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台 · {adminUser.display_name}（{adminUser.role}）</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button>{adminUser.permissions.includes("admin:manage_faults") && <button onClick={() => setConfirmReset(true)} className="rounded-lg bg-[#fff1ed] px-3 py-2 text-sm text-[#b63d13]">重置演示数据</button>}<button onClick={() => void logout()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">退出登录</button></div></div></header>
-    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 动作确认 → PMS / 设备 / 公安执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；AI 先生成待确认动作，改库、改金额、发卡、公安提交都必须弹窗核对后才执行。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821的总金额改成680")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备改金额</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366重新发房卡")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备发卡</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366提交广州公安登记")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备公安登记</button>{pendingAdminActionId && pendingAdminAction && <button type="button" onClick={() => setConfirmActionOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行：{pendingAdminAction.title}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：把尾号4821换到1306，或把尾号4821的总金额改成680" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} onListeningChange={setAdminVoiceListening} submitSignal={adminVoiceSubmitSignal} onSubmitText={(text) => void submitAdminCommand(text, { fromVoiceFinal: true })} /><button type="submit" disabled={adminBusy || (!adminUtterance.trim() && !adminVoiceListening)} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : adminVoiceListening ? "结束并发送" : "发送"}</button></form><AdminResultPanel result={adminResult} status={adminReply} suggestionRoom={suggestionRoom} onSuggestionRoomChange={setSuggestionRoom} onPrepareSuggestion={(command) => void submitAdminCommand(command)} /></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
+  return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台 · {adminUser.display_name}（{adminUser.role}）</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button><button onClick={() => void logout()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">退出登录</button></div></div></header>
+    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 动作确认 → PMS / 设备 / 公安执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；AI 先生成待确认动作，改库、改金额、发卡、公安提交都必须弹窗核对后才执行。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821的总金额改成680")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备改金额</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366重新发房卡")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备发卡</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366提交广州公安登记")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备公安登记</button>{pendingAdminActionId && pendingAdminAction && <button type="button" onClick={() => setConfirmActionOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行：{pendingAdminAction.title}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：把尾号4821换到1306，或把尾号4821的总金额改成680" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} onListeningChange={setAdminVoiceListening} submitSignal={adminVoiceSubmitSignal} retrySignal={adminVoiceRetrySignal} onPipelineStage={(stage, status, detail, latencyMs) => updatePipelineStage(stage, { status, detail, latencyMs })} />{adminVoiceListening && <button type="button" onClick={() => setAdminVoiceSubmitSignal((value) => value + 1)} className="rounded-xl border border-[#cbd9e5] bg-white px-4 py-3 text-sm text-[#102a43]">结束录音</button>}<button type="submit" disabled={adminBusy || !adminUtterance.trim()} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : "发送"}</button><button type="button" onClick={() => { setAdminUtterance(""); setAdminVoiceRetrySignal((value) => value + 1); }} disabled={adminBusy || adminVoiceListening} className="rounded-xl border border-[#cbd9e5] bg-white px-4 py-3 text-sm text-[#102a43]">重试</button></form><AdminPipeline stages={pipeline} /><AdminResultPanel result={adminResult} status={adminReply} suggestionRoom={suggestionRoom} onSuggestionRoomChange={setSuggestionRoom} onPrepareSuggestion={(command) => void submitAdminCommand(command)} /></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#3b78a8]">AI Native</p><h2 className="mt-1 font-semibold">意图识别与动作对齐审计</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">只保留脱敏表达</span></div><div className="divide-y divide-[#edf2f7]">{intentEvents.length ? intentEvents.slice(0, 8).map((event) => <div key={event.id} className="grid gap-2 px-5 py-4 md:grid-cols-[1fr_auto]"><div><p className="text-sm leading-6 text-[#334e68]">{event.detail}</p><p className="mt-1 text-xs text-[#9fb3c8]">顾客表达 → 意图 → 置信度 → 受控业务动作</p></div><span className="font-mono text-xs text-[#829ab1]">#{event.id}</span></div>) : <Empty text="与AI说一句话后，这里会显示脱敏的意图识别和动作对齐记录" />}</div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>
       <section className="mt-7"><p className="text-sm text-[#627d98]">系统运行</p><h2 className="mt-1 text-xl font-semibold">实时业务数据</h2><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div></section>
@@ -1610,6 +1855,8 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       <div className="mt-7 grid gap-7 lg:grid-cols-[1fr_.85fr]"><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">办理任务</p><h2 className="mt-1 font-semibold">数据库状态机</h2></div><div className="divide-y divide-[#edf2f7]">{snapshot.cases.length ? snapshot.cases.map((item) => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="font-mono text-xs text-[#627d98]">{item.id.slice(0, 12)}… · v{item.version}</p><p className="mt-1 text-sm">房间 {item.room_number ?? "未锁定"} · 硬件 {item.hardware_status}</p></div><StatusPill value={item.status} /></div>) : <Empty text="尚无办理任务" />}</div></section>
         <section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">不可篡改式演示记录</p><h2 className="mt-1 font-semibold">最近审计事件</h2></div><div className="max-h-[430px] divide-y divide-[#edf2f7] overflow-y-auto">{snapshot.auditEvents.length ? snapshot.auditEvents.map((event) => <div key={event.id} className="px-5 py-4"><div className="flex justify-between gap-3"><p className="text-sm font-medium">{event.event_type}</p><span className="font-mono text-[10px] text-[#829ab1]">#{event.id}</span></div><p className="mt-1 text-xs leading-5 text-[#627d98]">{event.detail}</p><p className="mt-1 text-[10px] text-[#9fb3c8]">{new Date(event.created_at).toLocaleString("zh-CN")}</p></div>) : <Empty text="尚无审计事件" />}</div></section></div>
     </div>
+    {confirmationCard && <AdminConfirmationCardV2 state={confirmationCard} busy={adminActionBusy} onOpen={() => { if (confirmationCard.status === "AWAITING_CONFIRMATION") setConfirmActionOpen(true); }} onCancel={() => { if (pendingAdminAction) void cancelPendingAdminAction(); }} onRetry={() => retryConfirmation(confirmationCard.action)} onAudit={() => void loadAuditDetails(confirmationCard.action.actionId)} onEdit={(action) => { setPendingAdminAction(action); setPendingActionDirty(true); setConfirmationCard((current) => current ? { ...current, action } : current); }} auditBusy={auditDetailsBusy} />}
+    {auditDetails && <AdminAuditDetailPanel events={auditDetails} onClose={() => setAuditDetails(null)} />}
     <AlertDialog open={confirmActionOpen} onOpenChange={(open) => { if (!adminActionBusy) setConfirmActionOpen(open); }}>
       <AlertDialogContent className="border-[#cfe0f2] p-0 text-[#102a43]">
         <AlertDialogHeader className="border-b border-[#e8eef3] bg-[#f7fbff] p-6 text-left">
@@ -1626,13 +1873,14 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   </main>;
 }
 
-function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSignal = 0, onSubmitText }: { adapter: AdapterConfig; onText: (text: string) => void; onListeningChange?: (listening: boolean) => void; submitSignal?: number; onSubmitText?: (text: string) => void }) {
+function AdminVoiceInputControls({ adapter, onText, onListeningChange, onLatency, submitSignal = 0, retrySignal = 0, onPipelineStage }: { adapter: AdapterConfig; onText: (text: string) => void; onListeningChange?: (listening: boolean) => void; onLatency?: (latencyMs: number) => void; submitSignal?: number; retrySignal?: number; onPipelineStage?: (stage: "mic" | "asr", status: PipelineStageStatus, detail?: string, latencyMs?: number) => void }) {
   const [inputs, setInputs] = useState<AudioInputDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState(() => typeof window !== "undefined" ? localStorage.getItem("hotel_admin_audio_input_device") || "" : "");
   const [listening, setListening] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [backend, setBackend] = useState<"local" | "browser" | "unavailable" | "connecting">("connecting");
   const [status, setStatus] = useState("正在检查输入设备…");
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [level, setLevel] = useState(0);
   const recognitionRef = useRef<RecognitionLike | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -1644,6 +1892,8 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
   const resultSeenRef = useRef(false);
   const stopTimerRef = useRef<number | null>(null);
   const latestTextRef = useRef("");
+  const recordingStartedAtRef = useRef(0);
+  const firstResultAtRef = useRef(0);
   const submitAfterStopRef = useRef(false);
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) { setStatus("当前浏览器不支持输入设备枚举"); return; }
@@ -1709,21 +1959,27 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
     setListening(false);
     setStopping(false);
   }
-  function acceptText(text: string) {
+  function acceptText(text: string, final = false) {
     const trimmed = text.trim();
     if (!trimmed) return;
     latestTextRef.current = trimmed;
     onText(trimmed);
+    markFirstResult();
+    // eslint-disable-next-line react-hooks/purity -- 事件回调中计算语音延迟
+    if (final && recordingStartedAtRef.current) { const elapsed = Math.round(Date.now() - recordingStartedAtRef.current); setLatencyMs(elapsed); onLatency?.(elapsed); onPipelineStage?.("asr", "normal", `已识别 ${elapsed}ms`, elapsed); }
+  }
+  function markFirstResult() {
+    if (firstResultAtRef.current || !recordingStartedAtRef.current) return;
+    firstResultAtRef.current = Date.now();
+    const elapsed = Math.round(firstResultAtRef.current - recordingStartedAtRef.current);
+    onPipelineStage?.("asr", "normal", `首字 ${elapsed}ms`, elapsed);
   }
   function maybeSubmitRecognizedText() {
     const text = latestTextRef.current.trim();
     const shouldSubmit = submitAfterStopRef.current;
     submitAfterStopRef.current = false;
-    if (shouldSubmit && text) {
-      setStatus("语音已识别，正在发送给管理员 AI…");
-      onSubmitText?.(text);
-      return true;
-    }
+    // 语音结果只回填输入框，不自动提交；管理员可以先修正尾号、房号和金额。
+    if (shouldSubmit && text) setStatus("语音已识别，请检查文字后点击发送");
     return false;
   }
   function finishRecording(shouldSubmit: boolean) {
@@ -1732,8 +1988,8 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
       if (shouldSubmit) maybeSubmitRecognizedText();
       return;
     }
-    submitAfterStopRef.current = shouldSubmit;
-    setStatus(shouldSubmit ? "正在整理管理员语音，识别完成后自动发送…" : "正在整理管理员语音…");
+    submitAfterStopRef.current = false;
+    setStatus("正在整理管理员语音，完成后请检查文字…");
     if (backend === "browser") {
       setStopping(true);
       recognitionRef.current?.stop?.();
@@ -1750,6 +2006,7 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
     // 的耗时可能超过几秒。不能像旧逻辑一样 4.5 秒就关闭 socket，否则最终结果会被丢弃。
     stopTimerRef.current = window.setTimeout(() => {
       const hadText = latestTextRef.current.trim();
+      if (!hadText) onPipelineStage?.("asr", "timeout", "本地语音识别超时");
       release();
       setStatus(hadText ? "语音已识别，请确认文字后点击发送" : "本地语音识别超时，请重新录音或输入文字");
       if (hadText) maybeSubmitRecognizedText();
@@ -1766,8 +2023,10 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
     // 管理后台也要和用户端一样支持停顿后继续说；真正结束由“结束并发送”触发。
     recognition.continuous = true;
     recognition.onresult = (event) => {
-      const text = Array.from({ length: event.results.length }, (_, index) => event.results[index]?.[0]?.transcript ?? "").join("").trim();
-      if (text) acceptText(text);
+      let text = "";
+      let allFinal = true;
+      for (let index = 0; index < event.results.length; index += 1) { const item = event.results[index]; text += item?.[0]?.transcript ?? ""; if (!item?.isFinal) allFinal = false; }
+      if (text.trim()) acceptText(text, allFinal);
     };
     recognition.onerror = (event) => {
       const errorCode = String(event?.error || "");
@@ -1821,6 +2080,7 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
     }
     streamRef.current = stream;
     monitor(stream);
+    onPipelineStage?.("mic", "normal", "麦克风已就绪");
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(resolveAsrWebSocketUrl(adapter.asrWsUrl));
       socketRef.current = socket;
@@ -1835,16 +2095,16 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
     socket.onmessage = (event) => {
       let payload: AsrSocketMessage;
       try { payload = JSON.parse(String(event.data)) as AsrSocketMessage; } catch { return; }
-      if (payload.type === "ready") setStatus(`本地 Qwen ASR 已就绪${payload.device ? ` · ${payload.device}` : ""}，请说话`);
+      if (payload.type === "ready") { setStatus(`本地 Qwen ASR 已就绪${payload.device ? ` · ${payload.device}` : ""}，请说话`); onPipelineStage?.("asr", "normal", "ASR 已就绪"); }
       if (payload.type === "result" && payload.text?.trim()) {
         resultSeenRef.current = true;
-        acceptText(payload.text.trim());
-        release();
-        if (!maybeSubmitRecognizedText()) setStatus("语音已识别，请确认文字后点击发送");
+        const final = payload.is_final !== false;
+        acceptText(payload.text.trim(), final);
+        if (final) { release(); if (!maybeSubmitRecognizedText()) setStatus("语音已识别，请确认文字后点击发送"); }
       }
-      if (payload.type === "error") { submitAfterStopRef.current = false; setStatus(payload.message || "本地 ASR 返回错误"); release(); }
+      if (payload.type === "error") { submitAfterStopRef.current = false; setStatus(payload.message || "本地 ASR 返回错误"); onPipelineStage?.("asr", "failed", payload.message || "ASR 返回错误"); release(); }
     };
-    socket.onclose = () => { if (!resultSeenRef.current && recorderRef.current) { setStatus("本地 ASR 连接中断，请重试或改用文字"); setListening(false); } };
+    socket.onclose = () => { if (!resultSeenRef.current && recorderRef.current) { setStatus("本地 ASR 连接中断，请重试或改用文字"); onPipelineStage?.("asr", "failed", "ASR 连接中断"); setListening(false); } };
     socket.send(JSON.stringify({ type: "start", language: "Chinese", sample_rate: 16000 }));
     const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"].find((value) => MediaRecorder.isTypeSupported(value)) ?? "";
     const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
@@ -1854,7 +2114,7 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
       const chunk = event.data;
       audioTailRef.current = audioTailRef.current.then(async () => { const buffer = await chunk.arrayBuffer(); if (socket.readyState === WebSocket.OPEN) socket.send(buffer); }).catch(() => undefined);
     };
-    recorder.onerror = () => { setStatus("无法读取所选麦克风，请检查设备"); release(); };
+    recorder.onerror = () => { setStatus("无法读取所选麦克风，请检查设备"); onPipelineStage?.("mic", "failed", "麦克风不可读"); release(); };
     recorder.start(250);
     setBackend("local");
     setListening(true);
@@ -1865,35 +2125,104 @@ function AdminVoiceInputControls({ adapter, onText, onListeningChange, submitSig
       submitAfterStopRef.current = false;
       release();
       setStatus("已取消本次管理员语音输入");
+      onPipelineStage?.("mic", "cancelled", "已取消录音");
+      onPipelineStage?.("asr", "cancelled", "已取消识别");
       return;
     }
     latestTextRef.current = "";
+    recordingStartedAtRef.current = performance.now();
+    firstResultAtRef.current = 0;
+    if (typeof window !== "undefined" && window.speechSynthesis) window.speechSynthesis.cancel();
     submitAfterStopRef.current = false;
     setBackend("connecting");
     setStatus("正在连接所选输入设备和本地 ASR…");
+    onPipelineStage?.("mic", "connecting", "正在请求麦克风");
+    onPipelineStage?.("asr", "connecting", "正在连接本地 ASR");
     void startLocal().catch((error) => { release(); if (error instanceof DOMException && ["NotAllowedError", "PermissionDeniedError"].includes(error.name)) { setBackend("unavailable"); setStatus("麦克风权限被拒绝，请在地址栏允许麦克风"); return; } setStatus("本地 ASR 不可用，已切换浏览器备用识别"); startBrowser(); });
   }
   useEffect(() => { onListeningChange?.(listening); }, [listening, onListeningChange]);
   useEffect(() => {
     if (submitSignal <= 0) return undefined;
-    const timer = window.setTimeout(() => finishRecording(true), 0);
+    const timer = window.setTimeout(() => finishRecording(false), 0);
     return () => window.clearTimeout(timer);
     // finishRecording 使用当前录音资源句柄，不能放入依赖导致录音过程中重复绑定。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [submitSignal]);
+  useEffect(() => {
+    if (retrySignal <= 0) return undefined;
+    const timer = window.setTimeout(() => {
+      latestTextRef.current = "";
+      onText("");
+      if (!listening) toggle();
+    }, 0);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [retrySignal]);
   // release 仅用于组件卸载清理，避免把每次录音状态变化带入订阅依赖。
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => () => release(), []);
   const selectedLabel = inputs.find((device) => device.deviceId === selectedDeviceId)?.label || "系统默认麦克风";
-  return <div className="flex flex-wrap items-center gap-2"><select value={selectedDeviceId} onChange={(event) => { const value = event.target.value; setSelectedDeviceId(value); localStorage.setItem("hotel_admin_audio_input_device", value); setStatus(value ? "已选择管理员输入设备" : "已恢复系统默认麦克风"); }} className="max-w-[190px] rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-3 py-3 text-xs" aria-label="管理员输入设备"><option value="">系统默认麦克风</option>{inputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select><button type="button" onClick={toggle} disabled={stopping} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30] text-white" : "bg-[#eef4f9] text-[#102a43]"}`} aria-label={listening ? "取消管理员语音输入" : "开始管理员语音输入"}>{listening ? <X size={18} /> : <Mic size={18} />}</button><span className="min-w-[180px] text-xs text-[#627d98]">{status} · {selectedLabel}{listening && <span className="ml-2 inline-block h-1.5 w-12 overflow-hidden rounded-full bg-[#e5e5ea] align-middle"><span className="block h-full bg-[#34c759]" style={{ width: `${Math.max(5, Math.round(level * 100))}%` }} /></span>}</span><span className="sr-only">当前语音后端：{backend}</span></div>;
+  return <div className="flex flex-wrap items-center gap-2"><select value={selectedDeviceId} onChange={(event) => { const value = event.target.value; setSelectedDeviceId(value); localStorage.setItem("hotel_admin_audio_input_device", value); setStatus(value ? "已选择管理员输入设备" : "已恢复系统默认麦克风"); }} className="max-w-[190px] rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-3 py-3 text-xs" aria-label="管理员输入设备"><option value="">系统默认麦克风</option>{inputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select><button type="button" onClick={toggle} disabled={stopping} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30] text-white" : "bg-[#eef4f9] text-[#102a43]"}`} aria-label={listening ? "取消管理员语音输入" : "开始管理员语音输入"}>{listening ? <X size={18} /> : <Mic size={18} />}</button><span className="min-w-[180px] text-xs text-[#627d98]">{status} · {selectedLabel}{latencyMs !== null && <span className="ml-1 text-[#1769aa]">· {latencyMs}ms</span>}{listening && <span className="ml-2 inline-block h-1.5 w-12 overflow-hidden rounded-full bg-[#e5e5ea] align-middle"><span className="block h-full bg-[#34c759]" style={{ width: `${Math.max(5, Math.round(level * 100))}%` }} /></span>}</span><span className="sr-only">当前语音后端：{backend}</span></div>;
+}
+
+function AdminPipeline({ stages }: { stages: PipelineStageState[] }) {
+  const dotClass: Record<PipelineStageStatus, string> = {
+    idle: "bg-[#cbd9e5]",
+    connecting: "animate-pulse bg-[#ff9500]",
+    normal: "bg-[#34c759]",
+    timeout: "bg-[#ff3b30]",
+    failed: "bg-[#ff3b30]",
+    cancelled: "bg-[#8e8e93]",
+  };
+  const statusLabel: Record<PipelineStageStatus, string> = { idle: "未开始", connecting: "连接中", normal: "正常", timeout: "超时", failed: "失败", cancelled: "已取消" };
+  return <div className="mt-4 flex flex-wrap items-center gap-2 rounded-2xl border border-[#e8eef3] bg-[#f8fbfd] px-4 py-3">{stages.map((stage, index) => <div key={stage.id} className="flex items-center gap-2">{index > 0 && <span className="text-[#cbd9e5]">→</span>}<span className="inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1.5 text-xs shadow-sm"><span className={`h-2 w-2 rounded-full ${dotClass[stage.status]}`} /><span className="font-medium text-[#334e68]">{stage.label}</span><span className="text-[#627d98]">{stage.detail ?? statusLabel[stage.status]}</span></span></div>)}</div>;
 }
 
 type AdminChartDatum = { name: string; value: number };
 
+function AdminConfirmationCardV2({ state, busy, onOpen, onCancel, onRetry, onAudit, onEdit, auditBusy }: { state: AdminConfirmationCardState; busy: boolean; onOpen: () => void; onCancel: () => void; onRetry: () => void; onAudit: () => void; onEdit: (action: PendingAdminAction) => void; auditBusy: boolean }) {
+  const [now, setNow] = useState(() => Date.now());
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(state.action.fields);
+  const [lastActionId, setLastActionId] = useState(state.action.actionId);
+  const [editError, setEditError] = useState("");
+  if (lastActionId !== state.action.actionId) {
+    setLastActionId(state.action.actionId);
+    setDraft(state.action.fields);
+    setEditError("");
+  }
+  useEffect(() => { if (state.status !== "AWAITING_CONFIRMATION") return undefined; const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, [state.status]);
+  const expiresAt = state.action.expiresAt ? new Date(state.action.expiresAt).getTime() : 0;
+  const remaining = expiresAt ? Math.max(0, expiresAt - now) : null;
+  const locallyExpired = state.status === "AWAITING_CONFIRMATION" && remaining !== null && remaining <= 0;
+  const status = locallyExpired ? "EXPIRED" : state.status;
+  const labels: Record<AdminConfirmationStatus, string> = { AWAITING_CONFIRMATION: "待确认", EXECUTED: "已执行", CANCELLED: "已取消", EXPIRED: "已过期", CONFLICTED: "房态冲突" };
+  const statusClass = status === "EXECUTED" ? "bg-[#effaf4] text-[#248a4d]" : status === "AWAITING_CONFIRMATION" ? "bg-[#eaf4ff] text-[#1769aa]" : "bg-[#fff1ed] text-[#b63d13]";
+  function saveEdits() {
+    const targetField = draft.find((field) => field.label === "目标房间" || (state.action.actionType !== "room_change" && field.label === "房间"));
+    if (targetField && !isRoomNumber(targetField.value)) { setEditError("房号必须是3到5位数字"); return; }
+    const amountField = draft.find((field) => field.label.includes("金额") || field.label.includes("房费") || field.label.includes("押金"));
+    const amount = amountField ? parseAmount(amountField.value) : null;
+    if (amountField && (amount === null || !Number.isInteger(amount) || amount < 0 || amount > 99999)) { setEditError("金额必须是0到99999之间的整数"); return; }
+    setEditError("");
+    const target = targetField?.value.trim();
+    const next: PendingAdminAction = { ...state.action, fields: draft, toRoom: state.action.actionType === "room_change" && target ? target : state.action.toRoom, newAmount: amountField ? (amount ?? state.action.newAmount) : state.action.newAmount };
+    onEdit(next); setEditing(false);
+  }
+  return <section className="fixed bottom-5 right-5 z-40 w-[min(620px,calc(100vw-2.5rem))] rounded-2xl border border-[#b9d8f4] bg-[#fbfdff] p-4 shadow-xl" aria-label="管理员确认单"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">管理员确认单</p><h3 className="mt-1 text-base font-semibold text-[#102a43]">{state.action.title}</h3></div><span className={`rounded-full px-3 py-1 text-xs ${statusClass}`}>{labels[status]}</span></div><div className="mt-3 grid gap-3 sm:grid-cols-2">{[...[{ label: "客人", value: state.action.phone }, { label: "订单号", value: state.action.orderCode || "已匹配订单" }], ...draft].map((field, index) => <label key={`${field.label}-${index}`} className="text-xs text-[#829ab1]">{field.label}{editing && index >= 2 ? <input value={field.value} onChange={(event) => setDraft((current) => current.map((item, itemIndex) => itemIndex === index - 2 ? { ...item, value: event.target.value } : item))} className="mt-1 w-full rounded-lg border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68] outline-none focus:border-[#007aff]" /> : <span className="mt-1 block font-medium text-[#334e68]">{field.value || "—"}</span>}</label>)}</div>{editError && <p className="mt-2 rounded-lg bg-[#fff1ed] px-3 py-2 text-xs text-[#b63d13]">{editError}</p>}<div className="mt-3 rounded-xl bg-[#f5f8fb] px-3 py-2 text-xs leading-5 text-[#627d98]">{status === "AWAITING_CONFIRMATION" && !locallyExpired ? <>有效期至 {state.action.expiresAt ? new Date(state.action.expiresAt).toLocaleString("zh-CN") : "5分钟内"} · 剩余 {remaining === null ? "—" : `${Math.ceil(remaining / 1000)} 秒`}</> : status === "EXPIRED" ? "确认单已过期，系统不会执行，请重新核对并生成。" : status === "CONFLICTED" ? (state.error ?? "目标房间状态已变化，系统未修改业务数据。") : status === "CANCELLED" ? "已取消确认，业务数据未修改。" : "已执行并写入操作审计。"}</div><div className="mt-3 flex flex-wrap gap-2">{editing ? <><button type="button" onClick={saveEdits} className="rounded-xl bg-[#007aff] px-3 py-2 text-sm font-medium text-white">保存字段</button><button type="button" onClick={() => { setDraft(state.action.fields); setEditing(false); }} className="rounded-xl border border-[#cbd9e5] px-3 py-2 text-sm">取消编辑</button></> : <button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={() => setEditing(true)} className="rounded-xl border border-[#007aff] px-3 py-2 text-sm text-[#1769aa] disabled:opacity-40">编辑字段</button>}<button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={onOpen} className="rounded-xl bg-[#007aff] px-3 py-2 text-sm font-medium text-white disabled:opacity-40">查看并确认</button><button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={onCancel} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68] disabled:opacity-40">取消确认</button>{(status === "EXPIRED" || status === "CONFLICTED") && <button type="button" onClick={onRetry} className="rounded-xl border border-[#007aff] px-3 py-2 text-sm text-[#1769aa]">重新核对并生成</button>}<button type="button" disabled={auditBusy} onClick={onAudit} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68]">{auditBusy ? "读取审计…" : "查看审计详情"}</button></div></section>;
+}
+
+function AdminAuditDetailPanel({ events, onClose }: { events: AdminAuditRecord[]; onClose: () => void }) {
+  return <section className="fixed inset-x-5 bottom-5 z-50 mx-auto max-w-3xl rounded-2xl border border-[#d9e2ec] bg-white p-4 shadow-2xl" aria-label="操作审计详情"><div className="flex items-center justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">操作审计详情</p><h3 className="mt-1 font-semibold text-[#102a43]">确认单完整时间线</h3></div><button type="button" onClick={onClose} className="rounded-lg border border-[#cbd9e5] px-3 py-1.5 text-xs text-[#627d98]">收起</button></div>{events.length ? <div className="mt-3 max-h-[55vh] divide-y divide-[#edf2f7] overflow-y-auto">{events.map((event) => <div key={event.id} className="grid gap-2 py-3 sm:grid-cols-[150px_1fr_auto]"><span className="text-xs text-[#829ab1]">{new Date(event.created_at).toLocaleString("zh-CN")}</span><div><p className="text-sm font-medium text-[#334e68]">{event.event_type}</p><p className="mt-1 text-xs leading-5 text-[#627d98]">{event.detail}</p></div><span className="text-xs text-[#829ab1]">{event.username ?? "系统"}{event.role ? ` · ${event.role}` : ""}</span></div>)}</div> : <p className="mt-4 rounded-xl bg-[#f5f8fb] px-3 py-3 text-sm text-[#627d98]">该确认单暂时没有审计事件。</p>}</section>;
+}
+
 function AdminResultPanel({ result, status, suggestionRoom, onSuggestionRoomChange, onPrepareSuggestion }: { result: AdminResult; status: string; suggestionRoom: string; onSuggestionRoomChange: (value: string) => void; onPrepareSuggestion: (command: string) => void }) {
   const orders = result?.type === "orders" ? result.orders : [];
   const firstPhone = orders[0] ? String(orders[0].phone_last4 ?? String(orders[0].phone ?? "").replace(/\D/g, "").slice(-4)) : "";
-  return <section className="mt-4 overflow-hidden rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf2f7] px-4 py-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">AI 结果</p><p className="mt-1 text-sm text-[#334e68]">{status}</p></div><span className="rounded-full bg-[#f2f7fb] px-3 py-1 text-xs text-[#627d98]">结构化 · 脱敏</span></div>{result?.type === "orders" && <div className="p-4">{orders.length ? <div className="grid gap-3 md:grid-cols-2">{orders.map((order) => { const phone = String(order.phone_masked ?? (order.phone_last4 ? `****${order.phone_last4}` : "***")); return <article key={String(order.id ?? order.order_code)} className="rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold text-[#102a43]">{String(order.source ?? "订单")} · {String(order.order_code ?? "未编号")}</p><p className="mt-1 text-xs text-[#627d98]">客人 {String(order.guest_label ?? "已脱敏")} · 手机号 {phone}</p></div><StatusPill value={String(order.status ?? "未知")} /></div><dl className="mt-4 grid grid-cols-2 gap-3 text-xs"><AdminDataField label="入住日期" value={String(order.stay_date ?? "—")} /><AdminDataField label="房型" value={String(order.room_type ?? "—")} /><AdminDataField label="房间" value={String(order.room_number ?? "未分配")} /><AdminDataField label="晚数/间数" value={`${String(order.nights ?? "—")} 晚 · ${String(order.room_count ?? "—")} 间`} /></dl></article>; })}</div> : <Empty text="没有找到符合条件的客人或订单" />} {firstPhone && <div className="mt-4 rounded-2xl bg-[#f5f8fb] p-4"><div className="flex items-start gap-3"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#eaf4ff] text-[#1769aa]"><Settings2 size={17} /></div><div><p className="text-sm font-medium text-[#334e68]">可执行建议</p><p className="mt-1 text-xs leading-5 text-[#627d98]">建议只生成受控修改草案，确认弹窗通过后才会调用 PMS，不会直接改库。</p></div></div><div className="mt-3 flex flex-wrap items-center gap-2"><input value={suggestionRoom} onChange={(event) => onSuggestionRoomChange(event.target.value.replace(/\D/g, "").slice(0, 4))} inputMode="numeric" placeholder="目标房号" className="w-28 rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm outline-none focus:border-[#007aff]" aria-label="建议目标房号" /><button type="button" disabled={!suggestionRoom.trim()} onClick={() => onPrepareSuggestion(`把尾号${firstPhone}换到${suggestionRoom}`)} className="rounded-xl bg-[#007aff] px-3 py-2 text-xs font-medium text-white disabled:opacity-40">生成换房草案</button><button type="button" onClick={() => onPrepareSuggestion(`把尾号${firstPhone}的总金额改成`)} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-xs text-[#334e68]">生成金额草案</button></div></div>}</div>}{result?.type === "room" && <div className="flex items-center justify-between gap-4 p-5"><div><p className="text-2xl font-semibold tracking-[-.03em] text-[#102a43]">房间 {result.roomNumber}</p><p className="mt-1 text-sm text-[#627d98]">当前状态：{result.status === "occupied" ? "有人入住" : "空闲，可继续核对"}</p></div><span className={`rounded-full px-3 py-1.5 text-xs ${result.status === "occupied" ? "bg-[#fff1ed] text-[#b63d13]" : "bg-[#e8f7ee] text-[#248a4d]"}`}>{result.status === "occupied" ? "已占用" : "可用"}</span></div>}</section>;
+  const workflow = result?.type === "workflow" ? result.workflow : null;
+  const workflowSteps: Array<[AdminWorkflowStep, string]> = [["guest_search", "查找客人"], ["guest_selection", "选择订单"], ["room_check", "核对房态"], ["confirmation", "换房确认"], ["executing", "PMS执行"]];
+  const selected = workflow?.selectedOrder;
+  return <section className="mt-4 overflow-hidden rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf2f7] px-4 py-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">管理员工作流</p><p className="mt-1 text-sm text-[#334e68]">{workflow ? workflow.message : status}</p></div><span className={`rounded-full px-3 py-1 text-xs ${workflow?.step === "blocked" ? "bg-[#fff1ed] text-[#b63d13]" : "bg-[#f2f7fb] text-[#627d98]"}`}>{workflow ? "受控流程 · 脱敏" : "查询结果 · 脱敏"}</span></div>{workflow && <div className="p-4"><div className="grid gap-2 sm:grid-cols-5">{workflowSteps.map(([step, label], index) => { const currentIndex = workflowSteps.findIndex(([value]) => value === workflow.step); const done = workflow.step === "completed" || (currentIndex >= 0 && index < currentIndex); const active = workflow.step === step; return <div key={step} className={`rounded-xl border p-3 ${done ? "border-[#bde7cf] bg-[#effaf4]" : active ? "border-[#b9d8f4] bg-[#eaf4ff]" : "border-[#e8eef3] bg-[#fbfdff]"}`}><div className="flex items-center gap-2"><span className={`grid h-6 w-6 place-items-center rounded-full text-xs ${done ? "bg-[#34c759] text-white" : active ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#829ab1]"}`}>{done ? <Check size={13} /> : index + 1}</span><span className="text-xs font-medium">{label}</span></div></div>; })}</div>{workflow.step === "guest_selection" && <div className="mt-4"><p className="text-sm font-medium">尾号 {String(workflow.candidates[0]?.phone_last4 ?? "")} 对应多笔订单，请选择一笔</p><div className="mt-3 grid gap-3 md:grid-cols-2">{workflow.candidates.map((order) => { const phone = String(order.phone ?? order.phone_masked ?? `***${order.phone_last4 ?? ""}`); const key = String(order.id ?? order.order_code); return <article key={key} className="rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-[#102a43]">{String(order.source ?? "订单")} · {String(order.order_code ?? "未编号")}</p><p className="mt-1 text-xs text-[#627d98]">手机号 {phone} · 房间 {String(order.room_number ?? "未分配")}</p></div><StatusPill value={String(order.status ?? "未知")} /></div><button type="button" onClick={() => onPrepareSuggestion(`__select:${key}`)} className="mt-4 w-full rounded-xl bg-[#007aff] px-3 py-2.5 text-sm font-medium text-white">选择此订单</button></article>; })}</div></div>}{(workflow.step === "room_check" || workflow.step === "confirmation" || workflow.step === "executing" || workflow.step === "completed") && selected && <div className="mt-4 rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="grid gap-3 sm:grid-cols-2"><AdminDataField label="客人" value={String(selected.guest_label ?? "已脱敏")} /><AdminDataField label="手机号" value={String(selected.phone ?? selected.phone_masked ?? `***${selected.phone_last4 ?? ""}`)} /><AdminDataField label="当前房间" value={String(selected.room_number ?? "未分配")} /><AdminDataField label="目标房间" value={workflow.targetRoom} /></div>{workflow.room && <div className="mt-4 flex items-center justify-between rounded-xl bg-[#f5f8fb] px-3 py-2 text-sm"><span>目标房态：{workflow.room.status === "vacant-clean" ? "空闲可用" : "不可用"}</span><StatusPill value={workflow.room.status} /></div>}{workflow.step === "confirmation" && <button type="button" onClick={() => onPrepareSuggestion("__open_confirmation")} className="mt-4 w-full rounded-xl bg-[#007aff] px-4 py-3 text-sm font-medium text-white">查看确认单并确认修改</button>}{workflow.step === "completed" && <p className="mt-4 rounded-xl bg-[#effaf4] px-3 py-2 text-sm text-[#248a4d]">换房已完成，数据库与审计记录已更新。</p>}</div>}{workflow.step === "blocked" && <div className="mt-4 rounded-xl bg-[#fff8f4] px-4 py-3 text-sm text-[#765444]">流程已停止：{workflow.message}</div>}</div>}{result?.type === "orders" && <div className="p-4">{orders.length ? <div className="grid gap-3 md:grid-cols-2">{orders.map((order) => { const phone = String(order.phone_masked ?? (order.phone_last4 ? `****${order.phone_last4}` : "***")); return <article key={String(order.id ?? order.order_code)} className="rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold text-[#102a43]">{String(order.source ?? "订单")} · {String(order.order_code ?? "未编号")}</p><p className="mt-1 text-xs text-[#627d98]">客人 {String(order.guest_label ?? "已脱敏")} · 手机号 {phone}</p></div><StatusPill value={String(order.status ?? "未知")} /></div><dl className="mt-4 grid grid-cols-2 gap-3 text-xs"><AdminDataField label="入住日期" value={String(order.stay_date ?? "—")} /><AdminDataField label="房型" value={String(order.room_type ?? "—")} /><AdminDataField label="房间" value={String(order.room_number ?? "未分配")} /><AdminDataField label="晚数/间数" value={`${String(order.nights ?? "—")} 晚 · ${String(order.room_count ?? "—")} 间`} /></dl></article>; })}</div> : <Empty text="没有找到符合条件的客人或订单" />} {firstPhone && <div className="mt-4 rounded-2xl bg-[#f5f8fb] p-4"><div className="flex items-start gap-3"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#eaf4ff] text-[#1769aa]"><Settings2 size={17} /></div><div><p className="text-sm font-medium text-[#334e68]">可执行建议</p><p className="mt-1 text-xs leading-5 text-[#627d98]">建议只生成受控修改草案，确认弹窗通过后才会调用 PMS，不会直接改库。</p></div></div><div className="mt-3 flex flex-wrap items-center gap-2"><input value={suggestionRoom} onChange={(event) => onSuggestionRoomChange(event.target.value.replace(/\D/g, "").slice(0, 4))} inputMode="numeric" placeholder="目标房号" className="w-28 rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm outline-none focus:border-[#007aff]" aria-label="建议目标房号" /><button type="button" disabled={!suggestionRoom.trim()} onClick={() => onPrepareSuggestion(`把尾号${firstPhone}换到${suggestionRoom}`)} className="rounded-xl bg-[#007aff] px-3 py-2 text-xs font-medium text-white disabled:opacity-40">生成换房草案</button><button type="button" onClick={() => onPrepareSuggestion(`把尾号${firstPhone}的总金额改成`)} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-xs text-[#334e68]">生成金额草案</button></div></div>}</div>}{result?.type === "room" && <div className="flex items-center justify-between gap-4 p-5"><div><p className="text-2xl font-semibold tracking-[-.03em] text-[#102a43]">房间 {result.roomNumber}</p><p className="mt-1 text-sm text-[#627d98]">当前状态：{result.status === "occupied" ? "有人入住" : "空闲，可继续核对"}</p></div><span className={`rounded-full px-3 py-1.5 text-xs ${result.status === "occupied" ? "bg-[#fff1ed] text-[#b63d13]" : "bg-[#e8f7ee] text-[#248a4d]"}`}>{result.status === "occupied" ? "已占用" : "可用"}</span></div>}</section>;
 }
 
 function AdminDataField({ label, value }: { label: string; value: string }) {

@@ -1,5 +1,6 @@
 import { getD1 } from "@/db";
 import { rolePermissions, type AdminPermission, type AdminRole } from "@/lib/admin-tools";
+import { DEFAULT_HOTEL_CODE, DEFAULT_HOTEL_ID, DEFAULT_TENANT_ID, ensureTenantFoundation } from "@/lib/tenant";
 
 export const ADMIN_COOKIE = "hotel_admin_session";
 const SESSION_HOURS = 8;
@@ -8,7 +9,7 @@ const SESSION_IDLE_MINUTES = 30;
 const PBKDF2_ITERATIONS = 100000;
 const DEMO_SEED = "hotel-demo-2026";
 
-export type AdminUser = { id: string; hotel_code: string; username: string; display_name: string; role: AdminRole; permissions: readonly AdminPermission[] };
+export type AdminUser = { id: string; tenant_id: string; hotel_id: string; hotel_code: string; username: string; display_name: string; role: AdminRole; permissions: readonly AdminPermission[] };
 
 function escapeCookie(value: string) { return value.replace(/[\\\"\r\n]/g, ""); }
 
@@ -59,6 +60,9 @@ export async function ensureAdminSchema() {
     db.prepare("CREATE INDEX IF NOT EXISTS admin_audit_created_idx ON admin_audit_events(created_at, id)"),
   ]);
   try { await db.prepare("ALTER TABLE admin_users ADD COLUMN password_salt TEXT").run(); } catch { /* 已存在 */ }
+  try { await db.prepare("ALTER TABLE admin_audit_events ADD COLUMN action_id TEXT").run(); } catch { /* 已存在 */ }
+  await ensureTenantFoundation();
+  await db.prepare("CREATE INDEX IF NOT EXISTS admin_audit_action_idx ON admin_audit_events(hotel_id, action_id, created_at, id)").run();
   const count = await db.prepare("SELECT COUNT(*) AS count FROM admin_users").first<{ count: number }>();
   if (!envBoolean("ADMIN_DEMO_ENABLED", true)) {
     await db.prepare("UPDATE admin_users SET enabled = 0, updated_at = ? WHERE id LIKE 'admin-%-demo'").bind(new Date().toISOString()).run();
@@ -68,23 +72,24 @@ export async function ensureAdminSchema() {
     const password = (typeof process !== "undefined" ? process.env?.ADMIN_DEMO_PASSWORD : undefined)?.trim() || DEMO_SEED;
     const passwordData = await hashPassword(password);
     const users = [
-      ["admin-owner-demo", "GZ-HAOS-001", "owner", "老板/所有者", "owner"],
-      ["admin-manager-demo", "GZ-HAOS-001", "manager", "店长", "manager"],
-      ["admin-frontdesk-demo", "GZ-HAOS-001", "frontdesk", "前台", "frontdesk"],
-      ["admin-housekeeping-demo", "GZ-HAOS-001", "housekeeping", "客房", "housekeeping"],
+      ["admin-owner-demo", DEFAULT_HOTEL_CODE, "owner", "老板/所有者", "owner"],
+      ["admin-manager-demo", DEFAULT_HOTEL_CODE, "manager", "店长", "manager"],
+      ["admin-frontdesk-demo", DEFAULT_HOTEL_CODE, "frontdesk", "前台", "frontdesk"],
+      ["admin-housekeeping-demo", DEFAULT_HOTEL_CODE, "housekeeping", "客房", "housekeeping"],
     ];
-    await db.batch(users.map(([id, hotel, username, display, role]) => db.prepare("INSERT INTO admin_users (id, hotel_code, username, display_name, role, password_hash, password_salt, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, hotel, username, display, role, passwordData.hash, passwordData.salt, envBoolean("ADMIN_DEMO_ENABLED", true) ? 1 : 0, stamp, stamp)));
+    await db.batch(users.map(([id, hotel, username, display, role]) => db.prepare("INSERT INTO admin_users (id, tenant_id, hotel_id, hotel_code, username, display_name, role, password_hash, password_salt, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, DEFAULT_TENANT_ID, DEFAULT_HOTEL_ID, hotel, username, display, role, passwordData.hash, passwordData.salt, envBoolean("ADMIN_DEMO_ENABLED", true) ? 1 : 0, stamp, stamp)));
   }
+  await db.prepare("INSERT OR IGNORE INTO user_hotel_scopes (user_id, hotel_id, scope_role) SELECT id, hotel_id, role FROM admin_users WHERE hotel_id IS NOT NULL").run();
 }
 
-function toUser(row: { id: string; hotel_code: string; username: string; display_name: string; role: string }): AdminUser | null {
+function toUser(row: { id: string; tenant_id?: string | null; hotel_id?: string | null; hotel_code: string; username: string; display_name: string; role: string }): AdminUser | null {
   if (!(row.role in rolePermissions)) return null;
   const role = row.role as AdminRole;
-  return { id: row.id, hotel_code: row.hotel_code, username: row.username, display_name: row.display_name, role, permissions: rolePermissions[role] };
+  return { id: row.id, tenant_id: row.tenant_id ?? DEFAULT_TENANT_ID, hotel_id: row.hotel_id ?? DEFAULT_HOTEL_ID, hotel_code: row.hotel_code, username: row.username, display_name: row.display_name, role, permissions: rolePermissions[role] };
 }
 
 export async function authenticateAdmin(username: string, password: string) {
-  const row = await getD1().prepare("SELECT id, hotel_code, username, display_name, role, password_hash, password_salt FROM admin_users WHERE username = ? AND enabled = 1 LIMIT 1").bind(username.trim()).first<{ id: string; hotel_code: string; username: string; display_name: string; role: string; password_hash: string; password_salt: string | null }>();
+  const row = await getD1().prepare("SELECT id, tenant_id, hotel_id, hotel_code, username, display_name, role, password_hash, password_salt FROM admin_users WHERE username = ? AND enabled = 1 LIMIT 1").bind(username.trim()).first<{ id: string; tenant_id: string | null; hotel_id: string | null; hotel_code: string; username: string; display_name: string; role: string; password_hash: string; password_salt: string | null }>();
   if (!row || !(await verifyPassword(password, row.password_hash, row.password_salt))) return null;
   if (!row.password_hash.startsWith("pbkdf2$") || !row.password_salt) {
     const upgraded = await hashPassword(password);
@@ -112,7 +117,7 @@ export async function getAdminFromRequest(request: Request) {
   if (!token) return null;
   const now = new Date();
   const idleCutoff = new Date(now.getTime() - SESSION_IDLE_MINUTES * 60 * 1000).toISOString();
-  const row = await getD1().prepare("SELECT u.id, u.hotel_code, u.username, u.display_name, u.role, s.id AS session_id FROM admin_sessions s JOIN admin_users u ON u.id = s.user_id WHERE s.session_token_hash = ? AND s.revoked_at IS NULL AND u.enabled = 1 AND s.expires_at > ? AND s.last_seen_at > ? LIMIT 1").bind(await hashSecret(token), now.toISOString(), idleCutoff).first<{ id: string; hotel_code: string; username: string; display_name: string; role: string; session_id: string }>();
+  const row = await getD1().prepare("SELECT u.id, u.tenant_id, u.hotel_id, u.hotel_code, u.username, u.display_name, u.role, s.id AS session_id FROM admin_sessions s JOIN admin_users u ON u.id = s.user_id WHERE s.session_token_hash = ? AND s.revoked_at IS NULL AND u.enabled = 1 AND s.expires_at > ? AND s.last_seen_at > ? LIMIT 1").bind(await hashSecret(token), now.toISOString(), idleCutoff).first<{ id: string; tenant_id: string | null; hotel_id: string | null; hotel_code: string; username: string; display_name: string; role: string; session_id: string }>();
   if (!row) return null;
   await getD1().prepare("UPDATE admin_sessions SET last_seen_at = ? WHERE id = ?").bind(new Date().toISOString(), row.session_id).run();
   const user = toUser(row);
@@ -121,8 +126,8 @@ export async function getAdminFromRequest(request: Request) {
 
 export function hasPermission(user: AdminUser, permission: AdminPermission) { return user.permissions.includes(permission); }
 
-export async function auditAdmin(user: AdminUser | null, eventType: string, detail: string) {
-  await getD1().prepare("INSERT INTO admin_audit_events (user_id, username, role, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(user?.id ?? null, user?.username ?? null, user?.role ?? null, eventType, detail.slice(0, 500), new Date().toISOString()).run();
+export async function auditAdmin(user: AdminUser | null, eventType: string, detail: string, options: { actionId?: string } = {}) {
+  await getD1().prepare("INSERT INTO admin_audit_events (user_id, tenant_id, hotel_id, action_id, username, role, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(user?.id ?? null, user?.tenant_id ?? DEFAULT_TENANT_ID, user?.hotel_id ?? DEFAULT_HOTEL_ID, options.actionId ?? null, user?.username ?? null, user?.role ?? null, eventType, detail.slice(0, 500), new Date().toISOString()).run();
 }
 
 export async function adminLoginThrottled() {

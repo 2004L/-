@@ -55,5 +55,5 @@ jobs:
       - name: Run security and lint checks
         run: pnpm security:check
 
-      - name: Run replay, concurrency and invariant checks
-        run: pnpm test:replay && pnpm test:concurrency && pnpm test:invariants
+      - name: Run repository test suite (in-process + real D1 integration)
+        run: pnpm test

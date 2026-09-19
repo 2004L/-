@@ -57,7 +57,7 @@ export async function createManualTask(sessionId: string, caseId: string, comman
   return id;
 }
 
-export function toResponse(record: CommandRecord | undefined) {
+export function toResponse(record: CommandRecord | null | undefined) {
   if (!record) return { ok: false, error: "command_not_found" };
   return { ok: record.status === "SUCCEEDED", command_id: record.id, status: record.status, result: record.result_json ? JSON.parse(record.result_json) : null, error_code: record.error_code, retryable: Boolean(record.retryable), idempotency_key: record.idempotency_key };
 }

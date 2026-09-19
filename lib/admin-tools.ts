@@ -51,7 +51,7 @@ export const adminToolArgumentSchemas: Record<AdminToolName, z.ZodTypeAny> = {
   "admin.confirm_room_change": z.object({ action_id: z.string().min(8).max(100), confirmation: z.literal("CONFIRM") }).strict(),
   "admin.cancel_pending_action": z.object({ action_id: z.string().min(8).max(100), reason: z.string().min(1).max(200) }).strict(),
   "admin.cancel_room_change": z.object({ action_id: z.string().min(8).max(100), reason: z.string().min(1).max(200) }).strict(),
-  "admin.get_audit_records": z.object({ limit: z.number().int().min(1).max(100).default(50) }).strict(),
+  "admin.get_audit_records": z.object({ limit: z.number().int().min(1).max(100).default(50), action_id: z.string().min(8).max(100).optional(), event_type: z.string().min(3).max(100).optional() }).strict(),
 };
 
 export const adminToolPermissions: Record<AdminToolName, AdminPermission> = {
@@ -74,34 +74,99 @@ export const adminTurnSchema = z.object({
   pending_action_id: z.string().min(8).max(100).optional(),
 }).strict();
 
-export type AdminToolCall = { type: "tool_call"; tool_call_id: string; tool_name: AdminToolName; arguments: Record<string, unknown>; response_hint?: string };
+export type AdminWorkflowHint = {
+  kind: "room_change";
+  target_room: string;
+  stage: "guest_search";
+};
+export type AdminToolCall = { type: "tool_call"; tool_call_id: string; tool_name: AdminToolName; arguments: Record<string, unknown>; response_hint?: string; workflow?: AdminWorkflowHint };
 export type AdminAssistantResult = AdminToolCall | { type: "clarification"; message: string; intent: string; confidence: number } | { type: "assistant_message"; message: string };
 
 const spokenDigitMap: Record<string, string> = { 零: "0", 〇: "0", 一: "1", 幺: "1", 二: "2", 两: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9" };
+const spokenNumberCharacters = "零〇一幺二两三四五六七八九十百千万0123456789";
+const spokenNumberToken = `[${spokenNumberCharacters}\\s]+`;
 const normalizeSpokenDigits = (value: string) => [...value].map((character) => spokenDigitMap[character] ?? character).join("");
 const digits = (value: string) => normalizeSpokenDigits(value).replace(/[^0-9]/g, "");
-const findLast4 = (value: string) => { const normalized = normalizeSpokenDigits(value); return normalized.match(/(?:尾号|后四位|后四个数字|手机号)[^0-9]{0,4}([0-9]{4})/)?.[1] ?? (digits(normalized).length === 4 ? digits(normalized) : null); };
-const findRoom = (value: string) => normalizeSpokenDigits(value).match(/(?:房间|房号|换到|改到|搬到|调到|发到|制作到)\s*([0-9]{3,5})/)?.[1] ?? null;
+
+/**
+ * Convert both digit-by-digit speech (四八二一) and Chinese units
+ * (四千八百二十一) without treating unrelated numbers in the sentence as one value.
+ */
+function spokenNumberToDigits(value: string) {
+  const token = value.replace(/\s+/g, "");
+  if (!token) return "";
+  if (/^[0-9]+$/.test(token)) return token;
+  if (![...token].some((character) => "十百千万".includes(character))) return digits(token);
+  let total = 0;
+  let section = 0;
+  let current = 0;
+  let hasNumber = false;
+  for (const character of token) {
+    if (/^[0-9]$/.test(character)) {
+      current = current * 10 + Number(character);
+      hasNumber = true;
+      continue;
+    }
+    const mapped = spokenDigitMap[character];
+    if (mapped !== undefined) {
+      current = current * 10 + Number(mapped);
+      hasNumber = true;
+      continue;
+    }
+    const unit = character === "十" ? 10 : character === "百" ? 100 : character === "千" ? 1000 : character === "万" ? 10000 : 0;
+    if (!unit) continue;
+    hasNumber = true;
+    if (unit === 10000) {
+      section = (section + (current || 0)) * unit;
+      total += section;
+      section = 0;
+    } else {
+      section += (current || 1) * unit;
+    }
+    current = 0;
+  }
+  return hasNumber ? String(total + section + current) : "";
+}
+
+function captureNumber(value: string, labels: string[]) {
+  const label = labels.join("|");
+  const match = value.match(new RegExp(`(?:${label})\\s*(?:是|为|叫|改成|改到|调整为)?\\s*(${spokenNumberToken})`, "u"));
+  return match?.[1] ? spokenNumberToDigits(match[1]) : "";
+}
+
+const findLast4 = (value: string) => {
+  const captured = captureNumber(value, ["尾号", "后四位", "后四个数字", "手机号"]);
+  if (captured && captured.length <= 4) return captured.padStart(4, "0");
+  const onlyDigits = digits(value);
+  return onlyDigits.length === 4 ? onlyDigits : null;
+};
+
+const findRoom = (value: string) => {
+  const captured = captureNumber(value, ["房间", "房号", "换到", "改到", "搬到", "调到", "发到", "制作到"]);
+  return captured && /^\d{3,5}$/.test(captured) ? captured : null;
+};
+
 const findAmount = (value: string) => {
-  const match = normalizeSpokenDigits(value).match(/(?:金额|房费|押金|总价|总金额|改成|改到|调整为)\D*([0-9]{1,5})/);
-  return match ? Number(match[1]) : null;
+  const captured = captureNumber(value, ["金额", "房费", "押金", "总价", "总金额", "改成", "改到", "调整为"]);
+  if (!captured || !/^\d{1,5}$/.test(captured)) return null;
+  return Number(captured);
 };
 
 export function routeAdminIntent(text: string, context?: { pending_action_id?: string }): AdminAssistantResult {
   const normalized = normalizeSpokenDigits(text.trim().replace(/\s+/g, " "));
   const phoneLast4 = findLast4(normalized);
-  if (/(确认|确定|执行|没问题|可以)/.test(normalized) && context?.pending_action_id) {
-    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "admin.confirm_pending_action", arguments: { action_id: context.pending_action_id, confirmation: "CONFIRM" }, response_hint: "将重新核对权限和业务状态后执行，并写入管理员审计。" };
-  }
   if (/(取消|不要|算了|不换)/.test(normalized) && context?.pending_action_id) {
     return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "admin.cancel_pending_action", arguments: { action_id: context.pending_action_id, reason: "管理员取消" }, response_hint: "将取消待确认动作，不修改 PMS。" };
+  }
+  if (/(确认|确定|执行|没问题|可以)/.test(normalized) && context?.pending_action_id) {
+    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "admin.confirm_pending_action", arguments: { action_id: context.pending_action_id, confirmation: "CONFIRM" }, response_hint: "将重新核对权限和业务状态后执行，并写入管理员审计。" };
   }
   if (/(换房|换到|改到|搬到|调到)/.test(normalized)) {
     const targetRoom = findRoom(normalized);
     if (!phoneLast4 && !/(订单|客人|住客)/.test(normalized)) return { type: "clarification", message: "请说客人手机号后四位和目标房号，例如：把尾号4821换到1306。", intent: "room_change", confidence: 0.92 };
     if (!phoneLast4) return { type: "clarification", message: "请先说客人手机号后四位，我不能猜是哪位客人。", intent: "room_change", confidence: 0.96 };
     if (!targetRoom) return { type: "clarification", message: "请告诉我目标房号，例如 1306。", intent: "room_change", confidence: 0.96 };
-    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "admin.prepare_room_change", arguments: { phone_last4: phoneLast4, to_room: targetRoom, reason: "管理员语音换房请求" }, response_hint: "只生成换房确认单，不会立即修改 PMS。" } as AdminToolCall;
+    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "admin.search_guest", arguments: { phone_last4: phoneLast4 }, response_hint: "先展示候选订单并核对当前房间，再检查目标房态和生成换房确认单。", workflow: { kind: "room_change", target_room: targetRoom, stage: "guest_search" } } as AdminToolCall;
   }
   if (/(改金额|修改金额|调整金额|金额改|房费改|押金改|总价改|补收|减免)/.test(normalized)) {
     const amount = findAmount(normalized);
@@ -128,4 +193,14 @@ export function routeAdminIntent(text: string, context?: { pending_action_id?: s
     return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "admin.search_guest", arguments: { phone_last4: phoneLast4 }, response_hint: "只返回脱敏客人和订单信息。" };
   }
   return { type: "clarification", message: "我可以帮您查询客人、查询房态，或准备换房。换房需要先核对信息，再明确说“确认执行”。", intent: "admin_assistance", confidence: 0.78 };
+}
+
+export function isRoomNumber(value: string) {
+  return /^\d{3,5}$/.test(String(value ?? "").trim());
+}
+
+export function parseAmount(value: string) {
+  const matches = String(value ?? "").match(/\d+(?:\.\d+)?/g);
+  if (!matches) return null;
+  return Number(matches[matches.length - 1]);
 }

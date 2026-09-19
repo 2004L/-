@@ -54,3 +54,8 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+
+# python / typescript build artifacts
+__pycache__/
+*.pyc
+*.tsbuildinfo

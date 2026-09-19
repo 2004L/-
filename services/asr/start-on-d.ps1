@@ -1,7 +1,8 @@
 $ErrorActionPreference = "Stop"
 
 $asrRoot = "D:\AI-Hotel-Models"
-$python = Join-Path $asrRoot "asr-venv\Scripts\python.exe"
+$cudaPython = Join-Path $asrRoot "asr-cuda-venv\Scripts\python.exe"
+$python = if (Test-Path -LiteralPath $cudaPython) { $cudaPython } else { Join-Path $asrRoot "asr-venv\Scripts\python.exe" }
 $modelPath = Join-Path $asrRoot "qwen3-asr-0.6b"
 $service = Join-Path $PSScriptRoot "server.py"
 $certRoot = Join-Path $asrRoot "asr-certs"
@@ -10,6 +11,10 @@ $keyPath = Join-Path $certRoot "asr-local-key.pem"
 
 if (-not (Test-Path -LiteralPath $python)) { throw "ASR Python environment not found: $python" }
 if (-not (Test-Path -LiteralPath $modelPath)) { throw "ASR model directory not found: $modelPath" }
+
+# CUDA 版环境来自清华镜像的 PyTorch/NVIDIA 运行库；仅对本次 ASR 进程生效。
+# 保留 CPU 环境作为回退，不把 CUDA DLL 写入系统 PATH。
+$env:PATH = "D:\AI-Hotel-Models\asr-cuda-venv\Library\bin;D:\AI-Hotel-Models\asr-cuda-venv\Lib\site-packages\torch\lib;$env:PATH"
 
 $env:ASR_HOST = "127.0.0.1"
 $env:ASR_PORT = "8765"
