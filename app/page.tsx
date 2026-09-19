@@ -51,6 +51,7 @@ import {
   YAxis,
 } from "recharts";
 import { isRoomNumber, parseAmount } from "@/lib/admin-tools";
+import { TerminalCheckoutPanel, TerminalModeChooser } from "@/components/terminal-checkout";
 
 type AdapterConfig = {
   provider: string;
@@ -122,6 +123,14 @@ type Snapshot = {
 };
 
 type ManualTask = { id: string; case_id: string; command_id: string | null; department: string; reason: string; status: string; created_at: string };
+
+type AiChainView = {
+  workflow: { id: string; intent: string | null; current_step: string | null; status: string; updated_at: string } | null;
+  intents: Array<{ raw_text_redacted: string; intent: string; confidence: number | null; source: string; created_at: string }>;
+  plans: Array<{ plan_json: string; status: string; created_at: string }>;
+  toolCalls: Array<{ tool_name: string; status: string; result_json: string | null; created_at: string; completed_at: string | null }>;
+  policyDecisions: Array<{ action: string; risk_level: string; decision: string; reason: string; created_at: string }>;
+};
 
 type MatchResponse = {
   outcome: "matched" | "ambiguous" | "not_found" | "already_checked_in" | "cancelled";
@@ -625,6 +634,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [last4, setLast4] = useState("");
   const [utterance, setUtterance] = useState("");
   const [phase, setPhase] = useState<TerminalPhase>("idle");
+  const [terminalMode, setTerminalMode] = useState<"choose" | "checkin" | "checkout">("choose");
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [listening, setListening] = useState(false);
   const [matchedOrder, setMatchedOrder] = useState<DemoOrder | null>(null);
@@ -714,6 +724,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setIntentTrace(null);
     setFlowStep(0);
     setFlowError(null);
+    setTerminalMode("choose");
     conversationRef.current = [];
     setTranscript([]);
     setMessage("您好，今天想办理什么？");
@@ -1419,13 +1430,25 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     }
   }
 
-  const showEntry = phase === "idle" || phase === "searching";
+  const showEntry = (phase === "idle" || phase === "searching") && terminalMode === "checkin";
   return <main className="min-h-screen bg-[#f5f5f7] px-5 py-6 text-[#1d1d1f] md:px-10">
     <header className="mx-auto flex max-w-6xl items-center justify-between"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>
     <section className="mx-auto flex min-h-[calc(100vh-7rem)] max-w-5xl flex-col items-center justify-center py-12 text-center">
+      {terminalMode === "choose" ? (<>
+        <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />AI Native 自助终端 · 请先选择业务</div>
+        <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">您好，今天想办理什么？</h1>
+        <p className="mt-4 text-base text-[#86868b]">先选业务，再由系统按业务需要逐步索取信息；随时可以返回重选。</p>
+        <TerminalModeChooser onChoose={setTerminalMode} />
+      </>) : terminalMode === "checkout" ? (<>
+        <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#34c759]" />自助退房 · 房间号 + 手机号后四位</div>
+        <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-5xl">办理退房</h1>
+        <p className="mt-4 text-base text-[#86868b]">先核对账目，确认后才结算，并把房间回收为待清洁。</p>
+        <TerminalCheckoutPanel sessionId={sessionId} onExit={() => setTerminalMode("choose")} onFinished={onRefresh} />
+      </>) : (<>
       <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />AI Native 对话 · 您怎么说都可以</div>
       <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">{activeMessage}</h1>
       <p className="mt-4 text-base text-[#86868b]">系统理解您的意图，再由受控业务接口完成动作。</p>
+      {showEntry && <button onClick={() => setTerminalMode("choose")} className="mt-5 inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm transition hover:bg-[#f2f2f7]"><ArrowLeft size={13} />返回选择办理 / 退房</button>}
 
       {showEntry && audioInputs.length > 1 && <label className="mx-auto mt-5 flex w-fit items-center gap-2 text-xs text-[#86868b]">输入设备<select value={selectedAudioDeviceId} onChange={(event) => { setSelectedAudioDeviceId(event.target.value); if (event.target.value) localStorage.setItem("hotel_audio_input_device", event.target.value); else localStorage.removeItem("hotel_audio_input_device"); }} disabled={listening} className="rounded-lg border border-[#d9d9df] bg-white px-2 py-1 text-xs"><option value="">系统默认麦克风</option>{audioInputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select></label>}
 
@@ -1448,6 +1471,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
       {phase === "complete" && <section className="mt-6 w-full max-w-3xl rounded-[2rem] border border-[#bde7cf] bg-[#effaf4] p-6"><CircleCheck className="mx-auto text-[#248a4d]" size={30} /><h2 className="mt-3 text-2xl font-semibold">自助入住完成</h2><p className="mt-2 text-sm text-[#52745f]">发卡机已完成写卡、回读和吐卡模拟，传感器确认身份证与房卡均已取走。</p></section>}
       {!showEntry && <button onClick={reset} className="mt-7 inline-flex items-center gap-2 text-sm text-[#6e6e73]"><RefreshCcw size={15} />办理下一位</button>}
+      </>)}
     </section>
     <footer className="mx-auto max-w-5xl pb-5 text-center text-xs text-[#86868b]">演示系统 · {adapter.provider} 临时适配器 · D1 假订单 {snapshot.orders.length} 笔 · 读卡与发卡均为自动化模拟，未连接生产设备</footer>
   </main>;
@@ -1492,6 +1516,8 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   const [auditDetailsBusy, setAuditDetailsBusy] = useState(false);
   const [pipeline, setPipeline] = useState<PipelineStageState[]>(() => INITIAL_PIPELINE.map((stage) => ({ ...stage })));
   const [adminVoiceRetrySignal, setAdminVoiceRetrySignal] = useState(0);
+  const [aiChain, setAiChain] = useState<AiChainView | null>(null);
+  const [aiChainBusy, setAiChainBusy] = useState(false);
   useEffect(() => {
     void fetch("/api/admin/auth/me", { cache: "no-store" })
       .then((response) => response.ok ? response.json() as Promise<{ user?: AdminUser }> : Promise.reject(new Error("auth_required")))
@@ -1726,6 +1752,17 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     updatePipelineStage("confirm", { status: "normal", detail: "待确认" });
     return actionId;
   }
+  async function loadAiChain() {
+    setAiChainBusy(true);
+    try {
+      const response = await fetch(`/api/admin/ai-chain?session_id=${encodeURIComponent(sessionId)}`, { cache: "no-store" });
+      const data = await response.json() as { ok?: boolean; error?: string } & Partial<AiChainView>;
+      if (!response.ok || !data.ok) throw new Error(data.error ?? "AI 决策链读取失败");
+      setAiChain({ workflow: data.workflow ?? null, intents: data.intents ?? [], plans: data.plans ?? [], toolCalls: data.toolCalls ?? [], policyDecisions: data.policyDecisions ?? [] });
+    } catch (error) {
+      setAdminReply(error instanceof Error ? error.message : "AI 决策链读取失败");
+    } finally { setAiChainBusy(false); }
+  }
   async function loadAuditDetails(actionId: string) {
     setAuditDetailsBusy(true);
     try {
@@ -1856,7 +1893,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>
       <section className="mt-7"><p className="text-sm text-[#627d98]">系统运行</p><h2 className="mt-1 text-xl font-semibold">实时业务数据</h2><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">D1 假数据</p><h2 className="mt-1 font-semibold">订单状态与手机号测试集</h2></div><div className="overflow-x-auto"><table className="w-full min-w-[850px] text-left text-sm"><thead className="bg-[#f8fbfd] text-xs text-[#627d98]"><tr>{["来源", "订单号", "手机号", "日期", "房型", "订单状态", "房间"].map((name) => <th key={name} className="px-5 py-3 font-medium">{name}</th>)}</tr></thead><tbody>{snapshot.orders.map((order) => <tr key={order.id} className="border-t border-[#edf2f7]"><td className="px-5 py-3 font-medium">{order.source}</td><td className="px-5 py-3 font-mono text-xs">{order.order_code}</td><td className="px-5 py-3">{order.phone_masked}</td><td className="px-5 py-3">{order.stay_date}</td><td className="px-5 py-3">{order.room_type}</td><td className="px-5 py-3"><StatusPill value={order.status} /></td><td className="px-5 py-3">{order.room_number ?? "—"}</td></tr>)}</tbody></table></div></section>
-      <div className="mt-7 grid gap-7 lg:grid-cols-[1fr_.85fr]"><section className="rounded-2xl border border-[#f3d9c0] bg-white shadow-sm"><div className="border-b border-[#f6e6d5] px-5 py-4"><p className="text-sm text-[#8a5b1d]">人工接管</p><h2 className="mt-1 font-semibold">待处理人工任务</h2></div><div className="divide-y divide-[#fdf1e6]">{snapshot.manualTasks.length ? snapshot.manualTasks.map((task) => <div key={task.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="text-sm font-medium">{task.department} · {task.status === "open" ? "待处理" : task.status}</p><p className="mt-1 text-xs leading-5 text-[#627d98]">{task.reason}</p><p className="mt-1 font-mono text-[10px] text-[#9fb3c8]">命令 {task.command_id ? task.command_id.slice(0, 8) : "—"} · 任务 {task.case_id.slice(0, 8)}</p></div><span className="rounded-full bg-[#fff1e5] px-3 py-1 text-xs text-[#8a5b1d]">{new Date(task.created_at).toLocaleString("zh-CN")}</span></div>) : <Empty text="当前没有待处理的人工任务" />}</div></section><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">办理任务</p><h2 className="mt-1 font-semibold">数据库状态机</h2></div><div className="divide-y divide-[#edf2f7]">{snapshot.cases.length ? snapshot.cases.map((item) => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="font-mono text-xs text-[#627d98]">{item.id.slice(0, 12)}… · v{item.version}</p><p className="mt-1 text-sm">房间 {item.room_number ?? "未锁定"} · 硬件 {item.hardware_status}</p></div><StatusPill value={item.status} /></div>) : <Empty text="尚无办理任务" />}</div></section>
+      <div className="mt-7 grid gap-7 lg:grid-cols-[1fr_.85fr]"><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#627d98]">AI 决策链回放</p><h2 className="mt-1 font-semibold">表达 → 意图 → 计划 → 策略 → 工具 → 回执</h2></div><button type="button" onClick={() => void loadAiChain()} disabled={aiChainBusy} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm disabled:opacity-50">{aiChainBusy ? "读取中…" : "读取当前会话"}</button></div>{aiChain ? <div className="grid gap-4 p-5 lg:grid-cols-2"><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">理解（意图）</p><div className="mt-2 space-y-2">{aiChain.intents.length ? aiChain.intents.map((item, index) => <div key={`${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">“{item.raw_text_redacted}”</p><p className="text-[#627d98]">{item.intent} · 置信度 {item.confidence ?? "—"} · {item.source}</p></div>) : <p className="text-xs text-[#829ab1]">暂无记录</p>}</div></div><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">计划与策略</p><div className="mt-2 space-y-2">{aiChain.plans.map((item, index) => <div key={`plan-${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">{item.status}</p><p className="font-mono text-[10px] text-[#829ab1]">{(item.plan_json ?? "").slice(0, 120)}</p></div>)}{aiChain.policyDecisions.map((item, index) => <div key={`${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">{item.action} · 风险 {item.risk_level}</p><p className="text-[#627d98]">{item.decision} — {item.reason}</p></div>)}</div></div><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">工具与回执</p><div className="mt-2 space-y-2">{aiChain.toolCalls.length ? aiChain.toolCalls.map((item, index) => <div key={`${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">{item.tool_name} · <span className={item.status === "SUCCEEDED" ? "text-[#248a4d]" : item.status === "PROPOSED" ? "text-[#1769aa]" : "text-[#b63d13]"}>{item.status}</span></p><p className="font-mono text-[10px] text-[#829ab1]">{item.result_json ? item.result_json.slice(0, 120) : "等待回执"}</p></div>) : <p className="text-xs text-[#829ab1]">暂无工具调用</p>}</div></div><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">工作流</p>{aiChain.workflow ? <div className="mt-2 space-y-1 text-xs leading-5 text-[#627d98]"><p>状态：{aiChain.workflow.status} · 当前步骤：{aiChain.workflow.current_step ?? "—"}</p><p>最后更新：{new Date(aiChain.workflow.updated_at).toLocaleString("zh-CN")}</p><p className="font-mono text-[10px]">{aiChain.workflow.id}</p></div> : <p className="mt-2 text-xs text-[#829ab1]">该会话还没有 AI 记录</p>}</div></div> : <p className="p-5 text-sm text-[#627d98]">点击“读取当前会话”，查看这位客人的完整 AI 决策链。</p>}</section><section className="rounded-2xl border border-[#f3d9c0] bg-white shadow-sm"><div className="border-b border-[#f6e6d5] px-5 py-4"><p className="text-sm text-[#8a5b1d]">人工接管</p><h2 className="mt-1 font-semibold">待处理人工任务</h2></div><div className="divide-y divide-[#fdf1e6]">{snapshot.manualTasks.length ? snapshot.manualTasks.map((task) => <div key={task.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="text-sm font-medium">{task.department} · {task.status === "open" ? "待处理" : task.status}</p><p className="mt-1 text-xs leading-5 text-[#627d98]">{task.reason}</p><p className="mt-1 font-mono text-[10px] text-[#9fb3c8]">命令 {task.command_id ? task.command_id.slice(0, 8) : "—"} · 任务 {task.case_id.slice(0, 8)}</p></div><span className="rounded-full bg-[#fff1e5] px-3 py-1 text-xs text-[#8a5b1d]">{new Date(task.created_at).toLocaleString("zh-CN")}</span></div>) : <Empty text="当前没有待处理的人工任务" />}</div></section><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">办理任务</p><h2 className="mt-1 font-semibold">数据库状态机</h2></div><div className="divide-y divide-[#edf2f7]">{snapshot.cases.length ? snapshot.cases.map((item) => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="font-mono text-xs text-[#627d98]">{item.id.slice(0, 12)}… · v{item.version}</p><p className="mt-1 text-sm">房间 {item.room_number ?? "未锁定"} · 硬件 {item.hardware_status}</p></div><StatusPill value={item.status} /></div>) : <Empty text="尚无办理任务" />}</div></section>
         <section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">不可篡改式演示记录</p><h2 className="mt-1 font-semibold">最近审计事件</h2></div><div className="max-h-[430px] divide-y divide-[#edf2f7] overflow-y-auto">{snapshot.auditEvents.length ? snapshot.auditEvents.map((event) => <div key={event.id} className="px-5 py-4"><div className="flex justify-between gap-3"><p className="text-sm font-medium">{event.event_type}</p><span className="font-mono text-[10px] text-[#829ab1]">#{event.id}</span></div><p className="mt-1 text-xs leading-5 text-[#627d98]">{event.detail}</p><p className="mt-1 text-[10px] text-[#9fb3c8]">{new Date(event.created_at).toLocaleString("zh-CN")}</p></div>) : <Empty text="尚无审计事件" />}</div></section></div>
     </div>
     {confirmationCard && <AdminConfirmationCardV2 state={confirmationCard} busy={adminActionBusy} onOpen={() => { if (confirmationCard.status === "AWAITING_CONFIRMATION") setConfirmActionOpen(true); }} onCancel={() => { if (pendingAdminAction) void cancelPendingAdminAction(); }} onRetry={() => retryConfirmation(confirmationCard.action)} onAudit={() => void loadAuditDetails(confirmationCard.action.actionId)} onEdit={(action) => { setPendingAdminAction(action); setPendingActionDirty(true); setConfirmationCard((current) => current ? { ...current, action } : current); }} auditBusy={auditDetailsBusy} />}

@@ -1,8 +1,11 @@
 import { getD1 } from "@/db";
+import { completeGuestToolCall } from "@/lib/ai-control";
 import { ensureAdminSchema, requireAdmin } from "@/lib/admin-auth";
 import { confirmFormalCheckin, ensureFormalCheckinOrder, holdFormalRoom, projectCheckinToLegacy } from "@/lib/checkin";
 import { checkinCommandKey, runDeviceCommand } from "@/lib/device-commands";
 import { ORDER_STATUS, RESERVATION_STATUS } from "@/lib/hotel-core";
+import { checkoutAndSettle, ensureStayFolio, findCheckoutCandidates, markRoomClean, quoteCheckout, verifyStayFolio, type StayCandidate } from "@/lib/folio";
+import { syncPmsRoomCatalog } from "@/lib/pms-core-sync";
 import { DEFAULT_HOTEL_CODE, DEFAULT_HOTEL_ID, DEFAULT_TENANT_ID, ensureTenantFoundation } from "@/lib/tenant";
 
 export const runtime = "edge";
@@ -128,6 +131,37 @@ async function ensureFormalForOrder(scope: DemoOrderScope, seed: FormalOrderSeed
 async function legacyOrderRef(orderId: string) {
   const row = await getD1().prepare("SELECT order_code, room_type FROM demo_orders WHERE id = ? LIMIT 1").bind(orderId).first<{ order_code: string; room_type: string }>();
   return row ? { orderCode: row.order_code, roomTypeName: row.room_type } : null;
+}
+
+/**
+ * Room-critical steps cannot degrade. Telling a guest the room is locked when the
+ * formal tables never recorded it ends with a keycard to a room the hotel still
+ * believes is empty, and the same guest cannot check out afterwards. These steps
+ * stop the flow and hand off to a human instead of showing a success that is not
+ * true; cosmetic projections keep the silent-degrade policy.
+ */
+async function requireFormal<T>(sessionId: string, caseId: string, label: string, run: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; reason: string }> {
+  try {
+    return { ok: true, value: await run() };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown_error";
+    console.warn(`[checkin][formal] ${label} required write failed: ${message}`);
+    await audit(sessionId, caseId, "FORMAL_SYNC_FAILED", null, null, `正式表写入失败（${label}）：${message}；该步骤不允许降级，已转人工接手`).catch(() => undefined);
+    return { ok: false, reason: message };
+  }
+}
+
+/** What the guest is told when a room-critical write stops the flow. */
+const ROOM_FAULT_TEXT: Record<string, string> = {
+  no_sellable_room: "这个房型暂时没有打扫干净的空房，需要客房打扫完成后才能自动分房",
+  room_conflict: "房间刚刚被其他人占用，或还没有打扫完成，不能自动分配",
+  room_not_held: "房间没有成功锁定，不能确认入住",
+  reservation_status_conflict: "这笔预订的状态已经变化",
+  reservation_not_found: "没有找到这笔预订的正式记录",
+};
+
+function handoffReply(reason: string) {
+  return { required: true as const, department: "front_desk", reason: ROOM_FAULT_TEXT[reason] ?? "房间状态异常，需要前台处理", error_code: reason };
 }
 
 async function projectFormal(scope: DemoOrderScope, orderNo: string, patch: { status?: string; roomNumber?: string | null }) {
@@ -360,6 +394,32 @@ async function audit(sessionId: string, caseId: string | null, eventType: string
     .prepare("INSERT INTO audit_events (session_id, case_id, event_type, from_state, to_state, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .bind(sessionId, caseId, eventType, fromState, toState, detail, now())
     .run();
+  await bindToolReceipt(sessionId, eventType, detail);
+}
+
+/** Business step → the AI tool call it fulfils, so ai_tool_calls gets real receipts. */
+const TOOL_RECEIPTS: Record<string, string[]> = {
+  ORDER_MATCHED: ["pms.search_order"],
+  WALK_IN_DRAFT_CREATED: ["pms.create_walk_in_draft"],
+  WALK_IN_QUOTED: ["pms.quote_walk_in"],
+  PAYMENT_STARTED: ["payment.create"],
+  WALK_IN_CREATED: ["pms.create_walk_in"],
+  WALK_IN_ORDER_CREATED: ["pms.create_walk_in"],
+  IDENTITY_CARD_DETECTED: ["device.reader.read_identity"],
+  POLICE_BROWSER_STARTED: ["police.submit_registration"],
+  KEYCARD_WRITE_STARTED: ["device.encoder.issue_keycard"],
+  HANDOFF_REQUIRED: ["device.reader.read_identity", "police.submit_registration", "device.encoder.issue_keycard", "pms.search_order", "pms.create_walk_in", "pms.create_walk_in_draft", "pms.quote_walk_in", "payment.create"],
+};
+
+async function bindToolReceipt(sessionId: string, eventType: string, detail: string) {
+  const toolNames = TOOL_RECEIPTS[eventType];
+  if (!toolNames) return;
+  const failed = eventType === "HANDOFF_REQUIRED";
+  try {
+    await completeGuestToolCall({ sessionId, toolNames, status: failed ? "FAILED" : "SUCCEEDED", result: { event: eventType, detail }, errorCode: failed ? detail : null });
+  } catch (error) {
+    console.warn("[ai-control] tool receipt binding failed", error instanceof Error ? error.message : "unknown_error");
+  }
 }
 
 async function loadCase(sessionId: string, caseId: unknown) {
@@ -712,16 +772,30 @@ export async function POST(request: Request, context: RouteContext) {
       return json({ checkinCase: updated });
     }
     if (action === "hold-room") {
-      const roomNumber = typeof body.room_number === "string" && /^\d{3,5}$/.test(body.room_number) ? body.room_number : "1208";
-      const updated = await transition({ sessionId, caseId: body.case_id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail: `模拟 PMS 已临时锁定 ${roomNumber} 房`, fields: { roomNumber } });
-      const ref = await legacyOrderRef(updated.order_id);
+      const current = await loadCase(sessionId, body.case_id);
+      if (current.status === "ROOM_HELD") return json({ checkinCase: current });
+      // The kiosk does not know which rooms are clean, so it only names one when
+      // a human explicitly wants that room; otherwise the service picks.
+      const requestedRoom = typeof body.room_number === "string" && /^\d{3,5}$/.test(body.room_number) ? body.room_number : null;
+      const ref = await legacyOrderRef(current.order_id);
       if (ref) {
         const scope = await sessionScope(sessionId);
-        await syncFormal(sessionId, updated.id, "hold-room", () => holdFormalRoom({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, roomNumber, roomTypeName: ref.roomTypeName, requestId: `${sessionId}:${updated.id}:hold` }));
-        await projectFormal(scope, ref.orderCode, { roomNumber });
-      } else {
-        await getD1().prepare("UPDATE demo_orders SET room_number = ?, updated_at = ? WHERE id = ? AND session_id = ?").bind(roomNumber, now(), updated.order_id, sessionId).run();
+        // The catalog is what makes "pick a sellable room" possible. It never
+        // overwrites an existing room status, and a failure just means no new
+        // rooms to choose from.
+        await syncPmsRoomCatalog({ tenantId: scope.tenantId, hotelId: scope.hotelId, hotelCode: scope.hotelCode }).catch(() => undefined);
+        const held = await requireFormal(sessionId, current.id, "hold-room", () => holdFormalRoom({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, roomNumber: requestedRoom, roomTypeName: ref.roomTypeName, requestId: `${sessionId}:${current.id}:hold` }));
+        if (!held.ok) {
+          const handed = await requireHandoff(sessionId, current.id, `锁定房间失败：${held.reason}，已转人工接手`);
+          return json({ checkinCase: handed, handoff: handoffReply(held.reason) });
+        }
+        const updated = await transition({ sessionId, caseId: current.id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail: `已锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`, fields: { roomNumber: held.value.roomNumber } });
+        await projectFormal(scope, ref.orderCode, { roomNumber: held.value.roomNumber });
+        return json({ checkinCase: updated });
       }
+      const roomNumber = requestedRoom ?? current.room_number ?? "1208";
+      const updated = await transition({ sessionId, caseId: current.id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail: `模拟 PMS 已临时锁定 ${roomNumber} 房`, fields: { roomNumber } });
+      await getD1().prepare("UPDATE demo_orders SET room_number = ?, updated_at = ? WHERE id = ? AND session_id = ?").bind(roomNumber, now(), updated.order_id, sessionId).run();
       return json({ checkinCase: updated });
     }
     if (action === "browser-start") {
@@ -756,15 +830,22 @@ export async function POST(request: Request, context: RouteContext) {
       return json({ checkinCase: updated, receipt });
     }
     if (action === "confirm-checkin") {
-      const updated = await transition({ sessionId, caseId: body.case_id, expected: "POLICE_COMPLETED", next: "PMS_CHECKIN_CONFIRMED", eventType: "PMS_CHECKIN_CONFIRMED", detail: "模拟 PMS 入住确认成功；已核对订单、房间和登记回执" });
-      const ref = await legacyOrderRef(updated.order_id);
+      const current = await loadCase(sessionId, body.case_id);
+      if (current.status === "PMS_CHECKIN_CONFIRMED") return json({ checkinCase: current });
+      const ref = await legacyOrderRef(current.order_id);
       if (ref) {
         const scope = await sessionScope(sessionId);
-        await syncFormal(sessionId, updated.id, "confirm-checkin", () => confirmFormalCheckin({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, requestId: `${sessionId}:${updated.id}:checkin` }));
-        await projectFormal(scope, ref.orderCode, { status: "checkin_confirmed" });
-      } else {
-        await getD1().prepare("UPDATE demo_orders SET status = 'checkin_confirmed', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
+        const confirmed = await requireFormal(sessionId, current.id, "confirm-checkin", () => confirmFormalCheckin({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, requestId: `${sessionId}:${current.id}:checkin` }));
+        if (!confirmed.ok) {
+          const handed = await requireHandoff(sessionId, current.id, `入住确认失败：${confirmed.reason}，已转人工接手`);
+          return json({ checkinCase: handed, handoff: handoffReply(confirmed.reason) });
+        }
+        const updated = await transition({ sessionId, caseId: current.id, expected: "POLICE_COMPLETED", next: "PMS_CHECKIN_CONFIRMED", eventType: "PMS_CHECKIN_CONFIRMED", detail: "正式入住已确认：预订、入住记录与房态同时更新" });
+        await projectFormal(scope, ref.orderCode, { status: "checkin_confirmed", roomNumber: current.room_number });
+        return json({ checkinCase: updated });
       }
+      const updated = await transition({ sessionId, caseId: current.id, expected: "POLICE_COMPLETED", next: "PMS_CHECKIN_CONFIRMED", eventType: "PMS_CHECKIN_CONFIRMED", detail: "模拟 PMS 入住确认成功；已核对订单、房间和登记回执" });
+      await getD1().prepare("UPDATE demo_orders SET status = 'checkin_confirmed', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
       return json({ checkinCase: updated });
     }
     if (action === "keycard-start") {
@@ -805,17 +886,115 @@ export async function POST(request: Request, context: RouteContext) {
       const updated = await transition({ sessionId, caseId: body.case_id, expected: "KEYCARD_DISPENSED", next: "CHECKIN_COMPLETE", eventType: "CARDS_COLLECTED", detail: "取卡口和身份证读卡器传感器均已清空，确认客人取走房卡与身份证", fields: { hardwareStatus: "identity_and_keycard_collected" } });
       return json({ checkinCase: updated });
     }
+    if (action === "room-clean") {
+      const scope = await sessionScope(sessionId);
+      const roomNumber = requireRoomNumber(body.room_number);
+      const cleaned = await markRoomClean({ hotelId: scope.hotelId, roomNumber, requestId: `${sessionId}:clean:${roomNumber}` });
+      await audit(sessionId, null, "ROOM_CLEANED", null, "VACANT_CLEAN", `客房 ${roomNumber} 已打扫完成，房态由待清洁回到可售`);
+      return json({ ok: true, room_number: roomNumber, room_status: cleaned.roomStatus });
+    }
+    if (action === "checkout-lookup") {
+      return json(await checkoutLookup(sessionId, requireRoomNumber(body.room_number), requireLast4(body.phone_last4)));
+    }
+    if (action === "checkout-confirm") {
+      const stayId = requireStayId(body.stay_id);
+      const requestId = typeof body.request_id === "string" && body.request_id.length <= 160 ? body.request_id : `${sessionId}:${stayId}:checkout`;
+      return json(await checkoutConfirm(sessionId, stayId, requestId));
+    }
     return json({ error: "unknown_action" }, 404);
   } catch (error) {
     return handleError(error);
   }
 }
 
+const ROOM_NUMBER_PATTERN = /^\d{3,5}$/;
+const STAY_ID_PATTERN = /^[a-zA-Z0-9_-]{3,120}$/;
+
+function requireRoomNumber(value: unknown) {
+  const room = typeof value === "string" ? value.trim() : "";
+  if (!ROOM_NUMBER_PATTERN.test(room)) throw new Error("invalid_room_number");
+  return room;
+}
+
+function requireStayId(value: unknown) {
+  if (typeof value !== "string" || !STAY_ID_PATTERN.test(value)) throw new Error("invalid_stay_id");
+  return value;
+}
+
+/** Only the masked identity fields the terminal is allowed to display. */
+function checkoutCandidateView(stay: StayCandidate) {
+  return {
+    stay_id: stay.stayId,
+    reservation_no: stay.reservationNo,
+    guest_name_masked: stay.guestNameMasked,
+    phone_last4: stay.phoneLast4,
+    room_number: stay.roomNumber,
+    stay_date: stay.stayDate,
+    nights: stay.nights,
+    checked_in_at: stay.checkedInAt,
+  };
+}
+
+/**
+ * Self-service checkout is two requests on purpose: the guest sees the itemised
+ * bill (including what is refunded) before anything is written. The lookup is
+ * what turns "room 1306 + their booking phone" into one specific stay, and it
+ * refuses to guess when more than one stay matches.
+ */
+async function checkoutLookup(sessionId: string, roomNumber: string, phoneLast4: string) {
+  const scope = await sessionScope(sessionId);
+  const candidates = await findCheckoutCandidates({ hotelId: scope.hotelId, phoneLast4, roomNumber });
+  if (!candidates.length) {
+    await audit(sessionId, null, "CHECKOUT_LOOKUP_MISSED", null, null, `未找到在住记录：房间号 ${roomNumber} 与手机号后四位需同时匹配`);
+    return { ok: true, outcome: "not_found" as const, candidates: [] };
+  }
+  if (candidates.length > 1) {
+    await audit(sessionId, null, "CHECKOUT_LOOKUP_AMBIGUOUS", null, null, `匹配到 ${candidates.length} 笔在住记录，已停止自动结算并转人工`);
+    return { ok: true, outcome: "ambiguous" as const, candidates: candidates.map(checkoutCandidateView) };
+  }
+  const stay = candidates[0];
+  const ensured = await ensureStayFolio({ hotelId: scope.hotelId, stayId: stay.stayId, requestId: `${sessionId}:${stay.stayId}:precheckout` });
+  const quote = await quoteCheckout({ hotelId: scope.hotelId, stayId: stay.stayId });
+  await audit(sessionId, null, "CHECKOUT_QUOTED", null, "QUOTED", `退房报价：房费 ${quote.roomTotal} 分、在住消费 ${quote.consumptionTotal} 分、押金 ${quote.depositTotal} 分；应${quote.due >= 0 ? "补收" : "退还"} ${Math.abs(quote.due)} 分`);
+  return { ok: true, outcome: "quoted" as const, stay: checkoutCandidateView(stay), quote, folio_opened: ensured.opened, deposit_amount: ensured.depositAmount };
+}
+
+/**
+ * Leaving the room and finishing the money are separate writes, so a settlement
+ * failure must not be reported as a checkout failure. The guest has still left;
+ * what is left over is a bill for the front desk.
+ */
+async function checkoutConfirm(sessionId: string, stayId: string, requestId: string) {
+  const scope = await sessionScope(sessionId);
+  try {
+    const result = await checkoutAndSettle({ hotelId: scope.hotelId, stayId, requestId });
+    await audit(sessionId, null, "CHECKOUT_SETTLED", null, "CHECKED_OUT", `退房结算完成：房费 ${result.quote.roomTotal} 分，押金 ${result.quote.depositTotal} 分，${result.settlement.settled >= 0 ? "补收" : "退还"} ${Math.abs(result.settlement.settled)} 分，账本已关闭`);
+    return {
+      ok: true,
+      outcome: "settled" as const,
+      stay_id: stayId,
+      room_id: result.checkout.roomId,
+      room_status: result.checkout.roomStatus,
+      settlement: result.settlement.settled,
+      folio_status: result.settlement.folio.status,
+      quote: result.quote,
+      folio_opened: result.folioOpened,
+      deposit_amount: result.depositAmount,
+    };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "unknown_error";
+    const verification = await verifyStayFolio({ hotelId: scope.hotelId, stayId }).catch(() => null);
+    await audit(sessionId, null, "CHECKOUT_NEEDS_FOLLOWUP", null, null, `退房已受理但结算未完成（${reason}），需前台接手；校验：${verification ? JSON.stringify(verification.issues) : "不可用"}`);
+    return json({ ok: false, outcome: "needs_followup" as const, stay_id: stayId, reason, verification }, 202);
+  }
+}
+
 function handleError(error: unknown) {
   const message = error instanceof Error ? error.message : "internal_error";
   if (message === "invalid_json" || message.startsWith("invalid_") || message === "room_not_available" || message.startsWith("payment_requires_quote") || message.startsWith("invalid_draft_status")) return json({ error: message }, 400);
-  if (message === "case_not_found" || message === "draft_not_found" || message === "payment_not_found") return json({ error: message }, 404);
-  if (message === "concurrent_update" || message === "concurrent_payment") return json({ error: message, error_code: "CONCURRENT_UPDATE", retryable: true }, 409);
+  if (["case_not_found", "draft_not_found", "payment_not_found", "stay_not_found", "folio_not_found", "checkout_room_not_found"].includes(message)) return json({ error: message }, 404);
+  if (["no_sellable_room", "room_conflict", "room_not_held"].includes(message)) return json({ error: message, error_code: "ROOM_STATE_CONFLICT", retryable: false }, 409);
+  if (["concurrent_update", "concurrent_payment", "folio_version_conflict", "stay_version_conflict", "room_status_conflict", "folio_not_balanced"].includes(message)) return json({ error: message, error_code: "CONCURRENT_UPDATE", retryable: true }, 409);
   if (message.startsWith("invalid_transition")) {
     const [, currentState, expectedNext] = message.split(":");
     return json({ error: "invalid_transition", error_code: "INVALID_TRANSITION", current_state: currentState, expected_next: expectedNext, retryable: false }, 409);

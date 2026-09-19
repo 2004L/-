@@ -1,6 +1,7 @@
 import { agentTurnSchema, extractPhoneNumber, routeIntent, toolArgumentSchemas, toolNames, type AssistantMessage, type Clarification, type ToolCall } from "@/lib/tools";
 import { llmConfig, streamModel } from "@/lib/llm";
 import { recordAiMetric, requestId } from "@/lib/ops";
+import { recordGuestAiTurn } from "@/lib/ai-control";
 import { withIntentEnvelope, type IntentSource } from "@/lib/intent-envelope";
 
 export const runtime = "edge";
@@ -49,11 +50,19 @@ export async function POST(request: Request) {
     const pendingWalkIn = !input.walk_in_draft_id && /(现场(?:办理|入住|预订)|没有?预订|直接(?:入住|住)|walk[- ]?in)/i.test(recentHistory);
     const pendingWalkInPhone = pendingWalkIn ? extractPhoneNumber(recentHistory) ?? undefined : undefined;
     const ruleResult = routeIntent(latest.content, { case_id: input.case_id, pending_walk_in: pendingWalkIn, pending_walk_in_phone: pendingWalkInPhone, walk_in_draft_id: input.walk_in_draft_id, walk_in_draft_status: input.walk_in_draft_status });
+    const recordTurn = async (result: AgentResult, source: IntentSource) => {
+      try {
+        await recordGuestAiTurn({ sessionId: input.session_id, conversationId: input.conversation_id, caseId: input.case_id, requestId: rid, utterance: latest.content, result, source });
+      } catch (error) {
+        console.warn("ai_control_record_failed", error instanceof Error ? error.message : "unknown");
+      }
+    };
     try {
       const modelResult = await streamModel(input.messages, { case_id: input.case_id });
       if (!modelResult) {
         await recordAiMetric({ requestId: rid, sessionId: metricSessionId, route: "/api/agent/turn", model, latencyMs: Date.now() - startedAt, outcome: "fallback" });
         const fallback = withIntentEnvelope(ruleResult, "rule_fallback");
+        await recordTurn(ruleResult, "rule_fallback");
         return Response.json(fallback, { headers: { "X-Request-ID": rid } });
       }
       const encoder = new TextEncoder();
@@ -82,9 +91,11 @@ export async function POST(request: Request) {
             const modelResponse = toolResponse as AgentResult | null ?? (text.trim() ? { type: "assistant_message" as const, message: text.trim() } : null);
             const reconciled = reconcileAgentResult(modelResponse, ruleResult);
             const response = withIntentEnvelope(reconciled.result, reconciled.source);
+            await recordTurn(reconciled.result, reconciled.source);
             send(controller, { type: "done", response });
           } catch (error) {
             outcome = "fallback";
+            await recordTurn(ruleResult, "rule_fallback");
             send(controller, { type: "fallback", response: withIntentEnvelope(ruleResult, "rule_fallback"), message: error instanceof Error ? error.message : "stream_failed" });
           } finally {
             clearInterval(heartbeat);
@@ -98,6 +109,7 @@ export async function POST(request: Request) {
       console.warn("llm_unavailable_fallback_to_rules", error instanceof Error ? error.message : "unknown");
     }
     await recordAiMetric({ requestId: rid, sessionId: metricSessionId, route: "/api/agent/turn", model, latencyMs: Date.now() - startedAt, outcome: "fallback" });
+    await recordTurn(ruleResult, "rule_fallback");
     return Response.json(withIntentEnvelope(ruleResult, "rule_fallback"), { headers: { "X-Request-ID": rid } });
   } catch {
     await recordAiMetric({ requestId: rid, sessionId: metricSessionId, route: "/api/agent/turn", model, latencyMs: Date.now() - startedAt, outcome: "error" });
