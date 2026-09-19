@@ -3,7 +3,9 @@ import {
   RESERVATION_STATUS,
   ROOM_STATUS,
   STAY_STATUS,
+  canonicalRoomType,
   formalRoomId,
+  formalRoomTypeId,
 } from "./hotel-core.ts";
 import type { SqlRunner, SqlValue } from "./orders-core.ts";
 
@@ -30,25 +32,13 @@ export type CheckinOrderInput = {
   reservationStatus?: number;
 };
 
-function utf8Hex(value: string) {
-  return [...new TextEncoder().encode(value)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-/** Same room-type identity scheme as the legacy projection, so rows are shared. */
-export function legacyRoomTypeId(hotelId: string, roomTypeName: string) {
-  return `rt-${hotelId}-${utf8Hex(roomTypeName).slice(0, 16)}`;
-}
-
-function legacyRoomTypeCode(roomTypeName: string) {
-  return `LEGACY-${utf8Hex(roomTypeName).slice(0, 16)}`;
-}
-
 export async function ensureCheckinOrder(db: SqlRunner, input: CheckinOrderInput) {
   const stamp = new Date().toISOString();
-  const roomTypeId = legacyRoomTypeId(input.hotelId, input.roomTypeName);
+  const roomType = canonicalRoomType(input.roomTypeName);
+  const roomTypeId = formalRoomTypeId(input.hotelId, roomType.code);
   await db.run(
     "INSERT OR IGNORE INTO room_types (id, tenant_id, hotel_id, code, name, pms_code, max_occupancy, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, 2, 1, ?, ?)",
-    [roomTypeId, input.tenantId, input.hotelId, legacyRoomTypeCode(input.roomTypeName), input.roomTypeName, stamp, stamp],
+    [roomTypeId, input.tenantId, input.hotelId, roomType.code, roomType.name, stamp, stamp],
   );
   await db.run(
     "INSERT OR IGNORE INTO orders (id, tenant_id, hotel_id, order_no, source, external_id, status, currency, room_amount, deposit_amount, total_amount, paid_amount, guest_name_masked, phone_last4, reservation_no, version, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'CNY', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
@@ -70,10 +60,11 @@ export async function ensureCheckinOrder(db: SqlRunner, input: CheckinOrderInput
 export async function holdFormalRoom(db: SqlRunner, input: { tenantId: string; hotelId: string; orderNo: string; roomNumber: string; roomTypeName: string; requestId: string }) {
   const stamp = new Date().toISOString();
   const roomId = formalRoomId(input.hotelId, input.roomNumber);
+  const roomTypeId = formalRoomTypeId(input.hotelId, canonicalRoomType(input.roomTypeName).code);
   const floor = Number(input.roomNumber.slice(0, -2)) || null;
   await db.run(
     "INSERT OR IGNORE INTO rooms (id, tenant_id, hotel_id, room_type_id, room_number, floor, status, version, pms_room_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)",
-    [roomId, input.tenantId, input.hotelId, legacyRoomTypeId(input.hotelId, input.roomTypeName), input.roomNumber, floor, ROOM_STATUS.VACANT_CLEAN, stamp, stamp],
+    [roomId, input.tenantId, input.hotelId, roomTypeId, input.roomNumber, floor, ROOM_STATUS.VACANT_CLEAN, stamp, stamp],
   );
   const held = await db.run(
     "UPDATE rooms SET status = ?, version = version + 1, updated_at = ? WHERE hotel_id = ? AND room_number = ? AND status = ?",

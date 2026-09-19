@@ -1,5 +1,5 @@
 import { getD1 } from "@/db";
-import { formalRoomId } from "@/lib/hotel-core";
+import { canonicalRoomType, formalRoomId, formalRoomTypeId } from "@/lib/hotel-core";
 import { simulatorPms } from "@/services/pms/simulator-adapter";
 
 /**
@@ -18,18 +18,29 @@ export async function syncPmsRoomCatalog(input: { tenantId: string; hotelId: str
   });
   const stamp = new Date().toISOString();
   const db = getD1();
-  const uniqueTypes = new Map(rooms.map((room) => [room.roomTypeCode, room.roomTypeCode]));
+
+  const existing = await db.prepare("SELECT id, room_number FROM rooms WHERE hotel_id = ?").bind(input.hotelId).all<{ id: string; room_number: string }>();
+  const nonCanonical = existing.results.filter((row) => row.id !== formalRoomId(input.hotelId, row.room_number));
+  if (nonCanonical.length) {
+    // The upsert below conflicts on room_number, so it can never repair an id.
+    console.warn(`[pms][rooms] ${nonCanonical.length} room row(s) still use a non-canonical id; apply migration 0014_data_governance.sql (e.g. ${nonCanonical.slice(0, 3).map((row) => row.id).join(", ")})`);
+  }
+
+  const uniqueTypes = new Map(rooms.map((room) => {
+    const type = canonicalRoomType(room.roomTypeCode);
+    return [type.code, type];
+  }));
   const statements = [
-    ...Array.from(uniqueTypes.values()).map((roomTypeCode) => db.prepare(
+    ...Array.from(uniqueTypes.values()).map((type) => db.prepare(
       "INSERT OR IGNORE INTO room_types (id, tenant_id, hotel_id, code, name, pms_code, max_occupancy, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 2, 1, ?, ?)"
-    ).bind(`pms-rt-${input.hotelId}-${roomTypeCode}`, input.tenantId, input.hotelId, roomTypeCode, roomTypeCode, roomTypeCode, stamp, stamp)),
+    ).bind(formalRoomTypeId(input.hotelId, type.code), input.tenantId, input.hotelId, type.code, type.name, type.pmsCode, stamp, stamp)),
     ...rooms.map((room) => db.prepare(
       `INSERT INTO rooms (id, tenant_id, hotel_id, room_type_id, room_number, floor, status, version, pms_room_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) ON CONFLICT(hotel_id, room_number) DO UPDATE SET room_type_id = excluded.room_type_id, floor = excluded.floor, pms_room_id = excluded.pms_room_id, updated_at = excluded.updated_at`
     ).bind(
       formalRoomId(input.hotelId, room.roomNumber),
       input.tenantId,
       input.hotelId,
-      `pms-rt-${input.hotelId}-${room.roomTypeCode}`,
+      formalRoomTypeId(input.hotelId, canonicalRoomType(room.roomTypeCode).code),
       room.roomNumber,
       Number(room.roomNumber.slice(0, -2)) || null,
       room.status,

@@ -18,12 +18,14 @@ const suites = [
   ["hardening", [], "test-hardening.mjs"],
   ["intents", [STRIP_TYPES], "test-intent-rules.mjs"],
   ["admin-intents", [STRIP_TYPES], "test-admin-intent-rules.mjs"],
+  ["admin-credentials", [STRIP_TYPES], "test-admin-credentials.mjs"],
   ["admin-phase2", [STRIP_TYPES], "test-admin-phase2.mjs"],
   ["single-source", [STRIP_TYPES], "test-single-source.mjs"],
   ["orders", [STRIP_TYPES], "test-orders.mjs"],
   ["orders-concurrency", [STRIP_TYPES], "test-orders-concurrency.mjs"],
   ["orders-d1", [STRIP_TYPES], "test-orders-d1.mjs"],
   ["checkin-d1", [STRIP_TYPES], "test-checkin-d1.mjs"],
+  ["data-governance-d1", [STRIP_TYPES], "test-data-governance-d1.mjs"],
 ];
 
 const failures = [];

@@ -1,13 +1,16 @@
 import { getD1 } from "@/db";
+import { ADMIN_DEMO_ACCOUNTS, PBKDF2_ITERATIONS, demoPasswordFor, demoSeedPlan, hashPasswordWithSalt, needsSaltRotation, type EnvReader } from "@/lib/admin-credentials";
 import { rolePermissions, type AdminPermission, type AdminRole } from "@/lib/admin-tools";
 import { DEFAULT_HOTEL_CODE, DEFAULT_HOTEL_ID, DEFAULT_TENANT_ID, ensureTenantFoundation } from "@/lib/tenant";
 
 export const ADMIN_COOKIE = "hotel_admin_session";
 const SESSION_HOURS = 8;
 const SESSION_IDLE_MINUTES = 30;
-// Cloudflare/Edge Web Crypto 的 PBKDF2 上限为 100000。
-const PBKDF2_ITERATIONS = 100000;
-const DEMO_SEED = "hotel-demo-2026";
+let demoCredentialsChecked = false;
+
+const processEnv: EnvReader = (name) => {
+  try { return typeof process !== "undefined" ? process.env?.[name] : undefined; } catch { return undefined; }
+};
 
 export type AdminUser = { id: string; tenant_id: string; hotel_id: string; hotel_code: string; username: string; display_name: string; role: AdminRole; permissions: readonly AdminPermission[] };
 
@@ -19,19 +22,10 @@ export async function hashSecret(value: string) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function envBoolean(name: string, fallback: boolean) {
-  try {
-    const value = (typeof process !== "undefined" ? process.env?.[name] : undefined)?.trim().toLowerCase();
-    return value ? value === "true" : fallback;
-  } catch { return fallback; }
-}
-
 function hex(bytes: Uint8Array) { return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join(""); }
 
-async function hashPassword(value: string, salt = crypto.randomUUID().replaceAll("-", "")) {
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(value), "PBKDF2", false, ["deriveBits"]);
-  const derived = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" }, key, 256);
-  return { hash: `pbkdf2$${PBKDF2_ITERATIONS}$${salt}$${hex(new Uint8Array(derived))}`, salt };
+async function hashPassword(value: string, salt?: string) {
+  return hashPasswordWithSalt(value, salt);
 }
 
 async function verifyPassword(value: string, stored: string, salt: string | null) {
@@ -64,20 +58,38 @@ export async function ensureAdminSchema() {
   await ensureTenantFoundation();
   await db.prepare("CREATE INDEX IF NOT EXISTS admin_audit_action_idx ON admin_audit_events(hotel_id, action_id, created_at, id)").run();
   const count = await db.prepare("SELECT COUNT(*) AS count FROM admin_users").first<{ count: number }>();
-  if (!envBoolean("ADMIN_DEMO_ENABLED", true)) {
-    await db.prepare("UPDATE admin_users SET enabled = 0, updated_at = ? WHERE id LIKE 'admin-%-demo'").bind(new Date().toISOString()).run();
-  }
-  if (!Number(count?.count ?? 0)) {
+  const plan = demoSeedPlan(processEnv);
+  if (!plan.enabled) {
+    if (plan.reason === "demo_accounts_disabled") {
+      await db.prepare("UPDATE admin_users SET enabled = 0, updated_at = ? WHERE id LIKE 'admin-%-demo'").bind(new Date().toISOString()).run();
+    } else if (plan.reason === "demo_password_missing") {
+      console.warn("[admin] 未创建演示管理员账号：请配置 ADMIN_DEMO_PASSWORD（或逐角色 ADMIN_DEMO_PASSWORD_<ROLE>）；代码中不再内置默认口令。");
+    }
+  } else if (!Number(count?.count ?? 0)) {
     const stamp = new Date().toISOString();
-    const password = (typeof process !== "undefined" ? process.env?.ADMIN_DEMO_PASSWORD : undefined)?.trim() || DEMO_SEED;
-    const passwordData = await hashPassword(password);
-    const users = [
-      ["admin-owner-demo", DEFAULT_HOTEL_CODE, "owner", "老板/所有者", "owner"],
-      ["admin-manager-demo", DEFAULT_HOTEL_CODE, "manager", "店长", "manager"],
-      ["admin-frontdesk-demo", DEFAULT_HOTEL_CODE, "frontdesk", "前台", "frontdesk"],
-      ["admin-housekeeping-demo", DEFAULT_HOTEL_CODE, "housekeeping", "客房", "housekeeping"],
-    ];
-    await db.batch(users.map(([id, hotel, username, display, role]) => db.prepare("INSERT INTO admin_users (id, tenant_id, hotel_id, hotel_code, username, display_name, role, password_hash, password_salt, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, DEFAULT_TENANT_ID, DEFAULT_HOTEL_ID, hotel, username, display, role, passwordData.hash, passwordData.salt, envBoolean("ADMIN_DEMO_ENABLED", true) ? 1 : 0, stamp, stamp)));
+    const hashed = await Promise.all(plan.accounts.map(async (account) => ({ account, credential: await hashPasswordWithSalt(account.password) })));
+    await db.batch(hashed.map(({ account, credential }) => db.prepare("INSERT INTO admin_users (id, tenant_id, hotel_id, hotel_code, username, display_name, role, password_hash, password_salt, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)").bind(account.id, DEFAULT_TENANT_ID, DEFAULT_HOTEL_ID, DEFAULT_HOTEL_CODE, account.username, account.displayName, account.role, credential.hash, credential.salt, stamp, stamp)));
+    if (plan.reason === "partial_demo_password") console.warn("[admin] 部分演示账号未配置独立口令，仅创建了已配置口令的账号。");
+  }
+  if (!demoCredentialsChecked) {
+    const demoRows = await db.prepare("SELECT id, password_salt FROM admin_users WHERE id LIKE 'admin-%-demo'").all<{ id: string; password_salt: string | null }>();
+    if (needsSaltRotation(demoRows.results)) {
+      const rotate: Array<{ id: string; password: string }> = [];
+      for (const row of demoRows.results) {
+        const account = ADMIN_DEMO_ACCOUNTS.find((item) => item.id === row.id);
+        const password = account ? demoPasswordFor(account, processEnv) : null;
+        if (password) rotate.push({ id: row.id, password });
+      }
+      if (rotate.length && rotate.length === demoRows.results.length) {
+        const stamp = new Date().toISOString();
+        const rotated = await Promise.all(rotate.map(async (item) => ({ id: item.id, ...(await hashPasswordWithSalt(item.password)) })));
+        await db.batch(rotated.map((item) => db.prepare("UPDATE admin_users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?").bind(item.hash, item.salt, stamp, item.id)));
+        console.warn(`[admin] 已完成 ${rotated.length} 个演示账号的口令轮换（每账号独立盐）。`);
+      } else {
+        console.warn("[admin] 检测到演示账号共用同一盐：请配置 ADMIN_DEMO_PASSWORD 后重启以完成轮换。");
+      }
+    }
+    demoCredentialsChecked = true;
   }
   await db.prepare("INSERT OR IGNORE INTO user_hotel_scopes (user_id, hotel_id, scope_role) SELECT id, hotel_id, role FROM admin_users WHERE hotel_id IS NOT NULL").run();
 }

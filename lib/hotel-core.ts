@@ -103,6 +103,28 @@ export function formalRoomId(hotelId: string, roomNumber: string) {
   return `room-${hotelId}-${roomNumber}`;
 }
 
+/**
+ * Authoritative room-type catalog. Both the legacy projection and the PMS
+ * catalog resolve through this list, so one logical room type keeps one row.
+ */
+export type RoomTypeDefinition = { code: string; name: string; pmsCode: string | null };
+
+export const ROOM_TYPE_CATALOG: readonly RoomTypeDefinition[] = [
+  { code: "STD-KING", name: "标准大床房", pmsCode: null },
+  { code: "DLX-KING", name: "高级大床房", pmsCode: "GZ-HAOS-001-DLX-KING" },
+  { code: "DLX-TWIN", name: "豪华双床房", pmsCode: "GZ-HAOS-001-DLX-TWIN" },
+];
+
+export function canonicalRoomType(value: string): RoomTypeDefinition {
+  const key = String(value ?? "").trim();
+  const found = ROOM_TYPE_CATALOG.find((item) => item.code === key || item.name === key);
+  return found ?? { code: key || "UNKNOWN", name: key || "未指定房型", pmsCode: null };
+}
+
+export function formalRoomTypeId(hotelId: string, code: string) {
+  return `rt-${hotelId}-${code}`;
+}
+
 const roomTransitions: Record<RoomStatus, readonly RoomStatus[]> = {
   [ROOM_STATUS.VACANT_CLEAN]: [ROOM_STATUS.HELD, ROOM_STATUS.OCCUPIED, ROOM_STATUS.VACANT_DIRTY, ROOM_STATUS.OUT_OF_ORDER, ROOM_STATUS.OUT_OF_SERVICE],
   [ROOM_STATUS.VACANT_DIRTY]: [ROOM_STATUS.VACANT_CLEAN, ROOM_STATUS.OUT_OF_ORDER, ROOM_STATUS.OUT_OF_SERVICE],

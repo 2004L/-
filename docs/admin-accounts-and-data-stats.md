@@ -13,20 +13,28 @@
 
 ## 2. 演示账号清单
 
-演示环境默认会创建 4 个角色账号。默认演示口令来自 `ADMIN_DEMO_PASSWORD` 环境变量；如果没有配置该环境变量，则使用统一默认口令：
+演示环境最多创建 4 个角色账号。**代码中不再内置默认口令**：只有在配置了口令来源时才会创建账号。
 
 ```text
-hotel-demo-2026
+ADMIN_DEMO_PASSWORD=<共享口令>            # 四个账号共用同一口令
+ADMIN_DEMO_PASSWORD_OWNER=<逐角色口令>     # 可选，优先于共享口令
+ADMIN_DEMO_PASSWORD_MANAGER=<逐角色口令>
+ADMIN_DEMO_PASSWORD_FRONTDESK=<逐角色口令>
+ADMIN_DEMO_PASSWORD_HOUSEKEEPING=<逐角色口令>
 ```
 
-> 生产部署必须替换 `ADMIN_DEMO_PASSWORD`，并建议将 `ADMIN_DEMO_ENABLED=false` 关闭内置演示账号。
+- 未配置任何口令来源时：不创建演示账号，并打印显式告警。
+- 生产环境（`NODE_ENV`/`ENVIRONMENT=production`）默认关闭演示账号；如需强制开启须显式设置 `ADMIN_DEMO_ENABLED=true`。
+- 每个账号使用**独立盐**与独立 PBKDF2 哈希；历史版本共用一个盐的账号会在检测到后自动轮换（需要配置上述口令之一）。
 
-| 账号 | 默认演示口令 | 显示身份 | 角色 | 主要权限 |
+> 生产部署必须使用密钥管理器注入口令，并保持 `ADMIN_DEMO_ENABLED=false`。
+
+| 账号 | 口令来源 | 显示身份 | 角色 | 主要权限 |
 | --- | --- | --- | --- | --- |
-| `owner` | `hotel-demo-2026` | 老板/所有者 | `owner` | 全部权限：查订单、查房态、换房、入住、退房、改金额、退款、设备控制、用户管理、配置管理、故障管理 |
-| `manager` | `hotel-demo-2026` | 店长 | `manager` | 查订单、查房态、换房、入住、退房、改金额、退款、设备控制、故障管理 |
-| `frontdesk` | `hotel-demo-2026` | 前台 | `frontdesk` | 查订单、查房态、换房、入住、退房 |
-| `housekeeping` | `hotel-demo-2026` | 客房 | `housekeeping` | 查房态 |
+| `owner` | `ADMIN_DEMO_PASSWORD_OWNER` 或 `ADMIN_DEMO_PASSWORD` | 老板/所有者 | `owner` | 全部权限：查订单、查房态、换房、入住、退房、改金额、退款、设备控制、用户管理、配置管理、故障管理 |
+| `manager` | `ADMIN_DEMO_PASSWORD_MANAGER` 或 `ADMIN_DEMO_PASSWORD` | 店长 | `manager` | 查订单、查房态、换房、入住、退房、改金额、退款、设备控制、故障管理 |
+| `frontdesk` | `ADMIN_DEMO_PASSWORD_FRONTDESK` 或 `ADMIN_DEMO_PASSWORD` | 前台 | `frontdesk` | 查订单、查房态、换房、入住、退房 |
+| `housekeeping` | `ADMIN_DEMO_PASSWORD_HOUSEKEEPING` 或 `ADMIN_DEMO_PASSWORD` | 客房 | `housekeeping` | 查房态 |
 
 ## 3. 权限策略统计
 
