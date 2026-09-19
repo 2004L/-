@@ -38,6 +38,13 @@
     "test:checkin-d1": "node --experimental-strip-types scripts/test-checkin-d1.mjs",
     "test:data-governance-d1": "node --experimental-strip-types scripts/test-data-governance-d1.mjs",
     "test:handoff-d1": "node --experimental-strip-types scripts/test-handoff-d1.mjs",
+    "test:ai-chain-d1": "node --experimental-strip-types scripts/test-ai-chain-d1.mjs",
+    "test:settlement-d1": "node --experimental-strip-types scripts/test-settlement-d1.mjs",
+    "test:checkin-checkout-loop": "node --experimental-strip-types scripts/test-checkin-checkout-loop.mjs",
+    "accept:guest-loop": "node scripts/acceptance-guest-loop.mjs",
+    "test:settlement-concurrency": "node --experimental-strip-types scripts/test-settlement-concurrency.mjs",
+    "test:schema-drift": "node --experimental-strip-types scripts/test-schema-drift.mjs",
+    "db:audit": "node --experimental-strip-types scripts/db-schema-audit.mjs",
     "test:asr": "node scripts/test-asr-accuracy.mjs",
     "test:security": "node scripts/check-secrets.mjs"
   },

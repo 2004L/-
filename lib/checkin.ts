@@ -3,6 +3,7 @@ import {
   confirmFormalCheckin as confirmCore,
   ensureCheckinOrder as ensureCore,
   holdFormalRoom as holdCore,
+  pickSellableRoomWith as pickRoomCore,
   projectCheckinToLegacy as projectCore,
   type CheckinOrderInput,
 } from "@/lib/checkin-core";
@@ -13,7 +14,7 @@ export async function ensureFormalCheckinOrder(input: CheckinOrderInput) {
   return ensureCore(d1SqlRunner(), input);
 }
 
-export async function holdFormalRoom(input: { tenantId: string; hotelId: string; orderNo: string; roomNumber: string; roomTypeName: string; requestId: string }) {
+export async function holdFormalRoom(input: { tenantId: string; hotelId: string; orderNo: string; roomNumber?: string | null; roomTypeName: string; requestId: string }) {
   return holdCore(d1SqlRunner(), input);
 }
 
@@ -23,6 +24,11 @@ export async function confirmFormalCheckin(input: { tenantId: string; hotelId: s
 
 export async function projectCheckinToLegacy(input: { hotelId: string; orderNo: string; status?: string; roomNumber?: string | null }) {
   return projectCore(d1SqlRunner(), input);
+}
+
+/** Which room the service would hand to this booking right now, if any. */
+export async function pickSellableRoom(input: { hotelId: string; roomTypeId: string }) {
+  return pickRoomCore(d1SqlRunner(), input);
 }
 
 export type { CheckinOrderInput } from "@/lib/checkin-core";

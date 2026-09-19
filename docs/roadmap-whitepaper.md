@@ -109,6 +109,12 @@ v1.0 是生产化导向，把「终端信任边界」和「真实硬件接入」
 
 > 这是整个计划里业务价值最高的一个阶段——它把系统从「入住机」变成「酒店系统」。
 
+**进展（2026-09-19）**：账务与离店已落地，并已接进自助终端。`lib/settlement-core.ts` + `lib/checkout-core.ts` 跑通开账、在住挂账、退房报价、结算、押金退还（反向分录）、离店、房态转脏与清洁闭环；`app/api/demo/[action]/route.ts` 新增 `checkout-lookup`（只读报价）与 `checkout-confirm`（房态与账务分开写，结算失败返回 202 `needs_followup` 转前台）；`app/page.tsx` 首屏改为「办理入住 / 办理退房」两个入口。退出门槛中「账实相符」「重复结算/重复退款被幂等拦截」「并发退房只推进一次」「一笔订单从入住跑到房态回可售」均已由真实 D1 用例覆盖（结算 35 项、并发 22 项、入住到退房闭环 25 项，见 `scripts/test-checkin-checkout-loop.mjs`）。**未完成**：发票开具、`payments` 正式化、把 A2 动作注册进 `workflow_runs` 供 AI 调用。详见 `docs/settlement-folio.md`。
+
+> 闭环用例上线即查出一个真 bug：`findInHouseStaysWith` 把 D1 返回的下划线字段当驼峰字段用（`stayId` / `guestNameMasked` 全是 `undefined`），终端退房会一路撞到 `invalid_stay_id`。已改为显式行映射，并由该用例锁死。
+
+> 顺带修掉一个 A0 尾巴：新增 `scripts/test-schema-drift.mjs` 与 `pnpm db:audit`，前者证明 20 张运行时 DDL 表与 5 个补列都被迁移覆盖，后者查出本地库缺 `orders` 表与 `admin_audit_events.action_id` 列——根因是没有任何环节执行迁移，本地库靠运行时 bootstrap 长出来。`action_id` 是活 bug，已按守护式补列范式修复。
+
 ### A3　在住服务闭环（2 周）
 
 | 项 | 内容 |

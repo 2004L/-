@@ -27,6 +27,11 @@ const suites = [
   ["checkin-d1", [STRIP_TYPES], "test-checkin-d1.mjs"],
   ["data-governance-d1", [STRIP_TYPES], "test-data-governance-d1.mjs"],
   ["handoff-d1", [STRIP_TYPES], "test-handoff-d1.mjs"],
+  ["ai-chain-d1", [STRIP_TYPES], "test-ai-chain-d1.mjs"],
+  ["settlement-d1", [STRIP_TYPES], "test-settlement-d1.mjs"],
+  ["checkin-checkout-loop", [STRIP_TYPES], "test-checkin-checkout-loop.mjs"],
+  ["settlement-concurrency", [STRIP_TYPES], "test-settlement-concurrency.mjs"],
+  ["schema-drift", [STRIP_TYPES], "test-schema-drift.mjs"],
 ];
 
 const failures = [];

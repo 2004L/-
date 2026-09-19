@@ -30,6 +30,44 @@ export const STAY_STATUS = {
 } as const;
 
 /**
+ * Guest account state. A folio is opened when the stay starts and is only
+ * closed once money has actually moved, which is why "checked out" and
+ * "settled" are two different facts.
+ */
+export const FOLIO_STATUS = {
+  OPEN: "open",
+  SETTLING: "settling",
+  CLOSED: "closed",
+} as const;
+
+/**
+ * Ledger entry kinds. Only these six may be written; anything else is a code
+ * smell rather than a business event.
+ */
+export const LEDGER_ENTRY_TYPES = {
+  DEPOSIT: "deposit",
+  ROOM_CHARGE: "room_charge",
+  CONSUMPTION: "consumption",
+  SETTLEMENT: "settlement",
+  REFUND: "refund",
+  ADJUSTMENT: "adjustment",
+} as const;
+
+/**
+ * Direction each entry kind moves the guest balance. `1` increases what the
+ * guest owes, `-1` records money already received, `0` means the caller passes
+ * an already signed amount (only `adjustment` is allowed to do that).
+ */
+export const LEDGER_ENTRY_SIGNS: Record<LedgerEntryType, 1 | -1 | 0> = {
+  [LEDGER_ENTRY_TYPES.ROOM_CHARGE]: 1,
+  [LEDGER_ENTRY_TYPES.CONSUMPTION]: 1,
+  [LEDGER_ENTRY_TYPES.REFUND]: 1,
+  [LEDGER_ENTRY_TYPES.DEPOSIT]: -1,
+  [LEDGER_ENTRY_TYPES.SETTLEMENT]: -1,
+  [LEDGER_ENTRY_TYPES.ADJUSTMENT]: 0,
+};
+
+/**
  * Commercial order state. An order owns money and the commercial lifecycle;
  * it is deliberately independent from the reservation (stay) state machine.
  */
@@ -44,6 +82,9 @@ export const ORDER_STATUS = {
 export type RoomStatus = (typeof ROOM_STATUS)[keyof typeof ROOM_STATUS];
 export type ReservationStatus = (typeof RESERVATION_STATUS)[keyof typeof RESERVATION_STATUS];
 export type OrderStatus = (typeof ORDER_STATUS)[keyof typeof ORDER_STATUS];
+export type StayStatus = (typeof STAY_STATUS)[keyof typeof STAY_STATUS];
+export type FolioStatus = (typeof FOLIO_STATUS)[keyof typeof FOLIO_STATUS];
+export type LedgerEntryType = (typeof LEDGER_ENTRY_TYPES)[keyof typeof LEDGER_ENTRY_TYPES];
 
 const orderTransitions: Record<OrderStatus, readonly OrderStatus[]> = {
   [ORDER_STATUS.PENDING_PAYMENT]: [ORDER_STATUS.PAID, ORDER_STATUS.CANCELLED],
@@ -157,6 +198,38 @@ export function canTransitionReservation(from: ReservationStatus, to: Reservatio
 
 export function assertReservationTransition(from: ReservationStatus, to: ReservationStatus) {
   if (!canTransitionReservation(from, to)) throw new Error(`invalid_reservation_transition:${from}->${to}`);
+}
+
+const folioTransitions: Record<FolioStatus, readonly FolioStatus[]> = {
+  [FOLIO_STATUS.OPEN]: [FOLIO_STATUS.SETTLING, FOLIO_STATUS.CLOSED],
+  [FOLIO_STATUS.SETTLING]: [FOLIO_STATUS.CLOSED, FOLIO_STATUS.OPEN],
+  [FOLIO_STATUS.CLOSED]: [],
+};
+
+export function canTransitionFolio(from: FolioStatus, to: FolioStatus) {
+  return from === to || folioTransitions[from].includes(to);
+}
+
+export function assertFolioTransition(from: FolioStatus, to: FolioStatus) {
+  if (!canTransitionFolio(from, to)) throw new Error(`invalid_folio_transition:${from}->${to}`);
+}
+
+/**
+ * Which folio states are acceptable for a given stay state. `CHECKED_OUT`
+ * accepts both `settling` and `closed` on purpose: leaving the room and
+ * finishing the money are separate events, so a checked-out stay that still
+ * owes a refund is compliant, while a checked-out stay with an `open` folio is
+ * not.
+ */
+export const STAY_STATUS_ALLOWED_FOLIO_STATUS: Record<StayStatus, readonly FolioStatus[] | null> = {
+  [STAY_STATUS.IDENTITY_PENDING]: null,
+  [STAY_STATUS.IDENTITY_VERIFIED]: null,
+  [STAY_STATUS.IN_HOUSE]: [FOLIO_STATUS.OPEN, FOLIO_STATUS.SETTLING],
+  [STAY_STATUS.CHECKED_OUT]: [FOLIO_STATUS.SETTLING, FOLIO_STATUS.CLOSED],
+};
+
+export function allowedFolioStatusForStay(status: StayStatus): readonly FolioStatus[] | null {
+  return STAY_STATUS_ALLOWED_FOLIO_STATUS[status] ?? null;
 }
 
 export type PmsOrder = {

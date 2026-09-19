@@ -22,7 +22,7 @@ const additiveColumns: Array<[string, string]> = [
   ["walk_in_drafts", "tenant_id TEXT"], ["walk_in_drafts", "hotel_id TEXT"],
   ["walk_in_payments", "tenant_id TEXT"], ["walk_in_payments", "hotel_id TEXT"],
   ["admin_users", "tenant_id TEXT"], ["admin_users", "hotel_id TEXT"],
-  ["admin_audit_events", "tenant_id TEXT"], ["admin_audit_events", "hotel_id TEXT"], ["admin_audit_events", "request_id TEXT"],
+  ["admin_audit_events", "tenant_id TEXT"], ["admin_audit_events", "hotel_id TEXT"], ["admin_audit_events", "request_id TEXT"], ["admin_audit_events", "action_id TEXT"],
   ["admin_actions", "tenant_id TEXT"], ["admin_actions", "hotel_id TEXT"], ["admin_actions", "workflow_id TEXT"],
   ["ai_request_metrics", "tenant_id TEXT"], ["ai_request_metrics", "hotel_id TEXT"],
 ];
