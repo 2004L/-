@@ -154,6 +154,8 @@ type IntentResponse = Partial<MatchResponse> & {
 
 type IntentEnvelopeView = { intent: string; intent_class: "hotel" | "general"; entities: Record<string, string | number | null>; missing_fields: string[]; next_action: string; risk: "none" | "low" | "medium" | "high"; requires_confirmation: boolean; confidence: number; source: "model" | "rule_fallback" | "safety_guard" };
 type AgentResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; implementation: "business_api" | "simulator"; response_hint?: string; intent_envelope?: IntentEnvelopeView } | { type: "clarification"; message: string; intent: string; confidence: number; intent_envelope?: IntentEnvelopeView } | { type: "assistant_message"; message: string; intent_envelope?: IntentEnvelopeView };
+
+const fullPhoneFromText = (text: string) => text.match(/1[3-9]\d{9}/)?.[0] ?? null;
 type AdminResponse = { type: "tool_call"; tool_call_id: string; tool_name: string; arguments: Record<string, unknown>; response_hint?: string; workflow?: { kind: "room_change"; target_room: string; stage: "guest_search" }; intent_envelope?: IntentEnvelopeView } | { type: "clarification"; message: string; intent: string; confidence: number; intent_envelope?: IntentEnvelopeView } | { type: "assistant_message"; message: string; intent_envelope?: IntentEnvelopeView };
 type AgentHistoryMessage = { role: "user" | "assistant" | "tool"; content: string };
 type TranscriptEntry = { id: string; role: "user" | "assistant" | "tool"; content: string };
@@ -1002,6 +1004,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [depositAmount, setDepositAmount] = useState<number | null>(null);
   const [alternatives, setAlternatives] = useState<DemoOrder[]>([]);
   const [walkInDraft, setWalkInDraft] = useState<WalkInDraft | null>(null);
+  const [pendingWalkInPhone, setPendingWalkInPhone] = useState<string | null>(null);
   const [walkInRoomTypes, setWalkInRoomTypes] = useState<WalkInRoomType[]>([]);
   const [walkInPayment, setWalkInPayment] = useState<WalkInPayment | null>(null);
   const [message, setMessage] = useState("您好，今天想办理什么？");
@@ -1082,6 +1085,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setDepositAmount(null);
     setAlternatives([]);
     setWalkInDraft(null);
+    setPendingWalkInPhone(null);
     setWalkInRoomTypes([]);
     setWalkInPayment(null);
     setIntentTrace(null);
@@ -1480,7 +1484,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       recordConversation("user", normalized);
       const messages = conversationRef.current.slice(-24);
       let streamedText = "";
-      const agent = await postAgentStream({ session_id: sessionId, conversation_id: conversationId || sessionId, case_id: checkinCase?.id, walk_in_draft_id: walkInDraft?.id, walk_in_draft_status: walkInDraft?.status, messages }, (delta) => {
+      const agent = await postAgentStream({ session_id: sessionId, conversation_id: conversationId || sessionId, case_id: checkinCase?.id, walk_in_draft_id: walkInDraft?.id, walk_in_draft_status: walkInDraft?.status, pending_walk_in_phone: pendingWalkInPhone ?? undefined, messages }, (delta) => {
         streamedText += delta;
         setMessage(streamedText);
       });
@@ -1488,6 +1492,10 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       if (agent.intent_envelope) setIntentTrace({ label: agent.intent_envelope.intent, confidence: agent.intent_envelope.confidence, action: agent.intent_envelope.next_action });
       if (agent.type === "clarification") {
         recordConversation("assistant", agent.message);
+        const detectedPhone = fullPhoneFromText(normalized) ?? fullPhoneFromText(agent.message);
+        if (agent.intent_envelope?.requires_confirmation || detectedPhone) {
+          if (detectedPhone) setPendingWalkInPhone(detectedPhone);
+        }
         setIntentTrace({ label: "需要澄清", confidence: agent.confidence, action: "clarification" });
         setPhase("idle");
         setMessage(agent.message);
@@ -1526,6 +1534,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       } else if (agent.tool_name === "pms.create_walk_in_draft") {
         const phoneNumber = String(agent.arguments.phone_number ?? "");
         const draftResult = await postDemo<{ draft: WalkInDraft; room_types: WalkInRoomType[] }>("walk-in-draft", { session_id: sessionId, phone_number: phoneNumber, idempotency_key: `walk-in-draft:${sessionId}:${phoneNumber.slice(-4)}` });
+        setPendingWalkInPhone(null);
         setWalkInDraft(draftResult.draft);
         setWalkInRoomTypes(draftResult.room_types ?? []);
         setWalkInPayment(null);

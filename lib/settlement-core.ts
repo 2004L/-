@@ -56,6 +56,8 @@ export const FOLIOS_DDL: string[] = [
   "CREATE INDEX IF NOT EXISTS payments_hotel_stay_idx ON payments(hotel_id, stay_id, created_at)",
   "CREATE TABLE IF NOT EXISTS refunds (id TEXT PRIMARY KEY NOT NULL, tenant_id TEXT NOT NULL, hotel_id TEXT NOT NULL, payment_id TEXT NOT NULL, stay_id TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'CNY', status TEXT NOT NULL, idempotency_key TEXT NOT NULL, provider TEXT NOT NULL, provider_ref TEXT, failure_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (hotel_id, idempotency_key))",
   "CREATE INDEX IF NOT EXISTS refunds_hotel_stay_idx ON refunds(hotel_id, stay_id, created_at)",
+  "CREATE TABLE IF NOT EXISTS checkout_tasks (id TEXT PRIMARY KEY NOT NULL, tenant_id TEXT NOT NULL, hotel_id TEXT NOT NULL, session_id TEXT NOT NULL, stay_id TEXT NOT NULL, request_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (hotel_id, stay_id, request_id))",
+  "CREATE INDEX IF NOT EXISTS checkout_tasks_hotel_status_idx ON checkout_tasks(hotel_id, status, updated_at)",
 ];
 
 export const PAYMENT_STATUS = { PENDING: "pending", CAPTURED: "captured", FAILED: "failed" } as const;

@@ -51,7 +51,9 @@ export async function POST(request: Request) {
     }
     const recentHistory = input.messages.slice(-6).map((message) => message.content).join(" ");
     const pendingWalkIn = !input.walk_in_draft_id && /(现场(?:办理|入住|预订)|没有?预订|直接(?:入住|住)|walk[- ]?in)/i.test(recentHistory);
-    const pendingWalkInPhone = pendingWalkIn ? extractPhoneNumber(recentHistory) ?? undefined : undefined;
+    // The browser owns the currently confirmed candidate. Never reconstruct it
+    // from conversation history: an old number must not survive a correction.
+    const pendingWalkInPhone = input.pending_walk_in_phone;
     const ruleResult = routeIntent(latest.content, { case_id: input.case_id, pending_walk_in: pendingWalkIn, pending_walk_in_phone: pendingWalkInPhone, walk_in_draft_id: input.walk_in_draft_id, walk_in_draft_status: input.walk_in_draft_status });
     const recordTurn = async (result: AgentResult, source: IntentSource) => {
       try {

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { runDeviceCommand } from "@/lib/device-commands";
 import { toResponse } from "@/lib/simulator";
+import { createAndProcessCheckoutTask } from "@/lib/checkout-task";
 
 export const runtime = "edge";
 
@@ -29,7 +30,10 @@ export async function POST(request: Request) {
       successDetail: `收卡器已收纳 ${input.room_number} 房卡并放入 returner-bin-01`,
       faultEvent: "KEYCARD_RETURN_FAULT_INJECTED",
     });
-    return Response.json(toResponse(outcome.record));
+    const response = toResponse(outcome.record);
+    if (!response.ok || !response.result?.collected) return Response.json(response);
+    const task = await createAndProcessCheckoutTask({ sessionId: input.session_id, stayId: input.case_id, requestId: `${input.session_id}:${input.case_id}:checkout` });
+    return Response.json({ ...response, checkout_task: { id: task.task_id, status: task.status, error: task.error ?? null }, checkout: task.checkout ? { settlement: task.checkout.settlement.settled, folio_status: task.checkout.settlement.folio.status, refund_status: task.checkout.settlement.refund?.status ?? null, refund_provider_ref: task.checkout.settlement.refund?.provider_ref ?? null } : null });
   } catch (error) {
     return Response.json({ ok: false, error: error instanceof Error ? error.message : "invalid_request" }, { status: 400 });
   }

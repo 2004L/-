@@ -266,25 +266,14 @@ export function TerminalCheckoutPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, case_id: stay.stay_id, idempotency_key: `${sessionId}:card-return:${stay.stay_id}`, expected_state: "CHECKED_IN", device_id: "card-returner-demo-01", room_number: stay.room_number }),
       });
-      const data = (await response.json().catch(() => ({}))) as { ok?: boolean; result?: { storage_bin?: string }; error?: string };
+      const data = (await response.json().catch(() => ({}))) as { ok?: boolean; result?: { storage_bin?: string }; checkout?: { settlement?: number; folio_status?: string; refund_status?: string | null; refund_provider_ref?: string | null } | null; checkout_task?: { status?: string }; error?: string };
       if (!response.ok || !data.ok) throw new Error(data.error ?? "card_return_failed");
       setCardStorage(data.result?.storage_bin ?? "returner-bin-01");
       setCardPhase("collected");
       setPhase("done");
-      const stayId = stay.stay_id;
-      if (backgroundSettlementRef.current !== stayId) {
-        backgroundSettlementRef.current = stayId;
-        void post<{ outcome: string; settlement?: number; folio_status?: string; refund_status?: string | null; refund_provider_ref?: string | null }>("checkout-confirm", {
-          stay_id: stayId,
-          request_id: `${sessionId}:${stayId}:checkout:${Date.now()}`,
-        }).then((result) => {
-          setReceipt({ settlement: result.settlement ?? 0, folioStatus: result.folio_status ?? "closed", refundStatus: result.refund_status ?? null, refundProviderRef: result.refund_provider_ref ?? null });
-          void onFinished();
-        }).catch(() => {
-          // 客人已经完成收卡，结算失败交给后台待处理，不让客人在终端等待。
-          void onFinished();
-        });
-      }
+      if (data.checkout) setReceipt({ settlement: data.checkout.settlement ?? 0, folioStatus: data.checkout.folio_status ?? "closed", refundStatus: data.checkout.refund_status ?? null, refundProviderRef: data.checkout.refund_provider_ref ?? null });
+      // 收卡接口已经在服务端创建并执行幂等结算任务；浏览器断开不会丢失任务。
+      void onFinished();
     } catch (caught) {
       setCardPhase("failed");
       setError("没有检测到房卡，请把房卡插入收卡器后重试。" + (caught instanceof Error && caught.message ? `（${caught.message}）` : ""));

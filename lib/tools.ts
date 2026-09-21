@@ -28,6 +28,7 @@ export const agentTurnSchema = z.object({
   case_id: z.string().min(8).max(80).optional(),
   walk_in_draft_id: z.string().min(8).max(100).optional(),
   walk_in_draft_status: z.enum(["DRAFT", "QUOTED", "AWAITING_PAYMENT", "ORDER_CREATED"]).optional(),
+  pending_walk_in_phone: z.string().regex(/^1[3-9]\d{9}$/).optional(),
 }).strict();
 
 export type ToolName = (typeof toolNames)[number];
