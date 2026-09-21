@@ -75,7 +75,7 @@ export function buildIntentEnvelope(result: ToolCall | Clarification | Assistant
       missing_fields: [],
       next_action: "clarify",
       risk: hotel ? "medium" : "none",
-      requires_confirmation: false,
+      requires_confirmation: result.requires_confirmation === true,
       confidence: result.confidence,
       source,
     };

@@ -37,6 +37,16 @@ const cases = [
     assert: (result) => result.type === "tool_call" && result.tool_name === "hotel.policy_answer" && result.arguments.topic === "breakfast",
   },
   {
+    id: "checkout-starts-card-return",
+    result: routeIntent("退房"),
+    assert: (result) => result.type === "tool_call" && result.tool_name === "pms.start_checkout",
+  },
+  {
+    id: "checkout-time-remains-policy",
+    result: routeIntent("几点退房？"),
+    assert: (result) => result.type === "tool_call" && result.tool_name === "hotel.policy_answer" && result.arguments.topic === "checkout",
+  },
+  {
     id: "non-hotel-question-remains-natural",
     result: routeIntent("帮我写一段 C 语言 Hello World"),
     assert: (result) => result.type === "assistant_message" && result.message.includes("#include"),

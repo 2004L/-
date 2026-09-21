@@ -30,6 +30,9 @@ function reconcileAgentResult(modelResult: AgentResult | null, fallbackResult: A
   // A model refusal or empty natural-language answer must not hide a hotel action.
   // In that case the validated rule result is a controlled fallback, never a direct DB write.
   if (modelResult.type === "assistant_message" && fallbackResult.type === "tool_call") return { result: fallbackResult, source: "rule_fallback" };
+  if (modelResult.type === "clarification" && fallbackResult.type === "clarification" && fallbackResult.requires_confirmation) {
+    return { result: { ...modelResult, requires_confirmation: true }, source: "model" };
+  }
   return { result: modelResult, source: "model" };
 }
 

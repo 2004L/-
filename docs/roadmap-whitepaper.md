@@ -109,13 +109,17 @@ v1.0 是生产化导向，把「终端信任边界」和「真实硬件接入」
 
 > 这是整个计划里业务价值最高的一个阶段——它把系统从「入住机」变成「酒店系统」。
 
-**进展（2026-09-19）**：账务与离店已落地，并已接进自助终端。`lib/settlement-core.ts` + `lib/checkout-core.ts` 跑通开账、在住挂账、退房报价、结算、押金退还（反向分录）、离店、房态转脏与清洁闭环；`app/api/demo/[action]/route.ts` 新增 `checkout-lookup`（只读报价）与 `checkout-confirm`（房态与账务分开写，结算失败返回 202 `needs_followup` 转前台）；`app/page.tsx` 首屏改为「办理入住 / 办理退房」两个入口。退出门槛中「账实相符」「重复结算/重复退款被幂等拦截」「并发退房只推进一次」「一笔订单从入住跑到房态回可售」均已由真实 D1 用例覆盖（结算 35 项、并发 22 项、入住到退房闭环 25 项，见 `scripts/test-checkin-checkout-loop.mjs`）。**未完成**：发票开具、`payments` 正式化、把 A2 动作注册进 `workflow_runs` 供 AI 调用。详见 `docs/settlement-folio.md`。
+**进展（2026-09-19）**：账务与离店已落地，并已接进自助终端。`lib/settlement-core.ts` + `lib/checkout-core.ts` 跑通开账、在住挂账、退房报价、结算、押金退还（反向分录）、离店、房态转脏与清洁闭环；`app/api/demo/[action]/route.ts` 新增 `checkout-lookup`（只读报价）与 `checkout-confirm`（房态与账务分开写，结算失败返回 202 `needs_followup` 转前台）；`app/page.tsx` 首屏改为「办理入住 / 办理退房」两个入口。退出门槛中「账实相符」「重复结算/重复退款被幂等拦截」「并发退房只推进一次」「一笔订单从入住跑到房态回可售」均已由真实 D1 用例覆盖（结算 35 项、并发 22 项、入住到退房闭环 40 项，见 `scripts/test-checkin-checkout-loop.mjs`）。真实 HTTP 端到端验收 `scripts/acceptance-guest-loop.mjs`（30 项，`pnpm accept:guest-loop`）在全新库与演示库上均已跑通。**未完成**：发票开具、`payments` 正式化、把 A2 动作注册进 `workflow_runs` 供 AI 调用。详见 `docs/settlement-folio.md`。
 
 > 闭环用例上线即查出一个真 bug：`findInHouseStaysWith` 把 D1 返回的下划线字段当驼峰字段用（`stayId` / `guestNameMasked` 全是 `undefined`），终端退房会一路撞到 `invalid_stay_id`。已改为显式行映射，并由该用例锁死。
+>
+> 验收又追出三个问题并已修复：**空库从未跑迁移**（`no such table: demo_sessions`）、**入住写死 1208**（演示库里 1208 是脏房，锁房失败又被同步层静默吞掉，退房查不到人）、**`reservation_rooms` 重复行**（一个预订两行房价，报价把房费算成两倍）。前两个的根因都是「房态关键步骤允许静默降级」，已改为失败即写 `FORMAL_SYNC_FAILED` 审计并转人工；重复行由 `drizzle/0016_reservation_rooms_dedupe.sql` + 两个写入方的 `AND NOT EXISTS` + 报价端 `rateRowMismatch` 守卫三处收口。详见 `docs/settlement-folio.md` 第 8.1 节。
 
 > 顺带修掉一个 A0 尾巴：新增 `scripts/test-schema-drift.mjs` 与 `pnpm db:audit`，前者证明 20 张运行时 DDL 表与 5 个补列都被迁移覆盖，后者查出本地库缺 `orders` 表与 `admin_audit_events.action_id` 列——根因是没有任何环节执行迁移，本地库靠运行时 bootstrap 长出来。`action_id` 是活 bug，已按守护式补列范式修复。
 
 ### A3　在住服务闭环（2 周）
+
+> 进展（2026-09-19）：房态清洁这一半已经闭环——客人退房把房间变成待清洁，客房在管理后台点「打扫完成，改为可售」把房间放回售卖，中间每一次转移都有房态流水和管理员审计。`admin.mark_room_clean` 是唯一不需要确认弹窗的写操作：只能做 `VACANT_DIRTY → VACANT_CLEAN`、可逆，占用中或已锁定的房间会被房态机拒绝（前台角色刻意没有这个权限）。**未完成**：续住、换房下沉为通用服务、报修工单、客房服务请求、发票补开，以及「待清洁房列表」。
 
 | 项 | 内容 |
 | --- | --- |
@@ -184,6 +188,9 @@ v1.0 是生产化导向，把「终端信任边界」和「真实硬件接入」
 | A3 | `housekeeping.request` | 客房服务 |
 | A3 | `maintenance.report` | 报修 |
 | A3 | `folio.add_charge` | 在住消费挂账 |
+| A3 | `room.mark_clean` | 客房打扫完成，脏房回到可售（已落地为 `admin.mark_room_clean`） |
+| A3 | `data.purge_closed_loops` | 按时间范围清理已退房闭环（已落地为 `admin.prepare_purge_closed_loops`，需确认单） |
+| A3 | `data.browse_tables` / `stay.list_in_house` / `room.set_service_need` | 数据库浏览、在住客人看板、服务需求登记（已落地为 `admin.get_database_schema` / `admin.get_table_rows` / `admin.list_in_house_guests` / `admin.set_room_service_need`） |
 | A4 | `room.get_status` | 房态查询 |
 | A4 | `pricing.quote_upgrade` | 升房报价与销售 |
 | A4 | `order.cancel` | 取消与退款 |

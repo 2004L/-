@@ -5,6 +5,8 @@ import { confirmFormalCheckin, ensureFormalCheckinOrder, holdFormalRoom, project
 import { checkinCommandKey, runDeviceCommand } from "@/lib/device-commands";
 import { ORDER_STATUS, RESERVATION_STATUS } from "@/lib/hotel-core";
 import { checkoutAndSettle, ensureStayFolio, findCheckoutCandidates, markRoomClean, quoteCheckout, verifyStayFolio, type StayCandidate } from "@/lib/folio";
+import { demoOrderReconcileAllStatement } from "@/lib/legacy-projection-core";
+import { askKnowledge, policyQuery } from "@/lib/knowledge";
 import { syncPmsRoomCatalog } from "@/lib/pms-core-sync";
 import { DEFAULT_HOTEL_CODE, DEFAULT_HOTEL_ID, DEFAULT_TENANT_ID, ensureTenantFoundation } from "@/lib/tenant";
 
@@ -164,11 +166,29 @@ function handoffReply(reason: string) {
   return { required: true as const, department: "front_desk", reason: ROOM_FAULT_TEXT[reason] ?? "房间状态异常，需要前台处理", error_code: reason };
 }
 
-async function projectFormal(scope: DemoOrderScope, orderNo: string, patch: { status?: string; roomNumber?: string | null }) {
+async function projectFormal(sessionId: string, scope: DemoOrderScope, orderNo: string, patch: { status?: string; roomNumber?: string | null }) {
   try {
-    await projectCheckinToLegacy({ hotelId: scope.hotelId, orderNo, ...patch });
+    await projectCheckinToLegacy({ hotelId: scope.hotelId, sessionId, orderNo, ...patch });
   } catch (error) {
     console.warn(`[checkin][projection] ${orderNo} failed: ${error instanceof Error ? error.message : "unknown_error"}`);
+  }
+}
+
+/**
+ * Pull the demo copies back in line with the bookings, for every session of the
+ * hotel. The booking itself is shared — one order number is one booking — so the
+ * truth has to reach every copy, not just the one that happened to be open. Sessions
+ * nobody opens again would otherwise keep offering an order the hotel already sold.
+ * Only pairs that cannot describe the same guest are rewritten, so a session that is
+ * midway through a check-in is left alone.
+ */
+async function reconcileDemoOrders(sessionId: string) {
+  const scope = await sessionScope(sessionId);
+  const statement = demoOrderReconcileAllStatement({ hotelId: scope.hotelId, stamp: now() });
+  try {
+    await getD1().prepare(statement.sql).bind(...statement.params).run();
+  } catch (error) {
+    console.warn(`[checkin][projection] reconcile ${sessionId} failed: ${error instanceof Error ? error.message : "unknown_error"}`);
   }
 }
 
@@ -257,11 +277,14 @@ function classifyIntent(utterance: string): { intent: string; label: string; con
   if (/(停车|停车场|车位)/.test(utterance)) {
     return { intent: "hotel_policy", label: "咨询停车", confidence: 0.98, action: "rag_answer", last4, answer: "酒店提供停车服务。正式接入后，我会根据门店政策说明位置、费用和入场方式。" };
   }
+  if (/(退房时间|几点退房|延迟退房|晚点退)/.test(utterance)) {
+    return { intent: "hotel_policy", label: "咨询退房政策", confidence: 0.97, action: "rag_answer", last4, answer: "正式系统会读取订单对应的退房时间；如需延迟退房，我会先查询当天房态和酒店政策。" };
+  }
+  if (/(退房|离店|我要走了|准备走了|退卡|归还房卡)/.test(utterance)) {
+    return { intent: "checkout", label: "办理退房", confidence: 0.99, action: "start_checkout", last4 };
+  }
   if (/(押金|微信|支付宝|怎么付|支付)/.test(utterance)) {
     return { intent: "payment_policy", label: "咨询支付与押金", confidence: 0.96, action: "rag_answer", last4, answer: "押金和支付方式以当前酒店政策为准。系统会在身份与房态核验后展示微信或支付宝付款页面，不会由AI自行修改金额。" };
-  }
-  if (/(退房|几点退)/.test(utterance)) {
-    return { intent: "hotel_policy", label: "咨询退房", confidence: 0.97, action: "rag_answer", last4, answer: "正式系统会读取订单对应的退房时间；如需延迟退房，我会先查询当天房态和酒店政策。" };
   }
   if (/(没预订|没有预订|现场办理|直接住|到店住)/.test(utterance)) {
     return { intent: "walk_in", label: "现场入住", confidence: 0.96, action: last4 ? "prepare_walk_in" : "collect_phone_last4", last4 };
@@ -269,7 +292,9 @@ function classifyIntent(utterance: string): { intent: string; label: string; con
   if (last4 || /(预订|订了|订房|入住|住店|美团|抖音|携程|官网)/.test(utterance)) {
     return { intent: "query_reservation", label: "查询预订", confidence: last4 ? 0.98 : 0.92, action: last4 ? "search_order" : "collect_phone_last4", last4 };
   }
-  return { intent: "general_assistance", label: "一般咨询", confidence: 0.72, action: "clarify_intent", last4 };
+    if (/(吗|呢|怎么|多少|几点|能不能|可以|有没有|是否|什么样|哪些|哪里)/.test(utterance)) {
+    return { intent: "hotel_policy", label: "咨询门店政策", confidence: 0.9, action: "rag_answer", last4, answer: "正在查门店知识库…" };
+  }return { intent: "general_assistance", label: "一般咨询", confidence: 0.72, action: "clarify_intent", last4 };
 }
 
 async function readBody(request: Request) {
@@ -330,6 +355,7 @@ async function seedSession(sessionId: string) {
       reservationStatus: cancelled ? RESERVATION_STATUS.CANCELLED : undefined,
     });
   })));
+  await reconcileDemoOrders(sessionId);
 }
 
 async function snapshot(sessionId: string) {
@@ -488,9 +514,11 @@ async function matchOrder(sessionId: string, phoneLast4: string, source?: string
       : await db.prepare("SELECT id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number FROM demo_orders WHERE session_id = ? AND phone_last4 = ? ORDER BY updated_at DESC").bind(sessionId, phoneLast4).all<Record<string, unknown>>();
     const outcome = historical.results.some((item) => item.status === "in_house")
       ? "already_checked_in"
-      : historical.results.some((item) => item.status === "cancelled")
-        ? "cancelled"
-        : "not_found";
+      : historical.results.some((item) => item.status === "checked_out")
+        ? "checked_out"
+        : historical.results.some((item) => item.status === "cancelled")
+          ? "cancelled"
+          : "not_found";
     await audit(sessionId, null, "ORDER_MATCH_BLOCKED", null, outcome.toUpperCase(), `末四位 ${phoneLast4} 未找到可办理订单`);
     return { outcome, orders: historical.results };
   }
@@ -610,6 +638,15 @@ export async function POST(request: Request, context: RouteContext) {
       const safeExpression = redactUtterance(utterance);
       await audit(sessionId, null, "INTENT_RECOGNIZED", null, classified.intent.toUpperCase(), `表达：“${safeExpression}” → 意图：${classified.label} → 置信度：${Math.round(classified.confidence * 100)}% → 动作：${classified.action}`);
 
+      if (classified.action === "rag_answer") {
+        // 政策回答不再来自代码里的字符串，而是来自当前门店的知识库：命中要带出处，命中不到就转人工。
+        const knowledgeScope = await sessionScope(sessionId);
+        const knowledge = await askKnowledge({ hotelId: knowledgeScope.hotelId, query: utterance.slice(0, 120), allow: ["guest"] });
+        const answer = knowledge.answer ?? "这个我暂时没有可靠依据（门店知识库里没查到），已记录并转前台确认。";
+        await audit(sessionId, null, "KNOWLEDGE_ANSWERED", classified.intent.toUpperCase(), knowledge.needsHandoff ? "HANDOFF" : "ANSWERED",
+          knowledge.needsHandoff ? `门店政策未命中：“${safeExpression}”` : `门店政策命中：${knowledge.citations.map((citation) => `${citation.title} v${citation.version}`).join("、")}`);
+        return json({ ...classified, answer, citations: knowledge.citations, needs_handoff: knowledge.needsHandoff, assistantMessage: answer });
+      }
       if (classified.intent === "query_reservation" && classified.last4) {
         const match = await matchOrder(sessionId, classified.last4);
         return json({ ...classified, phone_last4: classified.last4, assistantMessage: "我已经理解您的入住需求，正在查询订单。", ...match });
@@ -790,7 +827,7 @@ export async function POST(request: Request, context: RouteContext) {
           return json({ checkinCase: handed, handoff: handoffReply(held.reason) });
         }
         const updated = await transition({ sessionId, caseId: current.id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail: `已锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`, fields: { roomNumber: held.value.roomNumber } });
-        await projectFormal(scope, ref.orderCode, { roomNumber: held.value.roomNumber });
+        await projectFormal(sessionId, scope, ref.orderCode, { roomNumber: held.value.roomNumber });
         return json({ checkinCase: updated });
       }
       const roomNumber = requestedRoom ?? current.room_number ?? "1208";
@@ -840,9 +877,16 @@ export async function POST(request: Request, context: RouteContext) {
           const handed = await requireHandoff(sessionId, current.id, `入住确认失败：${confirmed.reason}，已转人工接手`);
           return json({ checkinCase: handed, handoff: handoffReply(confirmed.reason) });
         }
+        const folioResult = await requireFormal(sessionId, current.id, "capture-deposit", () => ensureStayFolio({ hotelId: scope.hotelId, stayId: `stay-${confirmed.value.reservationId}`, requestId: `${sessionId}:${current.id}:deposit`, }));
+        if (!folioResult.ok) {
+          const handed = await requireHandoff(sessionId, current.id, `押金收款未确认：${folioResult.reason}，已转人工接手`);
+          return json({ checkinCase: handed, handoff: handoffReply(folioResult.reason) });
+        }
+        const folio = folioResult.value;
         const updated = await transition({ sessionId, caseId: current.id, expected: "POLICE_COMPLETED", next: "PMS_CHECKIN_CONFIRMED", eventType: "PMS_CHECKIN_CONFIRMED", detail: "正式入住已确认：预订、入住记录与房态同时更新" });
-        await projectFormal(scope, ref.orderCode, { status: "checkin_confirmed", roomNumber: current.room_number });
-        return json({ checkinCase: updated });
+        await projectFormal(sessionId, scope, ref.orderCode, { status: "checkin_confirmed", roomNumber: current.room_number });
+        await audit(sessionId, current.id, "DEPOSIT_CAPTURED", null, "CAPTURED", `入住时已收押金 ${folio.depositAmount} 分，支付适配器回执已保存`);
+        return json({ checkinCase: updated, folio_status: folio.folio.status, deposit_amount: folio.depositAmount, deposit_payment_status: "captured" });
       }
       const updated = await transition({ sessionId, caseId: current.id, expected: "POLICE_COMPLETED", next: "PMS_CHECKIN_CONFIRMED", eventType: "PMS_CHECKIN_CONFIRMED", detail: "模拟 PMS 入住确认成功；已核对订单、房间和登记回执" });
       await getD1().prepare("UPDATE demo_orders SET status = 'checkin_confirmed', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
@@ -876,7 +920,7 @@ export async function POST(request: Request, context: RouteContext) {
       const ref = await legacyOrderRef(updated.order_id);
       if (ref) {
         const scope = await sessionScope(sessionId);
-        await projectFormal(scope, ref.orderCode, { status: "in_house" });
+        await projectFormal(sessionId, scope, ref.orderCode, { status: "in_house" });
       } else {
         await getD1().prepare("UPDATE demo_orders SET status = 'in_house', updated_at = ? WHERE id = ? AND session_id = ?").bind(now(), updated.order_id, sessionId).run();
       }
@@ -892,6 +936,25 @@ export async function POST(request: Request, context: RouteContext) {
       const cleaned = await markRoomClean({ hotelId: scope.hotelId, roomNumber, requestId: `${sessionId}:clean:${roomNumber}` });
       await audit(sessionId, null, "ROOM_CLEANED", null, "VACANT_CLEAN", `客房 ${roomNumber} 已打扫完成，房态由待清洁回到可售`);
       return json({ ok: true, room_number: roomNumber, room_status: cleaned.roomStatus });
+    }
+    if (action === "knowledge-search") {
+      const scope = await sessionScope(sessionId);
+      const rawQuery = typeof body.query === "string" ? body.query.trim().slice(0, 120) : "";
+      const topic = typeof body.topic === "string" ? body.topic : undefined;
+      if (rawQuery.length < 2 && !topic) throw new Error("invalid_query");
+      const asked = policyQuery(topic, rawQuery);
+      const knowledge = await askKnowledge({ hotelId: scope.hotelId, query: asked, allow: ["guest"] });
+      await audit(sessionId, null, "KNOWLEDGE_ANSWERED", null, knowledge.needsHandoff ? "HANDOFF" : "ANSWERED",
+        knowledge.needsHandoff ? `门店政策未命中：${asked}` : `门店政策命中：${knowledge.citations.map((citation) => `${citation.title} v${citation.version}`).join("、")}`);
+      return json({
+        ok: true,
+        query: asked,
+        answer: knowledge.answer,
+        citations: knowledge.citations,
+        confidence: knowledge.confidence,
+        needs_handoff: knowledge.needsHandoff,
+        handoff_message: knowledge.needsHandoff ? "这个我暂时没有可靠依据（门店知识库里没查到），已记录并转前台确认。" : null,
+      });
     }
     if (action === "checkout-lookup") {
       return json(await checkoutLookup(sessionId, requireRoomNumber(body.room_number), requireLast4(body.phone_last4)));
@@ -968,7 +1031,9 @@ async function checkoutConfirm(sessionId: string, stayId: string, requestId: str
   const scope = await sessionScope(sessionId);
   try {
     const result = await checkoutAndSettle({ hotelId: scope.hotelId, stayId, requestId });
-    await audit(sessionId, null, "CHECKOUT_SETTLED", null, "CHECKED_OUT", `退房结算完成：房费 ${result.quote.roomTotal} 分，押金 ${result.quote.depositTotal} 分，${result.settlement.settled >= 0 ? "补收" : "退还"} ${Math.abs(result.settlement.settled)} 分，账本已关闭`);
+    // The guest has left, so no session may keep saying they are still in the room.
+    await reconcileDemoOrders(sessionId);
+    await audit(sessionId, null, "CHECKOUT_SETTLED", null, "CHECKED_OUT", `退房业务结算完成：房费 ${result.quote.roomTotal} 分，押金 ${result.quote.depositTotal} 分，${result.settlement.settled >= 0 ? "补收" : "退款回执已确认，退还"} ${Math.abs(result.settlement.settled)} 分，账本已关闭`);
     return {
       ok: true,
       outcome: "settled" as const,
@@ -980,6 +1045,8 @@ async function checkoutConfirm(sessionId: string, stayId: string, requestId: str
       quote: result.quote,
       folio_opened: result.folioOpened,
       deposit_amount: result.depositAmount,
+      refund_status: result.settlement.refund?.status ?? null,
+      refund_provider_ref: result.settlement.refund?.provider_ref ?? null,
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : "unknown_error";

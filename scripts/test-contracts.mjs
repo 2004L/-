@@ -6,11 +6,11 @@ for (const file of files) {
   if (!text.includes("idempotency") && file.includes("route.ts") && !file.includes("app/api/agent/turn") && !file.includes("app/api/health") && !file.includes("app/api/admin/metrics")) throw new Error(`${file} 未声明幂等键`);
 }
 const tools = readFileSync("lib/tools.ts", "utf8");
-for (const name of ["pms.search_order", "hotel.policy_answer", "device.reader.read_identity", "device.encoder.issue_keycard", "police.submit_registration"]) {
+for (const name of ["pms.search_order", "hotel.policy_answer", "hotel.knowledge_search", "device.reader.read_identity", "device.encoder.issue_keycard", "police.submit_registration"]) {
   if (!tools.includes(name)) throw new Error(`缺少工具契约：${name}`);
 }
 const adminTools = readFileSync("lib/admin-tools.ts", "utf8");
-for (const name of ["admin.search_guest", "admin.get_room_status", "admin.prepare_room_change", "admin.prepare_amount_adjustment", "admin.prepare_keycard_issue", "admin.prepare_police_submission", "admin.confirm_pending_action", "admin.confirm_room_change", "admin.cancel_pending_action", "admin.cancel_room_change", "admin.get_audit_records"]) {
+for (const name of ["admin.search_guest", "admin.get_room_status", "admin.mark_room_clean", "admin.prepare_purge_closed_loops", "admin.get_database_schema", "admin.get_table_rows", "admin.list_in_house_guests", "admin.set_room_service_need", "admin.reconcile_demo_orders", "admin.prepare_room_change", "admin.prepare_amount_adjustment", "admin.prepare_keycard_issue", "admin.prepare_police_submission", "admin.confirm_pending_action", "admin.confirm_room_change", "admin.cancel_pending_action", "admin.cancel_room_change", "admin.get_audit_records"]) {
   if (!adminTools.includes(name)) throw new Error(`缺少管理员工具契约：${name}`);
 }
 const auth = readFileSync("lib/admin-auth.ts", "utf8");

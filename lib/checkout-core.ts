@@ -117,7 +117,7 @@ export async function markRoomCleanWith(db: SqlRunner, input: { hotelId: string;
   if (!input.hotelId || !input.roomNumber || !input.requestId) throw new Error(CHECKOUT_ERRORS.REQUEST_INVALID);
   const room = await db.first<{ id: string; status: number; version: number }>(ROOM_BY_NUMBER_SQL, [input.hotelId, input.roomNumber]);
   if (!room) throw new Error(CHECKOUT_ERRORS.ROOM_NOT_FOUND);
-  if (Number(room.status) === ROOM_STATUS.VACANT_CLEAN) return { roomId: room.id, roomStatus: Number(room.status), idempotent: true };
+  if (Number(room.status) === ROOM_STATUS.VACANT_CLEAN) return { roomId: room.id, roomStatus: Number(room.status), fromStatus: Number(room.status), idempotent: true };
   assertRoomTransition(Number(room.status) as RoomStatus, ROOM_STATUS.VACANT_CLEAN);
   const stamp = new Date().toISOString();
   const moved = await db.run(
@@ -129,7 +129,7 @@ export async function markRoomCleanWith(db: SqlRunner, input: { hotelId: string;
     "INSERT INTO room_status_logs (id, tenant_id, hotel_id, room_id, from_status, to_status, reason, actor_type, actor_id, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, 'housekeeping cleaned', 'housekeeping', NULL, ?, ?)",
     [`rlog-${input.requestId}-clean`, await tenantOf(db, input.hotelId, room.id), input.hotelId, room.id, room.status, ROOM_STATUS.VACANT_CLEAN, input.requestId, stamp],
   );
-  return { roomId: room.id, roomStatus: Number(ROOM_STATUS.VACANT_CLEAN), idempotent: false };
+  return { roomId: room.id, roomStatus: Number(ROOM_STATUS.VACANT_CLEAN), fromStatus: Number(room.status), idempotent: false };
 }
 
 /** Room status logs require a tenant id; the room row is the cheapest source. */

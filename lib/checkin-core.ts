@@ -186,14 +186,20 @@ export async function confirmFormalCheckin(db: SqlRunner, input: { tenantId: str
 }
 
 /** Only the demo compatibility columns are written; formal tables stay authoritative. */
-export async function projectCheckinToLegacy(db: SqlRunner, input: { hotelId: string; orderNo: string; status?: string; roomNumber?: string | null }) {
+/** Demo-side projection input. `sessionId` is required: each session owns its copy. */
+export type ProjectCheckinInput = { hotelId: string; sessionId: string; orderNo: string; status?: string; roomNumber?: string | null };
+
+export async function projectCheckinToLegacy(db: SqlRunner, input: ProjectCheckinInput) {
   const clauses: string[] = [];
   const params: SqlValue[] = [];
   if (input.status) { clauses.push("status = ?"); params.push(input.status); }
   if (input.roomNumber !== undefined) { clauses.push("room_number = ?"); params.push(input.roomNumber); }
   if (!clauses.length) return 0;
   clauses.push("updated_at = ?");
-  params.push(new Date().toISOString(), input.hotelId, input.orderNo);
-  const result = await db.run(`UPDATE demo_orders SET ${clauses.join(", ")} WHERE hotel_id = ? AND order_code = ?`, params);
+  params.push(new Date().toISOString(), input.hotelId, input.sessionId, input.orderNo);
+  // Scoped to the session that is actually checking this guest in: every browser
+  // session keeps its own copy of the demo orders, and one guest arriving must not
+  // rewrite another session's history.
+  const result = await db.run(`UPDATE demo_orders SET ${clauses.join(", ")} WHERE hotel_id = ? AND session_id = ? AND order_code = ?`, params);
   return result.changes;
 }

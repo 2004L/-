@@ -6,6 +6,7 @@ import {
   pickSellableRoomWith as pickRoomCore,
   projectCheckinToLegacy as projectCore,
   type CheckinOrderInput,
+  type ProjectCheckinInput,
 } from "@/lib/checkin-core";
 
 /** D1 adapter for the formal check-in writes used by the guest flow. */
@@ -22,7 +23,7 @@ export async function confirmFormalCheckin(input: { tenantId: string; hotelId: s
   return confirmCore(d1SqlRunner(), input);
 }
 
-export async function projectCheckinToLegacy(input: { hotelId: string; orderNo: string; status?: string; roomNumber?: string | null }) {
+export async function projectCheckinToLegacy(input: ProjectCheckinInput) {
   return projectCore(d1SqlRunner(), input);
 }
 

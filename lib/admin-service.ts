@@ -4,6 +4,27 @@ import { auditAdmin, hasPermission, type AdminUser } from "@/lib/admin-auth";
 import { syncLegacyCore } from "@/lib/legacy-core-sync";
 import { ORDER_ERRORS, updateOrderAmount, type OrderAmountType } from "@/lib/orders";
 import { syncPmsRoomCatalog } from "@/lib/pms-core-sync";
+import { markRoomCleanWith } from "@/lib/checkout-core";
+import { d1SqlRunner } from "@/lib/orders";
+import { RETENTION_RANGE_LABELS, isRetentionRange, previewClosedLoopPurge, purgeClosedLoopsWith, type RetentionRange } from "@/lib/retention-core";
+import { listTablesWith, previewTableWith } from "@/lib/database-view-core";
+import { demoOrderReconcileAllStatement, demoOrderReconcileCountStatement } from "@/lib/legacy-projection-core";
+import { INHOUSE_DDL, SERVICE_NEED_LABELS, listInHouseWith, setServiceNeedWith, type ServiceNeed } from "@/lib/inhouse-core";
+import { d1ListRunner } from "@/lib/folio";
+import { getKnowledgeDocument, listKnowledgeDocuments, saveKnowledgeDraft, setKnowledgeStatus, askKnowledge } from "@/lib/knowledge";
+import {
+  KNOWLEDGE_ADMIN_ERRORS,
+  KNOWLEDGE_AUTHORITY_LABELS,
+  KNOWLEDGE_SOURCE_LABELS,
+  KNOWLEDGE_STATUS_LABELS,
+  KNOWLEDGE_VISIBILITY_LABELS,
+  normalizeKnowledgeDraft,
+  type KnowledgeAuthority,
+  type KnowledgeDraft,
+  type KnowledgeSource,
+  type KnowledgeStatus,
+  type KnowledgeVisibility,
+} from "@/lib/knowledge-admin-core";
 
 export type AdminAuth = { user: AdminUser; sessionId: string };
 
@@ -34,6 +55,9 @@ async function ensureActionSchema() {
   try { await getD1().prepare("ALTER TABLE demo_orders ADD COLUMN room_amount INTEGER DEFAULT 380").run(); } catch { /* 已存在 */ }
   try { await getD1().prepare("ALTER TABLE demo_orders ADD COLUMN deposit_amount INTEGER DEFAULT 300").run(); } catch { /* 已存在 */ }
   try { await getD1().prepare("ALTER TABLE demo_orders ADD COLUMN total_amount INTEGER DEFAULT 680").run(); } catch { /* 已存在 */ }
+  // Same lazy-bootstrap style as the rest of this file: the table is also in
+  // drizzle/0017, this only covers a database that never ran the migration.
+  await getD1().batch(INHOUSE_DDL.map((sql) => getD1().prepare(sql)));
 }
 
 function maskedPhone(phoneLast4: string) { return `***${phoneLast4}`; }
@@ -46,7 +70,7 @@ type AdminOrder = {
 };
 type PreparedAction = {
   action_id: string;
-  action_type: "room_change" | "amount_adjustment" | "keycard_issue" | "police_submission";
+  action_type: "room_change" | "amount_adjustment" | "keycard_issue" | "police_submission" | "purge_closed_loops" | "knowledge_document_save" | "knowledge_document_status";
   title: string;
   risk_level: "medium" | "high";
   required_permission: AdminPermission;
@@ -103,6 +127,300 @@ async function roomStatus(auth: AdminAuth, roomNumber: string) {
   }
   const row = await getD1().prepare("SELECT order_code, phone_last4, guest_label, status FROM demo_orders WHERE hotel_id = ? AND room_number = ? AND status IN ('in_house', 'checkin_confirmed') LIMIT 1").bind(auth.user.hotel_id, roomNumber).first<Record<string, unknown>>();
   return { room_number: roomNumber, status: row ? "occupied" : "vacant-clean", version: null, guest: row ? { order_code: row.order_code, phone: maskedPhone(String(row.phone_last4)), guest_label: row.guest_label } : null };
+}
+
+/**
+ * Housekeeping confirms the room is clean. This is the only writer that can make
+ * a dirty room sellable again, and the room state machine allows nothing but
+ * VACANT_DIRTY -> VACANT_CLEAN, so an occupied or held room cannot be declared
+ * clean by mistake. No confirmation dialog: the action is reversible
+ * (VACANT_CLEAN -> VACANT_DIRTY) and its whole risk is already fenced by the
+ * state machine, while the audit trail records who said the room was ready.
+ */
+async function markRoomClean(auth: AdminAuth, args: { room_number: string; reason?: string }) {
+  const formal = await ensureFormalCore(auth);
+  if (!formal) throw new Error("formal_core_unavailable");
+  // A room that only exists in the legacy projection has no row to transition.
+  try { await syncPmsRoomCatalog({ tenantId: auth.user.tenant_id, hotelId: auth.user.hotel_id, hotelCode: auth.user.hotel_code }); } catch { /* PMS catalog is best effort; the transition below stays authoritative */ }
+  const cleaned = await markRoomCleanWith(d1SqlRunner(), {
+    hotelId: auth.user.hotel_id,
+    roomNumber: args.room_number,
+    requestId: `${auth.sessionId}:clean:${args.room_number}`,
+  });
+  const fromLabel = cleaned.fromStatus === 1 ? "待清洁" : cleaned.fromStatus === 2 ? "已锁房（这间房的锁房没有被消耗，一并释放）" : cleaned.fromStatus === 0 ? "已是可售" : `状态 ${cleaned.fromStatus}`;
+  await auditAdmin(auth.user, "ADMIN_ROOM_MARKED_CLEAN", `客房 ${args.room_number} 回到可售（${fromLabel} → 可售）${cleaned.idempotent ? "，重复确认，未重复写房态流水" : ""}。理由：${args.reason ?? "客房打扫完成"}`);
+  return { room_number: args.room_number, room_status: cleaned.roomStatus, idempotent: cleaned.idempotent };
+}
+
+/**
+ * Retention cleanup. This one deletes history, so it is the strictest case of the
+ * prepare/confirm rule: the window and the row counts are frozen into the pending
+ * action, and the executor deletes exactly that window instead of recomputing
+ * "now" — what the operator read is what gets removed. Stays that are still in
+ * house are never in the set (see lib/retention-core.ts).
+ */
+async function preparePurge(auth: AdminAuth, args: { range: RetentionRange; reason: string }) {
+  if (!isRetentionRange(args.range)) throw new Error("retention_range_invalid");
+  const preview = await previewClosedLoopPurge(d1SqlRunner(), { hotelId: auth.user.hotel_id, range: args.range });
+  const label = RETENTION_RANGE_LABELS[args.range];
+  const id = crypto.randomUUID();
+  return createPreparedAction(auth, "admin.prepare_purge_closed_loops", args, {
+    action_id: id,
+    action_type: "purge_closed_loops",
+    title: `确认清理${label}的已退房记录吗？`,
+    risk_level: "high",
+    required_permission: "admin:purge_data",
+    order_id: "",
+    order_code: "（批量操作，涉及多笔订单）",
+    guest: { label: "已退房的历史记录", phone: "不适用" },
+    fields: [
+      { label: "时间范围", value: `${label}（${preview.windowStart.slice(0, 10)} 至 ${preview.windowEnd.slice(0, 10)}）` },
+      { label: "将删除入住记录", value: `${preview.stays} 笔已退房` },
+      { label: "连带删除", value: `${preview.folios} 个账本、${preview.ledgerEntries} 条分录、${preview.reservations} 笔预订、${preview.orders} 笔订单` },
+      { label: "涉及房间", value: preview.rooms.length ? preview.rooms.join("、") : "无" },
+      { label: "同时复位演示订单", value: `${preview.demoOrdersReleased} 笔（回到待入住）` },
+    ],
+    impacts: [
+      "这是不可撤销的删除，删掉的记录无法在系统内找回",
+      "只删已退房的闭环；在住客人的入住记录与账本不受影响",
+      "房态和房间档案不会被修改，房间当前状态保持不变",
+    ],
+    confirm_label: "确认清理",
+    cancel_label: "取消",
+    reason: args.reason,
+    range: args.range,
+    window_start: preview.windowStart,
+    window_end: preview.windowEnd,
+    preview,
+    expires_at: "",
+    status: "AWAITING_CONFIRMATION",
+  }, "ADMIN_RETENTION_PREPARED", `已生成数据清理确认单：${label}，将删除 ${preview.stays} 笔已退房记录`);
+}
+
+async function executePurge(auth: AdminAuth, actionId: string, prepared: PreparedAction) {
+  const range = String(prepared.range ?? "");
+  if (!isRetentionRange(range)) throw new Error("retention_range_invalid");
+  const result = await purgeClosedLoopsWith(d1SqlRunner(), {
+    hotelId: auth.user.hotel_id,
+    range,
+    windowStart: String(prepared.window_start ?? ""),
+    windowEnd: String(prepared.window_end ?? ""),
+    requestId: actionId,
+  });
+  const stamp = new Date().toISOString();
+  const executed = { ...prepared, status: "EXECUTED" as const, executed_at: stamp, idempotent: false, result };
+  await getD1().batch([
+    getD1().prepare("UPDATE admin_actions SET status = 'EXECUTED', result_json = ?, updated_at = ? WHERE id = ? AND user_id = ? AND hotel_id = ? AND status = 'AWAITING_CONFIRMATION'").bind(JSON.stringify(executed), stamp, actionId, auth.user.id, auth.user.hotel_id),
+    getD1().prepare("INSERT INTO admin_audit_events (user_id, tenant_id, hotel_id, action_id, username, role, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(auth.user.id, auth.user.tenant_id, auth.user.hotel_id, actionId, auth.user.username, auth.user.role, "ADMIN_RETENTION_EXECUTED", `已清理${RETENTION_RANGE_LABELS[range]}的已退房记录：入住记录 ${result.stays} 笔、账本 ${result.folios} 个、分录 ${result.ledgerEntries} 条、预订 ${result.reservations} 笔、订单 ${result.orders} 笔`, stamp),
+  ]);
+  return executed;
+}
+
+/**
+ * Bring every session's demo copy back in line with the bookings. The console reads
+ * the demo copy, so a session nobody opens again would otherwise keep showing guests
+ * who already checked out. Only bookings the guest cannot return from are mirrored,
+ * so nothing that is midway through a check-in gets rolled back.
+ */
+async function reconcileDemoOrders(auth: AdminAuth) {
+  const countStatement = demoOrderReconcileCountStatement({ hotelId: auth.user.hotel_id });
+  const before = await getD1().prepare(countStatement.sql).bind(...countStatement.params).first<{ c: number }>();
+  const statement = demoOrderReconcileAllStatement({ hotelId: auth.user.hotel_id, stamp: new Date().toISOString() });
+  const result = await getD1().prepare(statement.sql).bind(...statement.params).run();
+  const changed = Number(result.meta?.changes ?? 0);
+  await auditAdmin(auth.user, "ADMIN_DEMO_ORDERS_RECONCILED", `已把演示界面拉回真账：修正 ${changed} 笔假订单的状态与房号（修正前不一致 ${Number(before?.c ?? 0)} 笔）`);
+  return { updated: changed, drifted_before: Number(before?.c ?? 0), consistent_now: Number(before?.c ?? 0) - changed };
+}
+
+/** Read-only: what the database actually holds, table by table. */
+async function getDatabaseSchema() {
+  return { tables: await listTablesWith(d1ListRunner()) };
+}
+
+/** Read-only preview of one table. Table names are validated against sqlite_master. */
+async function getTableRows(args: { table: string; limit?: number }) {
+  return previewTableWith(d1ListRunner(), { table: args.table, limit: args.limit });
+}
+
+/** Read-only: who is in the building, with their room, their money and their needs. */
+async function listInHouseGuests(auth: AdminAuth) {
+  const guests = await listInHouseWith(d1ListRunner(), { hotelId: auth.user.hotel_id });
+  return { guests, pending_service: guests.filter((guest) => guest.serviceNeed !== "none").length };
+}
+
+/**
+ * "This room needs something." Deliberately a direct write with no confirmation
+ * dialog, for the same reason as room cleaning: it is a reversible note, it never
+ * touches money or room state, and the audit line records who said it. Refusing to
+ * let the front desk record "the guest asked for towels" would push that knowledge
+ * out of the system entirely.
+ */
+async function setRoomServiceNeed(auth: AdminAuth, args: { room_number: string; need: ServiceNeed; note?: string }) {
+  const stay = await getD1().prepare("SELECT s.id AS stay_id FROM stays s JOIN reservation_rooms rr ON rr.hotel_id = s.hotel_id AND rr.reservation_id = s.reservation_id JOIN rooms rm ON rm.id = rr.room_id AND rm.hotel_id = rr.hotel_id WHERE s.hotel_id = ? AND s.status = 2 AND rm.room_number = ? LIMIT 1").bind(auth.user.hotel_id, args.room_number).first<{ stay_id: string }>();
+  const result = await setServiceNeedWith(d1SqlRunner(), {
+    tenantId: auth.user.tenant_id,
+    hotelId: auth.user.hotel_id,
+    roomNumber: args.room_number,
+    need: args.need,
+    note: args.note ?? null,
+    actor: auth.user.username,
+    stayId: stay?.stay_id ?? null,
+  });
+  await auditAdmin(auth.user, "ADMIN_ROOM_SERVICE_NEED", `客房 ${args.room_number} 服务需求更新为「${SERVICE_NEED_LABELS[args.need]}」${args.note ? `，备注：${args.note}` : ""}`);
+  return result;
+}
+
+/** 政策录入：店长自己维护门店政策，但「客人会拿到的答案」必须过一次人工确认。 */
+type KnowledgeDocumentArgs = {
+  document_id?: string; title: string; source: KnowledgeSource; authority: KnowledgeAuthority; visibility: KnowledgeVisibility;
+  version?: number; effective_from: string; effective_to?: string; status: KnowledgeStatus; chunks: string[]; keywords?: string; reason: string;
+};
+
+/** 只读：这家店有哪些政策、各自什么状态、有几条切片。 */
+async function listKnowledgeDocumentsForAdmin(auth: AdminAuth) {
+  const documents = await listKnowledgeDocuments(auth.user.hotel_id);
+  return {
+    documents,
+    active: documents.filter((item) => item.status === "active").length,
+    guest_visible: documents.filter((item) => item.visibility === "guest" && item.status === "active").length,
+  };
+}
+
+async function getKnowledgeDocumentForAdmin(auth: AdminAuth, documentId: string) {
+  try {
+    return await getKnowledgeDocument(auth.user.hotel_id, documentId);
+  } catch (error) {
+    if (error instanceof Error && error.message === KNOWLEDGE_ADMIN_ERRORS.DOCUMENT_NOT_FOUND) throw new Error("knowledge_document_not_found");
+    throw error;
+  }
+}
+
+/**
+ * 试问：店长写完一条政策，最该问的是「客人这么问，系统会答什么」。
+ * 它和终端走同一条检索路径（同一个 askKnowledge），所以看到的答案就是客人会看到的答案。
+ */
+async function previewKnowledgeAnswer(auth: AdminAuth, args: { query: string; visibility: KnowledgeVisibility }) {
+  const allow: KnowledgeVisibility[] = args.visibility === "staff" ? ["guest", "staff"] : ["guest"];
+  const answer = await askKnowledge({ hotelId: auth.user.hotel_id, query: args.query, allow });
+  return {
+    query: answer.query,
+    answer: answer.answer,
+    needs_handoff: answer.needsHandoff,
+    confidence: Number(answer.confidence.toFixed(3)),
+    citations: answer.citations,
+    hits: answer.hits.slice(0, 5).map((hit) => ({ document_id: hit.documentId, title: hit.title, version: hit.version, coverage: Number(hit.coverage.toFixed(3)), pair_matched: hit.pairMatched })),
+  };
+}
+
+function knowledgeDraftFromArgs(args: KnowledgeDocumentArgs): KnowledgeDraft {
+  return normalizeKnowledgeDraft({
+    documentId: args.document_id,
+    title: args.title,
+    source: args.source,
+    authority: args.authority,
+    visibility: args.visibility,
+    version: args.version,
+    effectiveFrom: args.effective_from,
+    effectiveTo: args.effective_to,
+    status: args.status,
+    chunks: args.chunks,
+    keywords: args.keywords,
+  });
+}
+
+async function prepareKnowledgeDocument(auth: AdminAuth, args: KnowledgeDocumentArgs) {
+  const draft = knowledgeDraftFromArgs(args);
+  const before = draft.documentId ? await getKnowledgeDocumentForAdmin(auth, draft.documentId) : null;
+  const nextVersion = draft.version ?? (before ? before.version + 1 : 1);
+  const id = crypto.randomUUID();
+  return createPreparedAction(auth, "admin.prepare_knowledge_document", args as unknown as Record<string, unknown>, {
+    action_id: id,
+    action_type: "knowledge_document_save",
+    title: before ? `确认把「${draft.title}」改到 v${nextVersion} 吗？` : `确认新建政策「${draft.title}」吗？`,
+    risk_level: "high",
+    required_permission: "admin:manage_knowledge",
+    order_id: "",
+    order_code: "（门店政策，不涉及订单）",
+    guest: { label: draft.visibility === "guest" ? "所有客人都会看到" : "仅员工可见", phone: "不适用" },
+    fields: [
+      { label: "文档", value: `${draft.title}（${before ? `v${before.version} → v${nextVersion}` : `新建 v${nextVersion}`}）` },
+      { label: "来源 / 权威度", value: `${KNOWLEDGE_SOURCE_LABELS[draft.source]} · ${KNOWLEDGE_AUTHORITY_LABELS[draft.authority]}` },
+      { label: "可见范围", value: KNOWLEDGE_VISIBILITY_LABELS[draft.visibility] },
+      { label: "生效期", value: `${draft.effectiveFrom.slice(0, 10)} 至 ${draft.effectiveTo ? draft.effectiveTo.slice(0, 10) : "长期有效"}` },
+      { label: "切片", value: before ? `${before.chunks} 条 → ${draft.chunks.length} 条` : `${draft.chunks.length} 条` },
+      { label: "其他说法（进索引）", value: draft.keywords.length ? draft.keywords.join(" ") : "未填" },
+    ],
+    impacts: [
+      "确认后客人问到时立刻按新版本回答，旧版本切片会被整篇替换（不留半新半旧）",
+      draft.visibility === "guest" ? "这条政策会直接作为客人可见答案与出处出现在终端" : "这条政策只有员工身份能检索到，客人问不到",
+      draft.status === "active" ? "文档状态为生效中，时间与可见范围都满足时立即可检索" : `文档状态为${KNOWLEDGE_STATUS_LABELS[draft.status]}，客人暂时检索不到`,
+      "写入管理员审计：谁、什么时候、改了哪份文档的哪一版",
+    ],
+    confirm_label: before ? "确认发布新版本" : "确认新建",
+    cancel_label: "取消",
+    reason: args.reason,
+    knowledge: draft,
+    expires_at: "",
+    status: "AWAITING_CONFIRMATION",
+  }, "ADMIN_KNOWLEDGE_DOCUMENT_PREPARED", before
+    ? `已生成政策改版确认单：${draft.title} v${before.version} → v${nextVersion}（${draft.chunks.length} 条切片）`
+    : `已生成政策新建确认单：${draft.title}（${draft.chunks.length} 条切片，${KNOWLEDGE_VISIBILITY_LABELS[draft.visibility]}）`);
+}
+
+async function prepareKnowledgeStatus(auth: AdminAuth, args: { document_id: string; status: KnowledgeStatus; reason: string }) {
+  const before = await getKnowledgeDocumentForAdmin(auth, args.document_id);
+  if (before.status === args.status) throw new Error("knowledge_status_unchanged");
+  const id = crypto.randomUUID();
+  return createPreparedAction(auth, "admin.prepare_knowledge_status", args as unknown as Record<string, unknown>, {
+    action_id: id,
+    action_type: "knowledge_document_status",
+    title: `确认把「${before.title}」改为${KNOWLEDGE_STATUS_LABELS[args.status]}吗？`,
+    risk_level: "high",
+    required_permission: "admin:manage_knowledge",
+    order_id: "",
+    order_code: "（门店政策，不涉及订单）",
+    guest: { label: before.visibility === "guest" ? "客人可见文档" : "仅员工可见", phone: "不适用" },
+    fields: [
+      { label: "文档", value: `${before.title}（v${before.version}，${before.chunks} 条切片）` },
+      { label: "状态", value: `${KNOWLEDGE_STATUS_LABELS[before.status as KnowledgeStatus] ?? before.status} → ${KNOWLEDGE_STATUS_LABELS[args.status]}` },
+    ],
+    impacts: args.status === "active"
+      ? ["重新生效：客人问到时可以再次命中这条政策", "切片没有删除，恢复的就是原来那一版内容"]
+      : ["客人问到时不再命中这条政策，检索不到就转人工", "切片保留：改回来还能用，不会丢内容"],
+    confirm_label: "确认修改状态",
+    cancel_label: "取消",
+    reason: args.reason,
+    document_id: args.document_id,
+    document_status: args.status,
+    expires_at: "",
+    status: "AWAITING_CONFIRMATION",
+  }, "ADMIN_KNOWLEDGE_STATUS_PREPARED", `已生成政策状态确认单：${before.title} ${before.status} → ${args.status}`);
+}
+
+async function executeKnowledgeDocumentSave(auth: AdminAuth, actionId: string, prepared: PreparedAction) {
+  const draft = prepared.knowledge as KnowledgeDraft;
+  const result = await saveKnowledgeDraft({ tenantId: auth.user.tenant_id, hotelId: auth.user.hotel_id, hotelCode: auth.user.hotel_code, draft });
+  const stamp = new Date().toISOString();
+  const executed = { ...prepared, status: "EXECUTED" as const, executed_at: stamp, idempotent: false, result };
+  await getD1().batch([
+    getD1().prepare("UPDATE admin_actions SET status = 'EXECUTED', result_json = ?, updated_at = ? WHERE id = ? AND user_id = ? AND hotel_id = ? AND status = 'AWAITING_CONFIRMATION'").bind(JSON.stringify(executed), stamp, actionId, auth.user.id, auth.user.hotel_id),
+    getD1().prepare("INSERT INTO admin_audit_events (user_id, tenant_id, hotel_id, action_id, username, role, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(auth.user.id, auth.user.tenant_id, auth.user.hotel_id, actionId, auth.user.username, auth.user.role, "ADMIN_KNOWLEDGE_DOCUMENT_SAVED", `${result.created ? "新建" : "改版"}门店政策「${draft.title}」v${result.version}，${result.chunks} 条切片，${KNOWLEDGE_VISIBILITY_LABELS[draft.visibility]}${result.previous ? `（原 v${result.previous.version}）` : ""}`, stamp),
+  ]);
+  return executed;
+}
+
+async function executeKnowledgeDocumentStatus(auth: AdminAuth, actionId: string, prepared: PreparedAction) {
+  const status = String(prepared.document_status ?? "");
+  if (status !== "active" && status !== "draft" && status !== "retired") throw new Error(KNOWLEDGE_ADMIN_ERRORS.STATUS_INVALID);
+  const documentId = String(prepared.document_id ?? "");
+  const result = await setKnowledgeStatus({ hotelId: auth.user.hotel_id, documentId, status });
+  const stamp = new Date().toISOString();
+  const executed = { ...prepared, status: "EXECUTED" as const, executed_at: stamp, idempotent: false, result };
+  await getD1().batch([
+    getD1().prepare("UPDATE admin_actions SET status = 'EXECUTED', result_json = ?, updated_at = ? WHERE id = ? AND user_id = ? AND hotel_id = ? AND status = 'AWAITING_CONFIRMATION'").bind(JSON.stringify(executed), stamp, actionId, auth.user.id, auth.user.hotel_id),
+    getD1().prepare("INSERT INTO admin_audit_events (user_id, tenant_id, hotel_id, action_id, username, role, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(auth.user.id, auth.user.tenant_id, auth.user.hotel_id, actionId, auth.user.username, auth.user.role, "ADMIN_KNOWLEDGE_STATUS_CHANGED", `门店政策「${result.documentId}」状态改为 ${KNOWLEDGE_STATUS_LABELS[status]}（原 ${result.previousStatus}）`, stamp),
+  ]);
+  return executed;
 }
 
 async function prepareRoomChange(auth: AdminAuth, args: { order_id?: string; phone_last4?: string; from_room?: string; to_room: string; reason: string }) {
@@ -335,6 +653,9 @@ async function confirmPendingAction(auth: AdminAuth, actionId: string, confirmat
     if (prepared.action_type === "amount_adjustment") return executeAmountAdjustment(auth, action.id, prepared);
     if (prepared.action_type === "keycard_issue") return executeKeycardIssue(auth, action.id, prepared);
     if (prepared.action_type === "police_submission") return executePoliceSubmission(auth, action.id, prepared);
+    if (prepared.action_type === "purge_closed_loops") return executePurge(auth, action.id, prepared);
+    if (prepared.action_type === "knowledge_document_save") return executeKnowledgeDocumentSave(auth, action.id, prepared);
+    if (prepared.action_type === "knowledge_document_status") return executeKnowledgeDocumentStatus(auth, action.id, prepared);
     throw new Error("unknown_admin_action_type");
   } catch (error) {
     const message = error instanceof Error ? error.message : "admin_action_failed";
@@ -372,6 +693,18 @@ export async function executeAdminTool(auth: AdminAuth, toolName: AdminToolName,
   if (!parsed.success) throw new Error("invalid_tool_arguments");
   if (toolName === "admin.search_guest") return { tool_name: toolName, result: { orders: await searchOrders(parsed.data, auth.user.hotel_id, auth.user.tenant_id) } };
   if (toolName === "admin.get_room_status") return { tool_name: toolName, result: await roomStatus(auth, parsed.data.room_number) };
+  if (toolName === "admin.mark_room_clean") return { tool_name: toolName, result: await markRoomClean(auth, parsed.data) };
+  if (toolName === "admin.prepare_purge_closed_loops") return { tool_name: toolName, result: await preparePurge(auth, parsed.data) };
+  if (toolName === "admin.reconcile_demo_orders") return { tool_name: toolName, result: await reconcileDemoOrders(auth) };
+  if (toolName === "admin.get_database_schema") return { tool_name: toolName, result: await getDatabaseSchema() };
+  if (toolName === "admin.get_table_rows") return { tool_name: toolName, result: await getTableRows(parsed.data) };
+  if (toolName === "admin.list_in_house_guests") return { tool_name: toolName, result: await listInHouseGuests(auth) };
+  if (toolName === "admin.set_room_service_need") return { tool_name: toolName, result: await setRoomServiceNeed(auth, parsed.data) };
+  if (toolName === "admin.list_knowledge_documents") return { tool_name: toolName, result: await listKnowledgeDocumentsForAdmin(auth) };
+  if (toolName === "admin.get_knowledge_document") return { tool_name: toolName, result: await getKnowledgeDocumentForAdmin(auth, parsed.data.document_id) };
+  if (toolName === "admin.preview_knowledge_answer") return { tool_name: toolName, result: await previewKnowledgeAnswer(auth, parsed.data) };
+  if (toolName === "admin.prepare_knowledge_document") return { tool_name: toolName, result: await prepareKnowledgeDocument(auth, parsed.data) };
+  if (toolName === "admin.prepare_knowledge_status") return { tool_name: toolName, result: await prepareKnowledgeStatus(auth, parsed.data) };
   if (toolName === "admin.prepare_room_change") return { tool_name: toolName, result: await prepareRoomChange(auth, parsed.data) };
   if (toolName === "admin.prepare_amount_adjustment") return { tool_name: toolName, result: await prepareAmountAdjustment(auth, parsed.data) };
   if (toolName === "admin.prepare_keycard_issue") return { tool_name: toolName, result: await prepareKeycardIssue(auth, parsed.data) };

@@ -44,7 +44,7 @@ const baseOrder = (overrides) => ({
 });
 
 try {
-  await db.prepare("CREATE TABLE demo_orders (id TEXT PRIMARY KEY, tenant_id TEXT, hotel_id TEXT, order_code TEXT, source TEXT, guest_label TEXT, phone_last4 TEXT, phone_masked TEXT, stay_date TEXT, nights INTEGER, room_count INTEGER, room_type TEXT, status TEXT, room_number TEXT, room_amount INTEGER DEFAULT 380, deposit_amount INTEGER DEFAULT 300, total_amount INTEGER DEFAULT 680, created_at TEXT, updated_at TEXT)").run();
+  await db.prepare("CREATE TABLE demo_orders (id TEXT PRIMARY KEY, session_id TEXT, tenant_id TEXT, hotel_id TEXT, order_code TEXT, source TEXT, guest_label TEXT, phone_last4 TEXT, phone_masked TEXT, stay_date TEXT, nights INTEGER, room_count INTEGER, room_type TEXT, status TEXT, room_number TEXT, room_amount INTEGER DEFAULT 380, deposit_amount INTEGER DEFAULT 300, total_amount INTEGER DEFAULT 680, created_at TEXT, updated_at TEXT)").run();
   const execSql = async (path) => {
     const statements = readFileSync(path, "utf8")
       .split(/;\s*\n/)
@@ -54,7 +54,8 @@ try {
   };
   await execSql("drizzle/0008_hotel_core_domain.sql");
   await execSql("drizzle/0013_orders.sql");
-  await db.prepare("INSERT INTO demo_orders (id, tenant_id, hotel_id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number, room_amount, deposit_amount, total_amount, created_at, updated_at) VALUES ('demo-1', ?, ?, 'O-CHECKIN', '美团', '演示住客甲', '4821', '1** **** 4821', '2026-09-17', 1, 1, '高级大床房', 'awaiting_arrival', NULL, 380, 300, 680, 't0', 't0')").bind(TENANT, HOTEL).run();
+  await db.prepare("INSERT INTO demo_orders (id, session_id, tenant_id, hotel_id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number, room_amount, deposit_amount, total_amount, created_at, updated_at) VALUES ('demo-1', 'session-1', ?, ?, 'O-CHECKIN', '美团', '演示住客甲', '4821', '1** **** 4821', '2026-09-17', 1, 1, '高级大床房', 'awaiting_arrival', NULL, 380, 300, 680, 't0', 't0')").bind(TENANT, HOTEL).run();
+  await db.prepare("INSERT INTO demo_orders (id, session_id, tenant_id, hotel_id, order_code, source, guest_label, phone_last4, phone_masked, stay_date, nights, room_count, room_type, status, room_number, room_amount, deposit_amount, total_amount, created_at, updated_at) VALUES ('demo-2', 'session-2', ?, ?, 'O-CHECKIN', '美团', '演示住客甲', '4821', '1** **** 4821', '2026-09-17', 1, 1, '高级大床房', 'awaiting_arrival', NULL, 380, 300, 680, 't0', 't0')").bind(TENANT, HOTEL).run();
 
   console.log("== 1. 正式订单与预订落库");
   await ensureCheckinOrder(runner, baseOrder({}));
@@ -108,9 +109,11 @@ try {
   check("取消状态写入正式订单与预订", Number(cancelledOrder.status) === ORDER_STATUS.CANCELLED && Number(cancelledReservation.status) === RESERVATION_STATUS.CANCELLED);
 
   console.log("\n== 7. 演示表只接收投影");
-  await projectCheckinToLegacy(runner, { hotelId: HOTEL, orderNo: "O-CHECKIN", status: "in_house", roomNumber: "1306" });
-  const demo = await runner.first("SELECT status, room_number FROM demo_orders WHERE hotel_id = ? AND order_code = 'O-CHECKIN'", [HOTEL]);
+  await projectCheckinToLegacy(runner, { hotelId: HOTEL, sessionId: "session-1", orderNo: "O-CHECKIN", status: "in_house", roomNumber: "1306" });
+  const demo = await runner.first("SELECT status, room_number FROM demo_orders WHERE hotel_id = ? AND session_id = 'session-1'", [HOTEL]);
   check("演示表状态与房间号为投影值", demo.status === "in_house" && demo.room_number === "1306", JSON.stringify(demo));
+  const otherSession = await runner.first("SELECT status, room_number FROM demo_orders WHERE hotel_id = ? AND session_id = 'session-2'", [HOTEL]);
+  check("另一个会话的同一笔订单没有被改写", otherSession.status === "awaiting_arrival" && otherSession.room_number === null, JSON.stringify(otherSession));
 } finally {
   await mf.dispose();
 }

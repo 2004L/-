@@ -14,7 +14,8 @@ if (!base) {
   process.exit(0);
 }
 
-const ROOM_NUMBER = process.env.ACCEPT_ROOM ?? "1208";
+// The kiosk no longer names a room; set ACCEPT_ROOM only to pin one on purpose.
+const FORCED_ROOM = (process.env.ACCEPT_ROOM ?? "").trim();
 const PHONE_LAST4 = process.env.ACCEPT_PHONE_LAST4 ?? "4821";
 const sessionId = process.env.ACCEPT_SESSION ?? `accept${Date.now()}`;
 let failures = 0;
@@ -24,8 +25,24 @@ function check(name, condition, detail = "") {
   else { failures += 1; console.error(`FAIL  ${name}${detail ? ` :: ${detail}` : ""}`); }
 }
 
+/**
+ * wrangler dev 热重载时会把正在处理的请求打成 503，并明确要求重发一次
+ * （"Your worker restarted mid-request. Please try sending the request again."）。
+ * 这不是业务结果，所以按它的提示重试一次；持续 503 仍然会失败并报出来。
+ */
+async function send(path, init) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetch(`${base}${path}`, init);
+    if (response.status !== 503) return response;
+    const hint = await response.clone().text();
+    if (!hint.includes("restarted mid-request")) return response;
+    console.log(`RETRY  本地 dev server 刚重载过（503），按提示重发一次：${path}`);
+  }
+  return fetch(`${base}${path}`, init);
+}
+
 async function post(path, body) {
-  const response = await fetch(`${base}${path}`, {
+  const response = await send(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -39,7 +56,7 @@ const demo = (action, body) => post(`/api/demo/${action}`, { session_id: session
 const device = (target, body) => post(`/api/device/${target}`, { session_id: sessionId, ...body });
 
 async function bootstrap() {
-  const response = await fetch(`${base}/api/demo/bootstrap?session_id=${encodeURIComponent(sessionId)}`, { cache: "no-store" });
+  const response = await send(`/api/demo/bootstrap?session_id=${encodeURIComponent(sessionId)}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`bootstrap -> ${response.status}`);
   return response.json();
 }
@@ -60,8 +77,9 @@ try {
   current = (await demo("verify-identity", { case_id: caseId })).checkinCase;
   check("身份核验通过", current.status === "IDENTITY_VERIFIED", current.status);
 
-  current = (await demo("hold-room", { case_id: caseId, room_number: ROOM_NUMBER })).checkinCase;
-  check(`房间 ${ROOM_NUMBER} 已被锁定`, current.status === "ROOM_HELD" && current.room_number === ROOM_NUMBER, JSON.stringify({ status: current.status, room: current.room_number }));
+  current = (await demo("hold-room", { case_id: caseId, room_number: FORCED_ROOM })).checkinCase;
+  const roomNumber = current.room_number;
+  check("终端不报房号时服务端自己挑一间可售房", current.status === "ROOM_HELD" && /^[0-9]{4}$/.test(String(roomNumber)), JSON.stringify({ status: current.status, room: roomNumber }));
 
   await post("/api/police/submit", { session_id: sessionId, case_id: caseId, idempotency_key: `police:${caseId}`, expected_state: "ROOM_HELD", device_id: "police-browser-demo-01", operation: "submit_registration", actual_identity_verified: true, identity_token: "DEMO-ID-TOKEN" });
   current = (await demo("browser-start", { case_id: caseId })).checkinCase;
@@ -73,16 +91,16 @@ try {
   check("入住已确认", current.status === "PMS_CHECKIN_CONFIRMED", current.status);
   current = (await demo("keycard-start", { case_id: caseId })).checkinCase;
   check("开始写卡", current.status === "KEYCARD_WRITING", current.status);
-  await device("encoder", { case_id: caseId, idempotency_key: `encoder:${caseId}`, expected_state: "PMS_CHECKIN_CONFIRMED", device_id: "encoder-demo-01", operation: "issue_keycard", room_number: ROOM_NUMBER });
+  await device("encoder", { case_id: caseId, idempotency_key: `encoder:${caseId}`, expected_state: "PMS_CHECKIN_CONFIRMED", device_id: "encoder-demo-01", operation: "issue_keycard", room_number: roomNumber });
   current = (await demo("keycard-complete", { case_id: caseId })).checkinCase;
   check("房卡已送达取卡口", current.status === "KEYCARD_DISPENSED", current.status);
   current = (await demo("pickup-confirmed", { case_id: caseId })).checkinCase;
   check("客人取走证件与房卡，入住完成", current.status === "CHECKIN_COMPLETE", current.status);
 
   console.log("\n== 2. 同一位客人回头选「办理退房」：两要素识别 → 报价");
-  const lookup = await demo("checkout-lookup", { room_number: ROOM_NUMBER, phone_last4: PHONE_LAST4 });
+  const lookup = await demo("checkout-lookup", { room_number: roomNumber, phone_last4: PHONE_LAST4 });
   check("凭房间号 + 手机号后四位找到在住记录", lookup.outcome === "quoted", JSON.stringify(lookup.outcome));
-  check("识别到的正是刚入住的那笔", lookup.stay?.room_number === ROOM_NUMBER && lookup.stay?.phone_last4 === PHONE_LAST4, JSON.stringify(lookup.stay));
+  check("识别到的正是刚入住的那笔", lookup.stay?.room_number === roomNumber && lookup.stay?.phone_last4 === PHONE_LAST4, JSON.stringify(lookup.stay));
   check("终端只拿到脱敏姓名", typeof lookup.stay?.guest_name_masked === "string" && !lookup.stay.guest_name_masked.includes(lookup.stay.phone_last4), String(lookup.stay?.guest_name_masked));
   const quote = lookup.quote ?? {};
   check("报价含房费", Number(quote.roomTotal) > 0, JSON.stringify(quote.roomTotal));
@@ -97,7 +115,7 @@ try {
   check("房间归还（待清洁）", Number(settled.room_status) === 1, String(settled.room_status));
 
   console.log("\n== 4. 退房后这位客人再查一次：查不到，也不会重复结算");
-  const again = await demo("checkout-lookup", { room_number: ROOM_NUMBER, phone_last4: PHONE_LAST4 });
+  const again = await demo("checkout-lookup", { room_number: roomNumber, phone_last4: PHONE_LAST4 });
   check("不再出现在在住列表", again.outcome === "not_found", JSON.stringify(again.outcome));
   let replayError = "";
   try { await demo("checkout-confirm", { stay_id: lookup.stay.stay_id, request_id: `${sessionId}:checkout-again` }); }
@@ -105,7 +123,7 @@ try {
   check("重复退房被拒绝或幂等返回", replayError === "" || /folio_already_closed|stay_status_conflict|folio_not_balanced/.test(replayError), replayError || "(幂等通过)");
 
   console.log("\n== 5. 错误路径：房间号与手机号必须同时匹配");
-  const wrongPhone = await demo("checkout-lookup", { room_number: ROOM_NUMBER, phone_last4: "0000" });
+  const wrongPhone = await demo("checkout-lookup", { room_number: roomNumber, phone_last4: "0000" });
   check("换手机号查不到", wrongPhone.outcome === "not_found", JSON.stringify(wrongPhone.outcome));
   const wrongRoom = await demo("checkout-lookup", { room_number: "9999", phone_last4: PHONE_LAST4 });
   check("换房间号查不到", wrongRoom.outcome === "not_found", JSON.stringify(wrongRoom.outcome));

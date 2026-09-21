@@ -18,6 +18,13 @@ function adminToolParameters(toolName: AdminToolName) {
   };
   if (toolName === "admin.search_guest") return { type: "object", additionalProperties: false, properties: actionTarget };
   if (toolName === "admin.get_room_status") return { type: "object", additionalProperties: false, properties: { room_number: { type: "string", pattern: "^[0-9]{3,5}$" } }, required: ["room_number"] };
+  if (toolName === "admin.mark_room_clean") return { type: "object", additionalProperties: false, properties: { room_number: { type: "string", pattern: "^[0-9]{3,5}$" }, reason: { type: "string", minLength: 1, maxLength: 200 } }, required: ["room_number"] };
+  if (toolName === "admin.prepare_purge_closed_loops") return { type: "object", additionalProperties: false, properties: { range: { type: "string", enum: ["3d", "7d", "30d", "180d", "365d"] }, reason: { type: "string", minLength: 1, maxLength: 200 } }, required: ["range"] };
+  if (toolName === "admin.get_database_schema") return { type: "object", additionalProperties: false, properties: {} };
+  if (toolName === "admin.reconcile_demo_orders") return { type: "object", additionalProperties: false, properties: {} };
+  if (toolName === "admin.get_table_rows") return { type: "object", additionalProperties: false, properties: { table: { type: "string", minLength: 1, maxLength: 80 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["table"] };
+  if (toolName === "admin.list_in_house_guests") return { type: "object", additionalProperties: false, properties: {} };
+  if (toolName === "admin.set_room_service_need") return { type: "object", additionalProperties: false, properties: { room_number: { type: "string", pattern: "^[0-9]{3,5}$" }, need: { type: "string", enum: ["none", "cleaning", "maintenance", "supplies"] }, note: { type: "string", maxLength: 200 } }, required: ["room_number", "need"] };
   if (toolName === "admin.prepare_room_change") return { type: "object", additionalProperties: false, properties: { order_id: actionTarget.order_id, phone_last4: actionTarget.phone_last4, to_room: { type: "string", pattern: "^[0-9]{3,5}$" }, reason: { type: "string", minLength: 1, maxLength: 200 } }, required: ["to_room", "reason"] };
   if (toolName === "admin.prepare_amount_adjustment") return { type: "object", additionalProperties: false, properties: { ...actionTarget, amount_type: { type: "string", enum: ["room_amount", "deposit_amount", "total_amount"] }, new_amount: { type: "integer", minimum: 0, maximum: 99999 }, reason: { type: "string", minLength: 1, maxLength: 200 } }, required: ["amount_type", "new_amount", "reason"] };
   if (toolName === "admin.prepare_keycard_issue") return { type: "object", additionalProperties: false, properties: { ...actionTarget, room_number: { type: "string", pattern: "^[0-9]{3,5}$" }, reason: { type: "string", minLength: 1, maxLength: 200 } }, required: ["reason"] };
@@ -47,7 +54,11 @@ export async function askAdminModel(messages: ChatMessage[], context?: { pending
       "你是酒店管理后台的 AI Native 管理员助手。",
       "你可以理解自然语言并选择管理员工具，但不能直接写数据库、改金额、发房卡或提交公安。",
       "管理员酒店意图必须优先通过工具规划表达；不要把已理解的酒店操作改写成普通闲聊。缺字段时用自然语言澄清。",
-      "所有写操作必须先调用 prepare_* 生成确认单；只有管理员明确说确认执行且存在 pending_action_id 时，才调用 admin.confirm_pending_action。",
+      "除房态清洁外，所有写操作必须先调用 prepare_* 生成确认单；只有管理员明确说确认执行且存在 pending_action_id 时，才调用 admin.confirm_pending_action。",
+      "房态清洁是唯一不需要确认单的写操作：管理员说某间房打扫完成时直接调用 admin.mark_room_clean。它只能把待清洁的房间改成可售，占用中或已锁定的房间会被房态机拒绝。",
+      "清理历史数据必须先生成确认单：调用 admin.prepare_purge_closed_loops 时必须由管理员明确说出时间范围（近三天/近七天/近一个月/近半年/近一年），不要替他选；它只删已退房的闭环，在住客人不受影响，但删除不可撤销。",
+      "查看数据库（admin.get_database_schema / admin.get_table_rows）和在住客人列表（admin.list_in_house_guests）都是只读的，可以直接调用；表名必须是数据库里真实存在的表名，不确定就先列全部表。",
+      "记录客房服务需求（admin.set_room_service_need）不需要确认单，但必须说出房号；它只记一笔「这间房现在需要什么」，不动房态也不动账务。",
       "涉及换房时必须先调用 admin.search_guest 查询并确认唯一订单，再调用 admin.get_room_status 检查目标房间，最后才允许用 order_id 调用 admin.prepare_room_change；不得仅凭手机号后四位直接生成换房确认单。",
       "如果缺少手机号后四位、订单号、目标房号、金额、地区等必要参数，直接用自然语言追问，不要猜。",
       context?.pending_action_id ? `当前已有待确认动作：${context.pending_action_id}` : "当前没有待确认动作。",
@@ -106,7 +117,11 @@ export async function streamAdminModel(
       "你是酒店管理后台的 AI Native 管理员助手。",
       "你可以理解自然语言并选择管理员工具，但不能直接写数据库、改金额、发房卡或提交公安。",
       "管理员酒店意图必须优先通过工具规划表达；不要把已理解的酒店操作改写成普通闲聊。缺字段时用自然语言澄清。",
-      "所有写操作必须先调用 prepare_* 生成确认单；只有管理员明确说确认执行且存在 pending_action_id 时，才调用 admin.confirm_pending_action。",
+      "除房态清洁外，所有写操作必须先调用 prepare_* 生成确认单；只有管理员明确说确认执行且存在 pending_action_id 时，才调用 admin.confirm_pending_action。",
+      "房态清洁是唯一不需要确认单的写操作：管理员说某间房打扫完成时直接调用 admin.mark_room_clean。它只能把待清洁的房间改成可售，占用中或已锁定的房间会被房态机拒绝。",
+      "清理历史数据必须先生成确认单：调用 admin.prepare_purge_closed_loops 时必须由管理员明确说出时间范围（近三天/近七天/近一个月/近半年/近一年），不要替他选；它只删已退房的闭环，在住客人不受影响，但删除不可撤销。",
+      "查看数据库（admin.get_database_schema / admin.get_table_rows）和在住客人列表（admin.list_in_house_guests）都是只读的，可以直接调用；表名必须是数据库里真实存在的表名，不确定就先列全部表。",
+      "记录客房服务需求（admin.set_room_service_need）不需要确认单，但必须说出房号；它只记一笔「这间房现在需要什么」，不动房态也不动账务。",
       "涉及换房时必须先调用 admin.search_guest 查询并确认唯一订单，再调用 admin.get_room_status 检查目标房间，最后才允许用 order_id 调用 admin.prepare_room_change。",
       "如果缺少手机号后四位、订单号、目标房号、金额、地区等必要参数，直接用自然语言追问，不要猜。",
       context?.pending_action_id ? `当前已有待确认动作：${context.pending_action_id}` : "当前没有待确认动作。",

@@ -35,6 +35,9 @@ export const FOLIO_ERRORS = {
   CREATE_FAILED: "folio_entry_create_failed",
   NOT_BALANCED: "folio_not_balanced",
   RATE_ROWS_MISMATCH: "folio_rate_rows_mismatch",
+  PAYMENT_NOT_CAPTURED: "deposit_payment_not_captured",
+  REFUND_PENDING: "deposit_refund_pending",
+  REFUND_FAILED: "deposit_refund_failed",
 } as const;
 
 const MAX_AMOUNT = 99_999_999;
@@ -49,7 +52,14 @@ export const FOLIOS_DDL: string[] = [
   "CREATE INDEX IF NOT EXISTS folios_hotel_status_idx ON folios(hotel_id, status)",
   "CREATE TABLE IF NOT EXISTS ledger_entries (id TEXT PRIMARY KEY NOT NULL, tenant_id TEXT NOT NULL, hotel_id TEXT NOT NULL, folio_id TEXT NOT NULL, entry_type TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'CNY', idempotency_key TEXT NOT NULL, reference_type TEXT, reference_id TEXT, created_at TEXT NOT NULL, UNIQUE (hotel_id, idempotency_key))",
   "CREATE INDEX IF NOT EXISTS ledger_entries_hotel_folio_idx ON ledger_entries(hotel_id, folio_id, created_at)",
+  "CREATE TABLE IF NOT EXISTS payments (id TEXT PRIMARY KEY NOT NULL, tenant_id TEXT NOT NULL, hotel_id TEXT NOT NULL, stay_id TEXT NOT NULL, payment_type TEXT NOT NULL, method TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'CNY', status TEXT NOT NULL, idempotency_key TEXT NOT NULL, provider TEXT NOT NULL, provider_ref TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (hotel_id, idempotency_key))",
+  "CREATE INDEX IF NOT EXISTS payments_hotel_stay_idx ON payments(hotel_id, stay_id, created_at)",
+  "CREATE TABLE IF NOT EXISTS refunds (id TEXT PRIMARY KEY NOT NULL, tenant_id TEXT NOT NULL, hotel_id TEXT NOT NULL, payment_id TEXT NOT NULL, stay_id TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'CNY', status TEXT NOT NULL, idempotency_key TEXT NOT NULL, provider TEXT NOT NULL, provider_ref TEXT, failure_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (hotel_id, idempotency_key))",
+  "CREATE INDEX IF NOT EXISTS refunds_hotel_stay_idx ON refunds(hotel_id, stay_id, created_at)",
 ];
+
+export const PAYMENT_STATUS = { PENDING: "pending", CAPTURED: "captured", FAILED: "failed" } as const;
+export const REFUND_STATUS = { PENDING: "pending", REFUNDED: "refunded", FAILED: "failed" } as const;
 
 export type FolioRecord = {
   id: string;
@@ -85,6 +95,11 @@ const LEDGER_FIELDS = "id, tenant_id, hotel_id, folio_id, entry_type, amount, cu
 const FOLIO_BY_STAY_SQL = `SELECT ${FOLIO_FIELDS} FROM folios WHERE hotel_id = ? AND stay_id = ? LIMIT 1`;
 const FOLIO_BY_ID_SQL = `SELECT ${FOLIO_FIELDS} FROM folios WHERE hotel_id = ? AND id = ? LIMIT 1`;
 const LEDGER_BY_KEY_SQL = `SELECT ${LEDGER_FIELDS} FROM ledger_entries WHERE hotel_id = ? AND idempotency_key = ? LIMIT 1`;
+const PAYMENT_BY_KEY_SQL = "SELECT id, tenant_id, hotel_id, stay_id, payment_type, method, amount, currency, status, idempotency_key, provider, provider_ref, created_at, updated_at FROM payments WHERE hotel_id = ? AND idempotency_key = ? LIMIT 1";
+const REFUND_BY_KEY_SQL = "SELECT id, tenant_id, hotel_id, payment_id, stay_id, amount, currency, status, idempotency_key, provider, provider_ref, failure_code, created_at, updated_at FROM refunds WHERE hotel_id = ? AND idempotency_key = ? LIMIT 1";
+
+export type PaymentRecord = { id: string; tenant_id: string; hotel_id: string; stay_id: string; payment_type: string; method: string; amount: number; currency: string; status: string; idempotency_key: string; provider: string; provider_ref: string | null; created_at: string; updated_at: string };
+export type RefundRecord = { id: string; tenant_id: string; hotel_id: string; payment_id: string; stay_id: string; amount: number; currency: string; status: string; idempotency_key: string; provider: string; provider_ref: string | null; failure_code: string | null; created_at: string; updated_at: string };
 
 /** Per-type totals in one row, generated from the entry-type catalogue. */
 const LEDGER_TOTALS_SQL = `SELECT ${Object.values(LEDGER_ENTRY_TYPES)
@@ -222,7 +237,29 @@ export type OpenFolioInput = {
   depositAmount: number;
   stayStatus?: StayStatus;
   requestId?: string | null;
+  paymentMethod?: string;
 };
+
+/** The demo payment adapter returns a captured receipt; a real adapter replaces this function. */
+export async function ensureDepositPaymentWith(db: SqlRunner, input: { tenantId: string; hotelId: string; stayId: string; amount: number; requestId: string; method?: string }) {
+  if (input.amount <= 0) return null;
+  const key = `deposit-payment:${input.stayId}`;
+  const existing = await db.first<PaymentRecord>(PAYMENT_BY_KEY_SQL, [input.hotelId, key]);
+  if (existing) {
+    if (Number(existing.amount) !== input.amount || existing.payment_type !== "deposit") throw new Error(FOLIO_ERRORS.IDEMPOTENCY_REUSED);
+    if (existing.status !== PAYMENT_STATUS.CAPTURED) throw new Error(FOLIO_ERRORS.PAYMENT_NOT_CAPTURED);
+    return existing;
+  }
+  const stamp = new Date().toISOString();
+  const providerRef = `SIM-PAY-${crypto.randomUUID().slice(0, 8)}`;
+  await db.run(
+    "INSERT OR IGNORE INTO payments (id, tenant_id, hotel_id, stay_id, payment_type, method, amount, currency, status, idempotency_key, provider, provider_ref, created_at, updated_at) VALUES (?, ?, ?, ?, 'deposit', ?, ?, 'CNY', ?, ?, 'demo', ?, ?, ?)",
+    [`pay-${crypto.randomUUID()}`, input.tenantId, input.hotelId, input.stayId, input.method ?? "deposit_simulator", input.amount, PAYMENT_STATUS.CAPTURED, key, providerRef, stamp, stamp],
+  );
+  const payment = await db.first<PaymentRecord>(PAYMENT_BY_KEY_SQL, [input.hotelId, key]);
+  if (!payment || payment.status !== PAYMENT_STATUS.CAPTURED) throw new Error(FOLIO_ERRORS.PAYMENT_NOT_CAPTURED);
+  return payment;
+}
 
 /** Opens the guest account and books the deposit. Safe to call on every retry. */
 export async function openFolioWith(db: SqlRunner, input: OpenFolioInput) {
@@ -238,6 +275,7 @@ export async function openFolioWith(db: SqlRunner, input: OpenFolioInput) {
   const folio = await readFolio(db, input.hotelId, input.stayId);
   if (!folio) throw new Error(FOLIO_ERRORS.CREATE_FAILED);
   if (input.depositAmount > 0) {
+    await ensureDepositPaymentWith(db, { tenantId: input.tenantId, hotelId: input.hotelId, stayId: input.stayId, amount: input.depositAmount, requestId: input.requestId ?? input.stayId, method: input.paymentMethod });
     await postLedgerEntryWith(db, {
       tenantId: input.tenantId,
       hotelId: input.hotelId,
@@ -251,6 +289,30 @@ export async function openFolioWith(db: SqlRunner, input: OpenFolioInput) {
   }
   const current = await readFolio(db, input.hotelId, input.stayId);
   return { folio: current ?? folio, idempotent: Number(folio.version) > 1 || folio.status !== FOLIO_STATUS.OPEN };
+}
+
+/** Create a pending refund, then accept the simulated provider callback. */
+export async function refundDepositWith(db: SqlRunner, input: { tenantId: string; hotelId: string; stayId: string; amount: number; requestId: string }) {
+  assertAmount(input.amount);
+  if (input.amount <= 0) throw new Error(FOLIO_ERRORS.INVALID_AMOUNT);
+  const payment = await db.first<PaymentRecord>("SELECT id, tenant_id, hotel_id, stay_id, payment_type, method, amount, currency, status, idempotency_key, provider, provider_ref, created_at, updated_at FROM payments WHERE hotel_id = ? AND stay_id = ? AND payment_type = 'deposit' ORDER BY created_at LIMIT 1", [input.hotelId, input.stayId]);
+  if (!payment || payment.status !== PAYMENT_STATUS.CAPTURED) throw new Error(FOLIO_ERRORS.PAYMENT_NOT_CAPTURED);
+  const key = `deposit-refund:${input.stayId}`;
+  const existing = await db.first<RefundRecord>(REFUND_BY_KEY_SQL, [input.hotelId, key]);
+  if (existing) {
+    if (Number(existing.amount) !== input.amount || existing.payment_id !== payment.id) throw new Error(FOLIO_ERRORS.IDEMPOTENCY_REUSED);
+    return existing;
+  }
+  const stamp = new Date().toISOString();
+  await db.run("INSERT OR IGNORE INTO refunds (id, tenant_id, hotel_id, payment_id, stay_id, amount, currency, status, idempotency_key, provider, provider_ref, failure_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'CNY', ?, ?, 'demo', NULL, NULL, ?, ?)", [`ref-${crypto.randomUUID()}`, input.tenantId, input.hotelId, payment.id, input.stayId, input.amount, REFUND_STATUS.PENDING, key, stamp, stamp]);
+  const pending = await db.first<RefundRecord>(REFUND_BY_KEY_SQL, [input.hotelId, key]);
+  if (!pending) throw new Error(FOLIO_ERRORS.REFUND_PENDING);
+  // Simulated adapter callback: only this callback transitions pending -> refunded.
+  const providerRef = `SIM-REF-${crypto.randomUUID().slice(0, 8)}`;
+  await db.run("UPDATE refunds SET status = ?, provider_ref = ?, updated_at = ? WHERE hotel_id = ? AND id = ? AND status = ?", [REFUND_STATUS.REFUNDED, providerRef, stamp, input.hotelId, pending.id, REFUND_STATUS.PENDING]);
+  const completed = await db.first<RefundRecord>(REFUND_BY_KEY_SQL, [input.hotelId, key]);
+  if (!completed || completed.status !== REFUND_STATUS.REFUNDED) throw new Error(FOLIO_ERRORS.REFUND_FAILED);
+  return completed;
 }
 
 export type PostChargeInput = {
@@ -402,6 +464,7 @@ export type SettleFolioResult = {
   quote: CheckoutQuote;
   settled: number;
   idempotent: boolean;
+  refund?: RefundRecord | null;
 };
 
 /**
@@ -429,6 +492,7 @@ export async function settleFolioWith(db: SqlRunner, input: SettleFolioInput): P
   }
   const quote = await quoteCheckoutWith(db, input);
   let settled = 0;
+  let refund: RefundRecord | null = null;
   if (quote.due > 0) {
     await postLedgerEntryWith(db, {
       tenantId, hotelId: input.hotelId, folioId: folio.id,
@@ -437,6 +501,8 @@ export async function settleFolioWith(db: SqlRunner, input: SettleFolioInput): P
     });
     settled = quote.due;
   } else if (quote.due < 0) {
+    refund = await refundDepositWith(db, { tenantId, hotelId: input.hotelId, stayId: input.stayId, amount: -quote.due, requestId: input.requestId });
+    if (refund.status !== REFUND_STATUS.REFUNDED) throw new Error(FOLIO_ERRORS.REFUND_PENDING);
     await postLedgerEntryWith(db, {
       tenantId, hotelId: input.hotelId, folioId: folio.id,
       entryType: LEDGER_ENTRY_TYPES.REFUND, amount: -quote.due,
@@ -447,7 +513,7 @@ export async function settleFolioWith(db: SqlRunner, input: SettleFolioInput): P
   const remaining = await recomputeFolioBalance(db, input.hotelId, folio.id);
   if (remaining !== 0) throw new Error(FOLIO_ERRORS.NOT_BALANCED);
   const closed = await closeFolioWith(db, { hotelId: input.hotelId, folio, expectedVersion: input.expectedVersion });
-  return { folio: closed.folio, quote: await quoteCheckoutWith(db, input), settled, idempotent: closed.idempotent };
+  return { folio: closed.folio, quote: await quoteCheckoutWith(db, input), settled, idempotent: closed.idempotent, refund };
 }
 
 /**

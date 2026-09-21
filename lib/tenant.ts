@@ -25,6 +25,7 @@ const additiveColumns: Array<[string, string]> = [
   ["admin_audit_events", "tenant_id TEXT"], ["admin_audit_events", "hotel_id TEXT"], ["admin_audit_events", "request_id TEXT"], ["admin_audit_events", "action_id TEXT"],
   ["admin_actions", "tenant_id TEXT"], ["admin_actions", "hotel_id TEXT"], ["admin_actions", "workflow_id TEXT"],
   ["ai_request_metrics", "tenant_id TEXT"], ["ai_request_metrics", "hotel_id TEXT"],
+  ["demo_sessions", "note TEXT"],
 ];
 
 export async function ensureTenantFoundation() {

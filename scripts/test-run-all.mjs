@@ -32,6 +32,13 @@ const suites = [
   ["checkin-checkout-loop", [STRIP_TYPES], "test-checkin-checkout-loop.mjs"],
   ["settlement-concurrency", [STRIP_TYPES], "test-settlement-concurrency.mjs"],
   ["schema-drift", [STRIP_TYPES], "test-schema-drift.mjs"],
+  ["retention-d1", [STRIP_TYPES], "test-retention-d1.mjs"],
+  ["inhouse-d1", [STRIP_TYPES], "test-inhouse-d1.mjs"],
+  ["knowledge-d1", [STRIP_TYPES], "test-knowledge-d1.mjs"],
+  ["knowledge-admin-d1", [STRIP_TYPES], "test-knowledge-admin-d1.mjs"],
+  ["knowledge-eval-d1", [STRIP_TYPES], "test-knowledge-eval-d1.mjs"],
+  ["terminal-session-d1", [STRIP_TYPES], "test-terminal-session-d1.mjs"],
+  ["legacy-projection-d1", [STRIP_TYPES], "test-legacy-projection-d1.mjs"],
 ];
 
 const failures = [];

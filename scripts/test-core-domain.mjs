@@ -7,7 +7,8 @@ const backfill = read("drizzle/0009_legacy_core_backfill.sql");
 const domain = read("lib/hotel-core.ts");
 const workflow = read("lib/workflow-engine.ts");
 const adapter = read("services/pms/simulator-adapter.ts");
-const sync = read("lib/legacy-core-sync.ts");
+// 投影 SQL 住在 legacy-projection-core.ts，适配层只负责执行；两处一起看才是完整的旧数据投影。
+const sync = read("lib/legacy-core-sync.ts") + read("lib/legacy-projection-core.ts");
 const admin = read("lib/admin-service.ts");
 
 for (const table of ["room_types", "rooms", "room_status_logs", "reservations", "reservation_rooms", "reservation_status_logs", "stays", "folios", "ledger_entries", "workflow_runs", "workflow_steps"]) {

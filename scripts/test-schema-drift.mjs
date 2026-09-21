@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { createMiniflareD1 } from "./miniflare-d1.mjs";
 import { ORDERS_DDL } from "../lib/orders-core.ts";
 import { FOLIOS_DDL } from "../lib/settlement-core.ts";
+import { INHOUSE_DDL } from "../lib/inhouse-core.ts";
+import { KNOWLEDGE_DDL } from "../lib/knowledge-core.ts";
 
 /**
  * Schema drift guard. The repository builds its schema twice: once in
@@ -44,7 +46,7 @@ const columns = async (table) => {
   return rows.results.map((row) => String(row.name)).sort();
 };
 
-const runtimeDdl = [...ORDERS_DDL, ...FOLIOS_DDL];
+const runtimeDdl = [...ORDERS_DDL, ...FOLIOS_DDL, ...INHOUSE_DDL, ...KNOWLEDGE_DDL.slice(0, 4)];
 
 try {
   for (const statement of runtimeDdl) await db.prepare(statement).run();

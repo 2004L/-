@@ -42,8 +42,10 @@
     "test:settlement-d1": "node --experimental-strip-types scripts/test-settlement-d1.mjs",
     "test:checkin-checkout-loop": "node --experimental-strip-types scripts/test-checkin-checkout-loop.mjs",
     "accept:guest-loop": "node scripts/acceptance-guest-loop.mjs",
+    "accept:housekeeping": "node scripts/acceptance-housekeeping.mjs",
     "test:settlement-concurrency": "node --experimental-strip-types scripts/test-settlement-concurrency.mjs",
     "test:schema-drift": "node --experimental-strip-types scripts/test-schema-drift.mjs",
+    "test:legacy-projection-d1": "node --experimental-strip-types scripts/test-legacy-projection-d1.mjs",
     "db:audit": "node --experimental-strip-types scripts/db-schema-audit.mjs",
     "test:asr": "node scripts/test-asr-accuracy.mjs",
     "test:security": "node scripts/check-secrets.mjs"

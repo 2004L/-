@@ -142,7 +142,9 @@ balance = due − roomTotal + postedRoomCharge
 | 真实 D1 集成 | `scripts/test-settlement-d1.mjs` | 开账/挂账/报价/离店/结算/退款/清洁/关账保护/恒等式，35 项 |
 | 双连接并发 | `scripts/test-settlement-concurrency.mjs` | 并发开账、并发挂账、并发离店、并发结算、关账后重放，22 项 |
 | 迁移与运行时 DDL 漂移 | `scripts/test-schema-drift.mjs` | 20 张表 + 5 个补列的一致性 |
-| 入住到退房闭环 | `scripts/test-checkin-checkout-loop.mjs` | 终端入住 → 终端退房 → 打扫回可售，25 项 |
+| 入住到退房闭环 | `scripts/test-checkin-checkout-loop.mjs` | 终端入住 → 终端退房 → 打扫回可售，40 项 |
+| 真机 HTTP 客人闭环 | `scripts/acceptance-guest-loop.mjs`（`pnpm accept:guest-loop`） | 走真实接口跑完入住 → 退房，30 项；需 `TARGET_BASE_URL` |
+| 真机 HTTP 客房闭环 | `scripts/acceptance-housekeeping.mjs`（`pnpm accept:housekeeping`） | 未登录被拒 / 前台被拒 / 客房把待清洁改成可售 / 重复确认幂等 / 审计留痕；需 `TARGET_BASE_URL` + `ADMIN_ACCEPT_PASSWORD` |
 
 关键断言：并发结算时**恰好一个调用方完成关账**，另一个识别为幂等；房费与补收各只入账一次；退款走反向分录；结算后余额归零且账实相符。
 
@@ -161,6 +163,22 @@ balance = due − roomTotal + postedRoomCharge
 
 建议：把 `pnpm db:audit` 加进发布门禁，并在部署流程里真正执行一次 `drizzle/*.sql`。这是 A0 起点固化尚未收掉的一角。
 
+### 8.1 端到端验收查出的三个问题（2026-09-19 已修）
+
+`scripts/acceptance-guest-loop.mjs` 走真实 HTTP 把「入住 → 退房」跑通 30 项之后，陆续查出三个问题，均已修复：
+
+| 问题 | 表现 | 修法 |
+| --- | --- | --- |
+| 空库没有跑迁移 | 全新 D1 上任何请求都 500：`no such table: demo_sessions` | 不是代码 bug，是部署缺口：`drizzle/0000`–`0016` 必须按序执行一次。已在全新 `--persist-to` 目录上验证 17 个迁移顺序执行后闭环 30 项全过 |
+| 入住写死 1208 | 1208 在演示库里是脏房，锁房 CAS 落空，`room_conflict` 还被同步层静默吞掉，于是退房时查不到人 | 服务端自己挑可售房（见第 9 节）；房态关键写入不再静默降级 |
+| `reservation_rooms` 重复行 | 一个预订两行房价，报价把房费算成两倍（`roomTotal` 760 应为 380，`due` 460 应为 80） | 两个写入方（`ensureCheckinOrder`、`lib/legacy-core-sync.ts`）都补 `AND NOT EXISTS`；新增 `drizzle/0016_reservation_rooms_dedupe.sql` 清理存量（保留带 `room_id` 的那行）；`settleFolioWith` 加 `rateRowMismatch` 守卫 |
+
+演示库实修结果：`reservation_rooms` 16 行 → 8 行，重复预订从 8 个降到 0，重跑迁移幂等；4821 那笔报价从 `roomTotal=760 / due=460` 回到 `roomTotal=380 / due=80`。
+
+另外查出一处**演示数据与模拟 PMS 不一致**：种子订单里卖的是三种房型（标准大床房 / 高级大床房 / 豪华双床房），而 `services/pms/simulator-adapter.ts` 的房型目录里没有标准大床房。后果是该房型的订单（含现场办理单）在自助终端一路走到 `no_sellable_room` 转人工，永远办不成入住。已在模拟酒店补一间 `1108`（STD-KING，可售）；模拟酒店卖什么房型，就得有什么房。
+
+> 本地开发注意：`wrangler dev` 热重载时会把正在处理的请求打成 `503 Your worker restarted mid-request`，响应正文本身就在要求重发一次。这不是业务结果，两个验收脚本都按提示对 503 重试一次。
+
 ---
 
 ## 9. 终端入口（已接通）
@@ -177,6 +195,8 @@ balance = due − roomTotal + postedRoomCharge
 - 还没接房卡读卡器，所以用「房间号 + 手机号后四位」两要素识别；任一不匹配即查不到，同一房间出现多笔在住会停在 `ambiguous` 转人工。
 - 闭环用例（`scripts/test-checkin-checkout-loop.mjs`）先跑一遍终端入住，再用同一台终端查退房，覆盖：两要素识别、开账带押金、房费 = 每晚房价 × 晚数、补收 = 房费 − 押金、离店后查不到、重复退房幂等、打扫后房间回可售、四段房态流水齐备。
 - 该用例上线即查出一个真 bug：`findInHouseStaysWith` 把 D1 返回的下划线字段当驼峰字段用，`stayId` / `guestNameMasked` 全是 `undefined`，终端退房会一路撞到 `invalid_stay_id`。已改为显式行映射。
+- 终端**不报房号**：`hold-room` 省略 `room_number` 时由服务端在「可售且未被在住预订占用」的房里挑一间，客人和终端都不需要知道哪间刚打扫过；房里只有脏房时返回 `no_sellable_room` 并转人工，而不是把脏房卖出去。
+- 新增 `room-clean` 动作（不复用终端退房链路，只做 `VACANT_DIRTY → VACANT_CLEAN` + `ROOM_CLEANED` 审计）：客房打扫完成后房间重新可售。终端侧用这个接口联调；客房侧在管理后台点「打扫完成，改为可售」（`admin.mark_room_clean`），两条入口落到同一个 `markRoomCleanWith` 上。
 
 ---
 
@@ -187,3 +207,23 @@ balance = due − roomTotal + postedRoomCharge
 - 长住多晚的分段结算、部分退款、跨班次交接
 - `folios` 目前一次结清；`settling` 状态下的多次部分结算尚未支持
 - 房态仍是单值 `ROOM_STATUS`，规范要求的五维房态（占用/清洁/维修/锁房/售卖）尚未拆分
+- 「客房打扫完成」已接进管理后台：`admin.mark_room_clean`（权限 `admin:housekeeping`，授予客房/店长/老板；前台刻意不给）+ 房态卡片上的按钮 + `ADMIN_ROOM_MARKED_CLEAN` 审计。它是唯一不需要确认弹窗的写操作：只能做 `VACANT_DIRTY → VACANT_CLEAN`、可逆，且占用中或已锁定的房间会被房态机直接拒绝。
+- 还缺一张「待清洁房列表」：现在要知道哪几间是脏房，得逐间查 `admin.get_room_status`，客房没法一眼看到今天要打扫哪几间。A3 的房态看板应补一个按楼层/房态筛选的列表。
+
+---
+
+## 11. 历史数据清理（按时间范围，已接通）
+
+已完成的闭环（已退房）可以按时间范围清理。入口在管理后台「数据保留」卡片，五档：近三天 / 近七天 / 近一个月 / 近半年 / 近一年；也可以直接说「清理近一个月的已退房记录」。
+
+- **语义**：删除所选**时间窗口内**的已退房闭环。窗口是 `[now − N 天, now]`，以 `stays.checked_out_at` 判定。在住的入住记录、开着的账本、房间当前状态都不在删除集合里。
+- **连带删除**：一个闭环删干净——`ledger_entries` → `folios` → `stays` → `reservation_rooms` → `reservation_status_logs` → `reservations` → `orders`（`orders` 只在没有别的预订还引用它时才删）。
+- **受控流程**：必须先生成确认单、核对数量后才能执行（权限 `admin:purge_data`，只给店长/老板；前台和客房实测都是 403）。**窗口和数量在生成确认单时就冻结**，执行时按冻结的窗口删，不重算「现在」——看到多少就删多少。
+- **幂等**：再执行一次没有可删的闭环，回执是 0，不会误伤。
+- **房态不改写**：清理的是历史，不是房间当前状态。
+
+用例：`scripts/test-retention-d1.mjs`（28 项，真实 D1），覆盖五档区间归属、只删窗口内、连带删除完整、在住房与开着的账本不动、幂等、参数与窗口校验。
+
+真机验证（2026-09-19）：演示库按「近三天」清理掉 3 笔已退房闭环（3 账本 / 9 分录 / 3 预订 / 3 订单），在住的 `MT-20260914-4821`、`MT-20260913-7366` 和 5 间房的状态都没动；被清理的订单（`WALKIN-20260914-9053`）随后**可以重新完整演示入住 → 退房**。也就是说，这套清理顺带承担了「重置演示数据」的角色，而且是一条可审计的正规操作，不是特例代码。
+
+> 边界：`stays` 里那些指向不存在预订的残留行**不在**这套清理的删除集合里——它们的状态是在住，不是已退房闭环。要清它们得另立一条规则（见第 8.1 节）。

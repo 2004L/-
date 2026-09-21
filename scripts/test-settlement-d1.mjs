@@ -55,6 +55,7 @@ async function seedStay({ suffix, rate, reservationAmount, roomNumber }) {
 
 try {
   await execSql("drizzle/0008_hotel_core_domain.sql");
+  await execSql("drizzle/0021_payments_refunds.sql");
   const paid = await seedStay({ suffix: "paid", rate: 380, reservationAmount: 680, roomNumber: "1206" });
   const refund = await seedStay({ suffix: "refund", rate: 190, reservationAmount: 190, roomNumber: "1208" });
 
@@ -63,6 +64,7 @@ try {
   check("开账落库且状态为 open", opened.folio.status === FOLIO_STATUS.OPEN, opened.folio.status);
   check("押金记为负数（酒店欠客人）", Number(opened.folio.balance) === -300, String(opened.folio.balance));
   check("押金分录唯一", (await count("SELECT COUNT(*) AS c FROM ledger_entries WHERE hotel_id = ? AND folio_id = ?", [HOTEL, opened.folio.id])) === 1);
+  check("押金支付记录为已收", (await one("SELECT status, payment_type FROM payments WHERE hotel_id = ? AND stay_id = ?", [HOTEL, paid.stayId]))?.status === "captured" && (await one("SELECT status, payment_type FROM payments WHERE hotel_id = ? AND stay_id = ?", [HOTEL, paid.stayId]))?.payment_type === "deposit");
   await openFolioWith(runner, { tenantId: TENANT, hotelId: HOTEL, stayId: paid.stayId, depositAmount: 300, stayStatus: STAY_STATUS.IN_HOUSE, requestId: "req-open-1" });
   check("重复开账幂等：仍只有一条 folio", (await count("SELECT COUNT(*) AS c FROM folios WHERE hotel_id = ? AND stay_id = ?", [HOTEL, paid.stayId])) === 1);
   check("重复开账幂等：押金不重复记账", (await count("SELECT COUNT(*) AS c FROM ledger_entries WHERE hotel_id = ? AND folio_id = ?", [HOTEL, opened.folio.id])) === 1);
@@ -137,6 +139,8 @@ try {
   await checkoutStayWith(runner, { hotelId: HOTEL, stayId: refund.stayId, requestId: "req-out-2" });
   const refunded = await settleFolioWith(runner, { hotelId: HOTEL, stayId: refund.stayId, requestId: "req-settle-2" });
   check("退款按反向分录记账", refunded.settled === -110, String(refunded.settled));
+  check("退款回执状态为已退", refunded.refund?.status === "refunded", String(refunded.refund?.status));
+  check("退款保存支付渠道回执", Boolean(refunded.refund?.provider_ref), String(refunded.refund?.provider_ref));
   check("退款后余额归零", Number(refunded.folio.balance) === 0, String(refunded.folio.balance));
   check("退款分录为正数（抵扣客人欠款）", (await one("SELECT amount FROM ledger_entries WHERE hotel_id = ? AND folio_id = ? AND entry_type = ?", [HOTEL, refunded.folio.id, LEDGER_ENTRY_TYPES.REFUND])).amount === 110);
   check("退款后账实相符", (await verifyFolioLedger(runner, HOTEL, refunded.folio.id)).balanced === true);

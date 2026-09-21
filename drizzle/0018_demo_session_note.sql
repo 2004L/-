@@ -1,0 +1,1 @@
+ALTER TABLE demo_sessions ADD COLUMN note TEXT;

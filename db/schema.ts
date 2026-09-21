@@ -237,6 +237,40 @@ export const walkInPayments = sqliteTable(
   (table) => [uniqueIndex("walk_in_payments_draft_uq").on(table.draftId)]
 );
 
+export const payments = sqliteTable("payments", {
+  id: text("id").primaryKey(),
+  tenantId: text("tenant_id").notNull(),
+  hotelId: text("hotel_id").notNull(),
+  stayId: text("stay_id").notNull(),
+  paymentType: text("payment_type").notNull(),
+  method: text("method").notNull(),
+  amount: integer("amount").notNull(),
+  currency: text("currency").notNull().default("CNY"),
+  status: text("status").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  provider: text("provider").notNull(),
+  providerRef: text("provider_ref"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [uniqueIndex("payments_hotel_idempotency_uq").on(table.hotelId, table.idempotencyKey), index("payments_hotel_stay_idx").on(table.hotelId, table.stayId, table.createdAt)]);
+
+export const refunds = sqliteTable("refunds", {
+  id: text("id").primaryKey(),
+  tenantId: text("tenant_id").notNull(),
+  hotelId: text("hotel_id").notNull(),
+  paymentId: text("payment_id").notNull(),
+  stayId: text("stay_id").notNull(),
+  amount: integer("amount").notNull(),
+  currency: text("currency").notNull().default("CNY"),
+  status: text("status").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  provider: text("provider").notNull(),
+  providerRef: text("provider_ref"),
+  failureCode: text("failure_code"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [uniqueIndex("refunds_hotel_idempotency_uq").on(table.hotelId, table.idempotencyKey), index("refunds_hotel_stay_idx").on(table.hotelId, table.stayId, table.createdAt)]);
+
 export const adminUsers = sqliteTable("admin_users", {
   id: text("id").primaryKey(),
   tenantId: text("tenant_id"),

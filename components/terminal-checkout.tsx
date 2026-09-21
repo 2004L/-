@@ -1,13 +1,16 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Check,
   CircleCheck,
   CreditCard,
   DoorOpen,
+  ArrowRight,
+  Info,
   IdCard,
   LoaderCircle,
+  RefreshCcw,
   ShieldCheck,
   TrendingUp,
   X,
@@ -50,9 +53,9 @@ const CHOICES: ChoiceDefinition[] = [
   },
   {
     id: "checkout",
-    title: "办理退房",
-    subtitle: "房费结清 · 押金退还 · 房态回收",
-    hint: "输入房间号与预订手机号后四位",
+    title: "退房 / 换房",
+    subtitle: "退房结算 · 押金退还 · 前台换房",
+    hint: "自助退房，或进入前台换房流程",
     accent: "#34c759",
     Icon: DoorOpen,
   },
@@ -130,7 +133,7 @@ type QuoteView = {
 
 type CheckoutPhase = "identify" | "quoting" | "quoted" | "settling" | "done" | "needs_followup" | "not_found" | "ambiguous" | "error";
 
-const CHECKOUT_STEPS = ["身份识别", "账目核对", "结算", "房态回收"] as const;
+const CHECKOUT_STEPS = ["身份识别", "收回房卡", "账目核对", "结算", "房态回收"] as const;
 
 const ERROR_TEXT: Record<string, string> = {
   invalid_room_number: "房间号格式不正确，请输入 3-5 位数字。",
@@ -143,6 +146,9 @@ const ERROR_TEXT: Record<string, string> = {
   folio_version_conflict: "有另一笔结算正在处理，请稍后重试或到前台办理。",
   folio_not_balanced: "账目未平，已停止自动结算并转前台处理。",
   folio_already_closed: "这笔账已经结清过了。",
+  deposit_payment_not_captured: "押金收款没有确认，系统已暂停办理，请到前台核对。",
+  deposit_refund_pending: "退房已完成，但押金退款仍在等待支付渠道回执，请保留凭证并到前台查询。",
+  deposit_refund_failed: "退房已完成，但押金退款失败，系统已转前台人工处理。",
   internal_error: "系统暂时无法完成操作，请到前台办理。",
 };
 
@@ -167,7 +173,7 @@ function MoneyRow({ label, value, tone = "plain" }: { label: string; value: stri
 
 function StepRail({ active }: { active: number }) {
   return (
-    <ol className="mt-6 grid gap-2 sm:grid-cols-4">
+    <ol className="mt-6 grid gap-2 sm:grid-cols-5">
       {CHECKOUT_STEPS.map((label, index) => (
         <li
           key={label}
@@ -187,19 +193,25 @@ export function TerminalCheckoutPanel({
   sessionId,
   onExit,
   onFinished,
+  onOpenFrontdesk,
 }: {
   sessionId: string;
   onExit: () => void;
   onFinished: () => Promise<void> | void;
+  onOpenFrontdesk: () => void;
 }) {
+  const [activeMode, setActiveMode] = useState<"checkout" | "room_change">("checkout");
   const [phase, setPhase] = useState<CheckoutPhase>("identify");
   const [roomNumber, setRoomNumber] = useState("");
   const [phoneLast4, setPhoneLast4] = useState("");
   const [stay, setStay] = useState<StayView | null>(null);
   const [quote, setQuote] = useState<QuoteView | null>(null);
   const [candidates, setCandidates] = useState<StayView[]>([]);
-  const [receipt, setReceipt] = useState<{ settlement: number; folioStatus: string } | null>(null);
+  const [receipt, setReceipt] = useState<{ settlement: number; folioStatus: string; refundStatus: string | null; refundProviderRef: string | null } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cardPhase, setCardPhase] = useState<"waiting" | "checking" | "collected" | "failed">("waiting");
+  const backgroundSettlementRef = useRef<string | null>(null);
+  const [cardStorage, setCardStorage] = useState<string | null>(null);
 
   const post = useCallback(
     async <T,>(action: string, body: Record<string, unknown>): Promise<T> => {
@@ -216,6 +228,8 @@ export function TerminalCheckoutPanel({
   );
 
   const canLookup = /^\d{3,5}$/.test(roomNumber.trim()) && /^\d{4}$/.test(phoneLast4.trim());
+  const roomError = roomNumber.length > 0 && !/^\d{3,5}$/.test(roomNumber.trim()) ? "请输入 3–5 位数字" : "";
+  const phoneError = phoneLast4.length > 0 && !/^\d{4}$/.test(phoneLast4.trim()) ? "请输入 4 位数字" : "";
 
   async function lookup() {
     if (!canLookup) return;
@@ -229,6 +243,8 @@ export function TerminalCheckoutPanel({
       if (data.outcome === "quoted" && data.stay && data.quote) {
         setStay(data.stay);
         setQuote(data.quote);
+        setCardPhase("waiting");
+        setCardStorage(null);
         setPhase("quoted");
         return;
       }
@@ -240,31 +256,50 @@ export function TerminalCheckoutPanel({
     }
   }
 
-  async function confirm() {
-    if (!stay) return;
+  async function returnCard() {
+    if (!stay?.room_number || cardPhase === "checking" || cardPhase === "collected") return;
+    setCardPhase("checking");
     setError(null);
-    setPhase("settling");
     try {
-      const data = await post<{ outcome: string; settlement?: number; folio_status?: string }>("checkout-confirm", {
-        stay_id: stay.stay_id,
-        request_id: `${sessionId}:${stay.stay_id}:checkout:${Date.now()}`,
+      const response = await fetch("/api/device/card-return", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, case_id: stay.stay_id, idempotency_key: `${sessionId}:card-return:${stay.stay_id}`, expected_state: "CHECKED_IN", device_id: "card-returner-demo-01", room_number: stay.room_number }),
       });
-      if (data.outcome === "settled") {
-        setReceipt({ settlement: data.settlement ?? 0, folioStatus: data.folio_status ?? "closed" });
-        setPhase("done");
-        await onFinished();
-        return;
+      const data = (await response.json().catch(() => ({}))) as { ok?: boolean; result?: { storage_bin?: string }; error?: string };
+      if (!response.ok || !data.ok) throw new Error(data.error ?? "card_return_failed");
+      setCardStorage(data.result?.storage_bin ?? "returner-bin-01");
+      setCardPhase("collected");
+      setPhase("done");
+      const stayId = stay.stay_id;
+      if (backgroundSettlementRef.current !== stayId) {
+        backgroundSettlementRef.current = stayId;
+        void post<{ outcome: string; settlement?: number; folio_status?: string; refund_status?: string | null; refund_provider_ref?: string | null }>("checkout-confirm", {
+          stay_id: stayId,
+          request_id: `${sessionId}:${stayId}:checkout:${Date.now()}`,
+        }).then((result) => {
+          setReceipt({ settlement: result.settlement ?? 0, folioStatus: result.folio_status ?? "closed", refundStatus: result.refund_status ?? null, refundProviderRef: result.refund_provider_ref ?? null });
+          void onFinished();
+        }).catch(() => {
+          // 客人已经完成收卡，结算失败交给后台待处理，不让客人在终端等待。
+          void onFinished();
+        });
       }
-      setPhase("needs_followup");
     } catch (caught) {
-      setError(errorText(caught));
-      setPhase("error");
+      setCardPhase("failed");
+      setError("没有检测到房卡，请把房卡插入收卡器后重试。" + (caught instanceof Error && caught.message ? `（${caught.message}）` : ""));
     }
   }
 
+  useEffect(() => {
+    if (phase !== "done") return;
+    const timer = window.setTimeout(() => onExit(), 10000);
+    return () => window.clearTimeout(timer);
+  }, [onExit, phase]);
+
   const stepIndex = phase === "identify" || phase === "quoting" || phase === "not_found" || phase === "ambiguous" || phase === "error"
     ? 0
-    : phase === "quoted" ? 1 : 2;
+    : phase === "quoted" && cardPhase !== "collected" ? 1 : phase === "quoted" ? 2 : 3;
 
   return (
     <section className="mt-10 w-full max-w-3xl animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -276,8 +311,8 @@ export function TerminalCheckoutPanel({
               <DoorOpen size={22} />
             </span>
             <div>
-              <h2 className="text-xl font-semibold tracking-tight">自助退房</h2>
-              <p className="mt-0.5 text-xs text-[#86868b]">报价由正式账本计算，确认前不会写入任何结算</p>
+              <h2 className="text-xl font-semibold tracking-tight">退房 / 换房</h2>
+              <p className="mt-0.5 text-xs text-[#86868b]">先选择业务，系统会明确告诉您每一步会发生什么</p>
             </div>
           </div>
           <button type="button" onClick={onExit} className="flex items-center gap-1 rounded-full bg-[#f2f2f7] px-3 py-2 text-xs text-[#6e6e73] transition hover:bg-[#e5e5ea]">
@@ -285,49 +320,65 @@ export function TerminalCheckoutPanel({
           </button>
         </div>
 
-        <StepRail active={phase === "done" ? 4 : stepIndex} />
+        <div className="mt-6 grid grid-cols-2 rounded-2xl bg-[#f5f5f7] p-1" role="tablist" aria-label="退房或换房">
+          <button type="button" role="tab" aria-selected={activeMode === "checkout"} onClick={() => setActiveMode("checkout")} className={`rounded-xl px-3 py-2.5 text-sm font-medium transition ${activeMode === "checkout" ? "bg-white text-[#1d1d1f] shadow-sm" : "text-[#86868b]"}`}><DoorOpen size={15} className="mr-1.5 inline" />自助退房</button>
+          <button type="button" role="tab" aria-selected={activeMode === "room_change"} onClick={() => setActiveMode("room_change")} className={`rounded-xl px-3 py-2.5 text-sm font-medium transition ${activeMode === "room_change" ? "bg-white text-[#1769aa] shadow-sm" : "text-[#86868b]"}`}><RefreshCcw size={15} className="mr-1.5 inline" />申请换房</button>
+        </div>
 
-        {(phase === "identify" || phase === "quoting") && (
+        {activeMode === "room_change" && (
+          <div className="mt-6 rounded-2xl border border-[#d8e9f8] bg-[#f7fbff] p-5">
+            <div className="flex items-start gap-3"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#eaf4ff] text-[#1769aa]"><RefreshCcw size={17} /></div><div><h3 className="font-semibold text-[#173b59]">换房需要前台确认</h3><p className="mt-1 text-sm leading-6 text-[#58738a]">换房会同时释放原房、占用目标房、更新入住记录并重新制作房卡。为避免误换，系统会先核对客人身份和目标房态，再生成确认单。</p></div></div>
+            <div className="mt-5 grid gap-2 sm:grid-cols-3"><div className="rounded-xl bg-white px-3 py-3 text-xs text-[#58738a]"><span className="font-semibold text-[#1769aa]">1</span><span className="ml-2">核对住客与当前房间</span></div><div className="rounded-xl bg-white px-3 py-3 text-xs text-[#58738a]"><span className="font-semibold text-[#1769aa]">2</span><span className="ml-2">检查目标房可用性</span></div><div className="rounded-xl bg-white px-3 py-3 text-xs text-[#58738a]"><span className="font-semibold text-[#1769aa]">3</span><span className="ml-2">确认后执行并留痕</span></div></div>
+            <button type="button" onClick={onOpenFrontdesk} className="mt-5 flex w-full items-center justify-center gap-2 rounded-2xl bg-[#1769aa] px-5 py-3.5 text-sm font-medium text-white transition hover:bg-[#125981]">进入前台换房流程 <ArrowRight size={16} /></button>
+            <p className="mt-3 flex items-center justify-center gap-1.5 text-center text-xs text-[#7891a5]"><Info size={13} />不会在本页直接修改房态或房卡</p>
+          </div>
+        )}
+
+        {activeMode === "checkout" && <StepRail active={phase === "done" ? 4 : stepIndex} />}
+
+        {activeMode === "checkout" && (phase === "identify" || phase === "quoting") && (
           <div className="mt-6 animate-in fade-in duration-500">
-            <p className="text-sm leading-6 text-[#6e6e73]">
-              请输入您所住的房间号和预订时使用的手机号后四位。系统只查询当前在住的记录，两个条件必须同时匹配。
-            </p>
+            <div className="rounded-2xl bg-[#f7fbff] p-4 text-sm leading-6 text-[#4f6f86]"><p className="font-medium text-[#173b59]">只需要两项信息</p><p className="mt-1">请输入您所住的房间号和预订手机号后四位。系统只查询当前在住记录，两个条件必须同时匹配。</p></div>
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <label className="text-xs font-medium text-[#6e6e73]">
-                房间号
+                <span className="flex items-center justify-between">房间号 <span className="font-normal text-[#a1a1a6]">例如 1306</span></span>
                 <input
                   value={roomNumber}
                   onChange={(event) => setRoomNumber(event.target.value.replace(/\D/g, "").slice(0, 5))}
                   inputMode="numeric"
-                  placeholder="例如 1306"
-                  className="mt-2 w-full rounded-2xl border border-[#d9d9df] bg-white px-4 py-3 text-lg tracking-[.2em] outline-none focus:border-[#007aff]"
+                  placeholder="1306"
+                  className={`mt-2 w-full rounded-2xl border bg-white px-4 py-3 text-lg tracking-[.2em] outline-none focus:border-[#007aff] ${roomError ? "border-[#ffb4ad]" : "border-[#d9d9df]"}`}
                   aria-label="房间号"
                 />
+                {roomError && <span className="mt-1 block text-xs font-normal text-[#c54b12]">{roomError}</span>}
               </label>
               <label className="text-xs font-medium text-[#6e6e73]">
-                手机号后四位
+                <span className="flex items-center justify-between">手机号后四位 <span className="font-normal text-[#a1a1a6]">例如 4821</span></span>
                 <input
                   value={phoneLast4}
                   onChange={(event) => setPhoneLast4(event.target.value.replace(/\D/g, "").slice(0, 4))}
                   inputMode="numeric"
-                  placeholder="例如 4821"
-                  className="mt-2 w-full rounded-2xl border border-[#d9d9df] bg-white px-4 py-3 text-lg tracking-[.2em] outline-none focus:border-[#007aff]"
+                  placeholder="4821"
+                  className={`mt-2 w-full rounded-2xl border bg-white px-4 py-3 text-lg tracking-[.2em] outline-none focus:border-[#007aff] ${phoneError ? "border-[#ffb4ad]" : "border-[#d9d9df]"}`}
                   aria-label="手机号后四位"
                 />
+                {phoneError && <span className="mt-1 block text-xs font-normal text-[#c54b12]">{phoneError}</span>}
               </label>
             </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2"><span className="text-xs text-[#a1a1a6]">演示快速填入：</span><button type="button" onClick={() => { setRoomNumber("1208"); setPhoneLast4("4821"); }} className="rounded-full border border-[#d9e2ec] bg-white px-3 py-1.5 text-xs text-[#627d98]">1208 · 4821</button><button type="button" onClick={() => { setRoomNumber("1306"); setPhoneLast4("6395"); }} className="rounded-full border border-[#d9e2ec] bg-white px-3 py-1.5 text-xs text-[#627d98]">1306 · 6395</button></div>
             <button
               type="button"
               onClick={() => void lookup()}
               disabled={!canLookup || phase === "quoting"}
               className="mt-6 flex w-full items-center justify-center gap-2 rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white transition hover:bg-black disabled:opacity-30"
             >
-              {phase === "quoting" ? <><LoaderCircle size={18} className="animate-spin" />正在核对账目…</> : <>查询在住记录并生成报价</>}
+              {phase === "quoting" ? <><LoaderCircle size={18} className="animate-spin" />正在核对身份与账目…</> : <>查询在住记录并生成报价 <ArrowRight size={16} /></>}
             </button>
+            <p className="mt-3 flex items-center justify-center gap-1.5 text-center text-xs text-[#86868b]"><ShieldCheck size={13} />只展示脱敏信息，不会显示完整手机号或证件资料</p>
           </div>
         )}
 
-        {phase === "quoted" && stay && quote && (
+        {activeMode === "checkout" && phase === "quoted" && stay && quote && (
           <div className="mt-6 animate-in fade-in slide-in-from-bottom-3 duration-500">
             <div className="grid gap-3 rounded-2xl bg-[#f5f5f7] p-4 text-sm sm:grid-cols-2">
               <div><p className="text-xs text-[#86868b]">客人</p><p className="mt-1 font-medium">{stay.guest_name_masked}</p></div>
@@ -335,6 +386,10 @@ export function TerminalCheckoutPanel({
               <div><p className="text-xs text-[#86868b]">订单号</p><p className="mt-1 font-mono text-xs">{stay.reservation_no ?? "—"}</p></div>
               <div><p className="text-xs text-[#86868b]">入住时间</p><p className="mt-1 text-xs">{stay.checked_in_at ?? "—"}</p></div>
             </div>
+
+            {cardPhase !== "collected" && <div className="mt-5 rounded-2xl border border-[#b9d8f4] bg-[#f7fbff] p-5"><div className="flex items-start gap-3"><div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[#eaf4ff] text-[#1769aa]"><CreditCard size={19} /></div><div><h3 className="font-semibold text-[#173b59]">先归还房卡</h3><p className="mt-1 text-sm leading-6 text-[#58738a]">请将房卡插入收卡器。收卡器检测到卡片后会自动收纳，确认成功后才能继续退房。</p></div></div><div className="mt-4 flex items-center justify-between rounded-xl bg-white px-3 py-3 text-xs"><span className="text-[#627d98]">收卡器状态</span><span className={`rounded-full px-2.5 py-1 ${cardPhase === "checking" ? "bg-[#fff8e6] text-[#8a6d1f]" : cardPhase === "failed" ? "bg-[#fff2f1] text-[#a13a33]" : "bg-[#f2f7fb] text-[#627d98]"}`}>{cardPhase === "checking" ? "正在检测…" : cardPhase === "failed" ? "未检测到房卡" : "等待插入房卡"}</span></div><button type="button" onClick={() => void returnCard()} disabled={cardPhase === "checking"} className="mt-4 flex w-full items-center justify-center gap-2 rounded-2xl bg-[#1769aa] px-5 py-3.5 text-sm font-medium text-white disabled:opacity-40">{cardPhase === "checking" ? <><LoaderCircle size={17} className="animate-spin" />正在收卡并核验</> : <>我已插入房卡，开始检测 <ArrowRight size={16} /></>}</button><p className="mt-3 text-center text-xs text-[#7891a5]">未检测到新房卡时，请不要拔出，重新插入后再点检测</p></div>}
+
+            {cardPhase === "collected" && <div className="mt-5 rounded-2xl border border-[#bde7cf] bg-[#effaf4] p-4"><p className="flex items-center gap-2 text-sm font-medium text-[#248a4d]"><Check size={17} />房卡已收回并存入收卡器</p><p className="mt-1 text-xs text-[#52745f]">收纳位置：{cardStorage ?? "returner-bin-01"} · 房卡回收已记录</p></div>}
 
             <div className="mt-5 rounded-2xl border border-[#e5e5ea] p-5">
               <p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">账单明细</p>
@@ -360,15 +415,7 @@ export function TerminalCheckoutPanel({
               )}
             </div>
 
-            <div className="mt-5 flex flex-col gap-2 sm:flex-row">
-              <button type="button" onClick={() => void confirm()} className="flex-1 rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white transition hover:bg-black">
-                <CreditCard size={18} className="mr-2 inline" />确认退房并结算
-              </button>
-              <button type="button" onClick={onExit} className="rounded-2xl bg-[#f2f2f7] px-5 py-4 text-sm font-medium text-[#6e6e73] transition hover:bg-[#e5e5ea]">
-                暂不退房
-              </button>
-            </div>
-            <p className="mt-3 text-center text-xs text-[#86868b]">确认后房间立即转为待清洁，房卡同时失效。</p>
+            <div className="mt-4 flex items-start gap-2 rounded-2xl bg-[#effaf4] p-4 text-xs leading-5 text-[#52745f]"><Check size={15} className="mt-0.5 shrink-0" /><p>房卡已收回，您现在可以离开。押金、账目和房态会在后台继续处理，无需在这里等待。</p></div>
           </div>
         )}
 
@@ -380,24 +427,21 @@ export function TerminalCheckoutPanel({
           </div>
         )}
 
-        {phase === "done" && receipt && (
+        {phase === "done" && (
           <div className="mt-6 animate-in fade-in zoom-in-95 duration-500">
             <div className="rounded-[1.5rem] border border-[#bde7cf] bg-[#effaf4] p-6 text-center">
               <CircleCheck className="mx-auto text-[#248a4d]" size={32} />
-              <h3 className="mt-3 text-2xl font-semibold">退房完成</h3>
-              <p className="mt-2 text-sm text-[#52745f]">
-                {receipt.settlement > 0 ? `已补收 ${amount(receipt.settlement)}` : receipt.settlement < 0 ? `已退还 ${amount(receipt.settlement)}` : "无需补退，账目已结清"}
-              </p>
+              <h3 className="mt-3 text-2xl font-semibold">房卡已收回，您可以离开</h3>
+              <p className="mt-2 text-sm text-[#52745f]">后台正在处理押金、账目和房态，10 秒后自动结束本次会话。</p>
               <div className="mt-5 grid gap-2 text-left text-xs text-[#52745f] sm:grid-cols-2">
-                <p className="flex items-center gap-1.5"><ShieldCheck size={13} />账本已关闭，余额为 0</p>
-                <p className="flex items-center gap-1.5"><TrendingUp size={13} />房态已转为待清洁</p>
-                <p className="flex items-center gap-1.5"><CreditCard size={13} />房卡已失效</p>
-                <p className="flex items-center gap-1.5"><Check size={13} />账实相符校验通过</p>
+                <p className="flex items-center gap-1.5"><CreditCard size={13} />房卡已进入收卡器收纳</p>
+                <p className="flex items-center gap-1.5"><ShieldCheck size={13} />后台结算任务已提交</p>
+                <p className="flex items-center gap-1.5"><TrendingUp size={13} />房态将转为待清洁</p>
+                <p className="flex items-center gap-1.5"><Check size={13} />无需在终端继续操作</p>
               </div>
+              {receipt?.refundStatus === "refunded" && <p className="mt-4 rounded-xl bg-white/70 px-3 py-2 text-xs text-[#52745f]">押金退款回执：{receipt.refundProviderRef ?? "已确认"}</p>}
             </div>
-            <button type="button" onClick={onExit} className="mt-5 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white transition hover:bg-black">
-              完成
-            </button>
+            <button type="button" onClick={onExit} className="mt-5 w-full rounded-2xl bg-[#1d1d1f] px-5 py-4 font-medium text-white transition hover:bg-black">立即结束</button>
           </div>
         )}
 

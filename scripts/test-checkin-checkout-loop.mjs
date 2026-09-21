@@ -65,6 +65,7 @@ const ORDER = {
 
 try {
   await execSql("drizzle/0008_hotel_core_domain.sql");
+  await execSql("drizzle/0021_payments_refunds.sql");
   await db.prepare("CREATE TABLE demo_orders (id TEXT PRIMARY KEY, tenant_id TEXT, hotel_id TEXT, order_code TEXT, source TEXT, guest_label TEXT, phone_last4 TEXT, phone_masked TEXT, stay_date TEXT, nights INTEGER, room_count INTEGER, room_type TEXT, status TEXT, room_number TEXT, room_amount INTEGER DEFAULT 380, deposit_amount INTEGER DEFAULT 300, total_amount INTEGER DEFAULT 680, created_at TEXT, updated_at TEXT)").run();
   await execSql("drizzle/0013_orders.sql");
 
@@ -78,6 +79,9 @@ try {
   check("入住记录挂在预订房间上", Boolean(stayRow?.room_id), JSON.stringify(stayRow));
   check("房间被占用", Number(roomAfterCheckin?.status) === ROOM_STATUS.OCCUPIED, String(roomAfterCheckin?.status));
   const stayId = stayRow.id;
+  const checkinFolio = await ensureFolioForStayWith(runner, { hotelId: HOTEL, stayId, requestId: "req-loop-checkin-deposit" });
+  check("入住确认时已建立账本", checkinFolio.opened && checkinFolio.depositAmount === ORDER.depositAmount, JSON.stringify(checkinFolio));
+  check("入住押金支付状态为已收", (await runner.first("SELECT status FROM payments WHERE hotel_id = ? AND stay_id = ? AND payment_type = 'deposit'", [HOTEL, stayId]))?.status === "captured");
 
   console.log("\n== 2. 终端退房第一步：用房间号 + 手机号后四位找到这位客人");
   const candidates = await findInHouseStaysWith(lister, { hotelId: HOTEL, phoneLast4: PHONE_LAST4, roomNumber: ROOM_NUMBER });
@@ -89,7 +93,7 @@ try {
 
   console.log("\n== 3. 终端退房第二步：开账、报价、结算、放房");
   const ensured = await ensureFolioForStayWith(runner, { hotelId: HOTEL, stayId, requestId: "req-loop-precheckout" });
-  check("开账时把预订押金记成真分录", ensured.opened && ensured.depositAmount === ORDER.depositAmount, JSON.stringify(ensured.depositAmount));
+  check("退房前复用入住时已开的账本", !ensured.opened && ensured.depositAmount === 0, JSON.stringify(ensured));
   const quote = await quoteCheckoutWith(runner, { hotelId: HOTEL, stayId });
   check("房费按每晚房价 × 晚数计算", quote.roomTotal === 760 && quote.nights === 2, JSON.stringify({ roomTotal: quote.roomTotal, nights: quote.nights }));
   check("应补收金额 = 房费 - 押金", quote.due === 460, String(quote.due));

@@ -31,22 +31,22 @@ ADMIN_DEMO_PASSWORD_HOUSEKEEPING=<逐角色口令>
 
 | 账号 | 口令来源 | 显示身份 | 角色 | 主要权限 |
 | --- | --- | --- | --- | --- |
-| `owner` | `ADMIN_DEMO_PASSWORD_OWNER` 或 `ADMIN_DEMO_PASSWORD` | 老板/所有者 | `owner` | 全部权限：查订单、查房态、换房、入住、退房、改金额、退款、设备控制、用户管理、配置管理、故障管理 |
-| `manager` | `ADMIN_DEMO_PASSWORD_MANAGER` 或 `ADMIN_DEMO_PASSWORD` | 店长 | `manager` | 查订单、查房态、换房、入住、退房、改金额、退款、设备控制、故障管理 |
-| `frontdesk` | `ADMIN_DEMO_PASSWORD_FRONTDESK` 或 `ADMIN_DEMO_PASSWORD` | 前台 | `frontdesk` | 查订单、查房态、换房、入住、退房 |
-| `housekeeping` | `ADMIN_DEMO_PASSWORD_HOUSEKEEPING` 或 `ADMIN_DEMO_PASSWORD` | 客房 | `housekeeping` | 查房态 |
+| `owner` | `ADMIN_DEMO_PASSWORD_OWNER` 或 `ADMIN_DEMO_PASSWORD` | 老板/所有者 | `owner` | 全部权限：查订单、查房态、换房、入住、退房、确认打扫完成、改金额、退款、设备控制、用户管理、配置管理、故障管理、清理历史数据、浏览数据库、登记服务需求 |
+| `manager` | `ADMIN_DEMO_PASSWORD_MANAGER` 或 `ADMIN_DEMO_PASSWORD` | 店长 | `manager` | 查订单、查房态、换房、入住、退房、确认打扫完成、改金额、退款、设备控制、故障管理、**清理历史数据** |
+| `frontdesk` | `ADMIN_DEMO_PASSWORD_FRONTDESK` 或 `ADMIN_DEMO_PASSWORD` | 前台 | `frontdesk` | 查订单、查房态、换房、入住、退房、登记客房服务需求（**不能**把待清洁房标为可售，也**不能**浏览原始数据库） |
+| `housekeeping` | `ADMIN_DEMO_PASSWORD_HOUSEKEEPING` 或 `ADMIN_DEMO_PASSWORD` | 客房 | `housekeeping` | 查房态、确认打扫完成（`VACANT_DIRTY → VACANT_CLEAN`，唯一能把脏房变回可售的角色）、登记客房服务需求（读不到客人账务，也看不到原始数据库） |
 
 ## 3. 权限策略统计
 
-系统当前定义 4 类角色、11 项管理员权限、11 个管理员工具。
+系统当前定义 4 类角色、15 项管理员权限、18 个管理员工具。
 
 ### 角色数量
 
 | 类型 | 数量 |
 | --- | ---: |
 | 管理员角色 | 4 |
-| 管理员权限 | 11 |
-| 管理员工具 | 11 |
+| 管理员权限 | 15 |
+| 管理员工具 | 18 |
 
 ### 管理员工具
 
@@ -54,6 +54,13 @@ ADMIN_DEMO_PASSWORD_HOUSEKEEPING=<逐角色口令>
 | --- | --- | --- |
 | `admin.search_guest` | 查询客人/订单 | 否 |
 | `admin.get_room_status` | 查询房态 | 否 |
+| `admin.mark_room_clean` | 确认客房打扫完成（`VACANT_DIRTY → VACANT_CLEAN`） | 是，只能做这一种房态转移，且写房态流水与审计 |
+| `admin.prepare_purge_closed_loops` | 生成「按时间范围清理已退房闭环」确认单 | 否，只统计；确认后才删除 |
+| `admin.get_database_schema` | 列出数据库里的表与行数 | 否，只读 |
+| `admin.reconcile_demo_orders` | 把演示界面拉回真账（按正式预订纠正所有会话的假订单） | 是，只改演示投影，不碰正式表 |
+| `admin.get_table_rows` | 预览某张表的前若干行（凭据类字段脱敏） | 否，只读 |
+| `admin.list_in_house_guests` | 在住客人的房间、脱敏身份、账务与是否需要服务 | 否，只读 |
+| `admin.set_room_service_need` | 记录/清除某间房当前需要什么服务 | 是，只写这一条服务需求并记审计，不动房态与账务 |
 | `admin.prepare_room_change` | 生成换房确认单 | 否 |
 | `admin.prepare_amount_adjustment` | 生成金额修改确认单 | 否 |
 | `admin.prepare_keycard_issue` | 生成发卡确认单 | 否 |

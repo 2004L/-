@@ -133,7 +133,7 @@ type AiChainView = {
 };
 
 type MatchResponse = {
-  outcome: "matched" | "ambiguous" | "not_found" | "already_checked_in" | "cancelled";
+  outcome: "matched" | "ambiguous" | "not_found" | "already_checked_in" | "checked_out" | "cancelled";
   order?: DemoOrder;
   orders?: DemoOrder[];
   checkinCase?: CheckinCase;
@@ -237,6 +237,365 @@ type AdminResult =
   | { type: "room"; roomNumber: string; status: string; version?: number | null }
   | { type: "workflow"; workflow: AdminWorkflow }
   | null;
+
+const RETENTION_OPTIONS: Array<{ id: string; label: string }> = [
+  { id: "3d", label: "近三天" },
+  { id: "7d", label: "近七天" },
+  { id: "30d", label: "近一个月" },
+  { id: "180d", label: "近半年" },
+  { id: "365d", label: "近一年" },
+];
+
+const SERVICE_NEED_OPTIONS: Array<{ id: string; label: string; tone: string }> = [
+  { id: "cleaning", label: "需打扫", tone: "bg-[#fff1e5] text-[#ad5b16]" },
+  { id: "maintenance", label: "需维修", tone: "bg-[#fff1ed] text-[#b63d13]" },
+  { id: "supplies", label: "需补物品", tone: "bg-[#eaf4ff] text-[#1769aa]" },
+  { id: "none", label: "无需服务", tone: "bg-[#e8f7ee] text-[#248a4d]" },
+];
+const SERVICE_NEED_TONES: Record<string, string> = { cleaning: "bg-[#fff1e5] text-[#ad5b16]", maintenance: "bg-[#fff1ed] text-[#b63d13]", supplies: "bg-[#eaf4ff] text-[#1769aa]", none: "bg-[#e8f7ee] text-[#248a4d]" };
+const SERVICE_NEED_NAMES: Record<string, string> = { cleaning: "需要打扫", maintenance: "需要维修", supplies: "需要补物品", none: "无需服务" };
+
+type InHouseGuestRow = {
+  stayId: string; roomNumber: string | null; guestNameMasked: string; phoneLast4: string; reservationNo: string;
+  checkedInAt: string | null; nights: number; folioStatus: string | null; folioBalance: number;
+  consumption: number; serviceNeed: string; serviceNote: string | null;
+  serviceReportedBy: string | null; serviceReportedAt: string | null;
+};
+type DatabaseTableRow = { name: string; rows: number };
+type DatabasePreview = { table: string; total: number; columns: string[]; maskedColumns: string[]; rows: Array<Record<string, unknown>>; limit: number; truncated: boolean };
+
+function AdminDataPanel() {
+  const [guests, setGuests] = useState<InHouseGuestRow[]>([]);
+  const [pendingService, setPendingService] = useState(0);
+  const [tables, setTables] = useState<DatabaseTableRow[]>([]);
+  const [preview, setPreview] = useState<DatabasePreview | null>(null);
+  const [status, setStatus] = useState("正在读取在住客人与数据库…");
+  const [busy, setBusy] = useState(false);
+
+  const call = useCallback((toolName: string, args: Record<string, unknown>) => callAdminTool<Record<string, unknown>>(toolName, args), []);
+
+  const loadGuests = useCallback(async () => {
+    const result = await call("admin.list_in_house_guests", {});
+    const list = (result.guests as InHouseGuestRow[] | undefined) ?? [];
+    setGuests(list);
+    setPendingService(Number(result.pending_service ?? 0));
+    return { count: list.length, pending: Number(result.pending_service ?? 0) };
+  }, [call]);
+
+  // The two halves need different permissions, so one failing must not blank the other.
+  const refresh = useCallback(async () => {
+    setBusy(true);
+    const problems: string[] = [];
+    let guestCount = 0;
+    let pending = 0;
+    let tableCount = 0;
+    try { const result = await loadGuests(); guestCount = result.count; pending = result.pending; }
+    catch (error) { problems.push(`在住客人：${error instanceof Error ? error.message : "读取失败"}`); }
+    try { const result = await call("admin.get_database_schema", {}); const list = (result.tables as DatabaseTableRow[] | undefined) ?? []; setTables(list); tableCount = list.length; }
+    catch (error) { setTables([]); problems.push(`数据库：${error instanceof Error ? error.message : "读取失败"}`); }
+    setStatus(problems.length ? problems.join("；") : `在住 ${guestCount} 位客人（${pending} 间房有未完成的服务需求）· 数据库 ${tableCount} 张表`);
+    setBusy(false);
+  }, [call, loadGuests]);
+
+  // queueMicrotask, not a direct call: refresh() sets state before its first await, and a synchronous setState inside an effect cascades renders.
+  useEffect(() => { queueMicrotask(() => { void refresh(); }); }, [refresh]);
+
+  async function updateServiceNeed(roomNumber: string, need: string) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await call("admin.set_room_service_need", { room_number: roomNumber, need });
+      const result = await loadGuests();
+      setStatus(`房间 ${roomNumber} 已标记为「${SERVICE_NEED_NAMES[need] ?? need}」，当前 ${result.pending} 间房有待办服务`);
+    } catch (error) { setStatus(error instanceof Error ? error.message : "更新服务需求失败"); }
+    finally { setBusy(false); }
+  }
+
+  /** Pull every session's demo copy back in line with the bookings. */
+  async function reconcileDemoData() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await call("admin.reconcile_demo_orders", {});
+      await loadGuests();
+      setStatus(`已把演示界面拉回真账：修正 ${Number(result.updated ?? 0)} 笔假订单（修正前不一致 ${Number(result.drifted_before ?? 0)} 笔）`);
+    } catch (error) { setStatus(error instanceof Error ? error.message : "对齐演示数据失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function openTable(name: string) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      setPreview((await call("admin.get_table_rows", { table: name, limit: 20 })) as unknown as DatabasePreview);
+      setStatus(`已打开表 ${name}`);
+    } catch (error) { setPreview(null); setStatus(error instanceof Error ? error.message : "读取表失败"); }
+    finally { setBusy(false); }
+  }
+
+  return <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe3d5] bg-[#fbfffc] shadow-sm">
+    <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#e3f0e7] px-5 py-4">
+      <div><p className="text-sm text-[#2f7d4f]">数据</p><h2 className="mt-1 font-semibold">在住客人的房间与是否需要服务</h2><p className="mt-1 text-xs leading-5 text-[#5f7d6a]">上半部分是现在住在店里的客人：房号、脱敏身份、账务和在住消费，以及这间房是否需要服务。下半部分是数据库里真实存在的表，点开可以看前 20 行；凭据类字段一律脱敏，全部只读。</p></div>
+      <div className="flex items-center gap-2">{pendingService > 0 && <span className="rounded-full bg-[#fff1e5] px-3 py-1.5 text-xs text-[#ad5b16]">{pendingService} 间房有未完成的服务需求</span>}<button type="button" onClick={() => void reconcileDemoData()} disabled={busy} className="rounded-lg border border-[#bcd9c7] bg-white px-3 py-2 text-sm text-[#2f7d4f] disabled:opacity-40">对齐演示数据</button><button type="button" onClick={() => void refresh()} disabled={busy} className="rounded-lg border border-[#bcd9c7] bg-white px-3 py-2 text-sm text-[#2f7d4f] disabled:opacity-40">{busy ? "读取中…" : "刷新"}</button></div>
+    </div>
+    <div className="px-5 py-2 text-xs text-[#5f7d6a]">{status}</div>
+    <div className="grid gap-3 px-5 pb-4 lg:grid-cols-2">{guests.length ? guests.map((guest) => <article key={guest.stayId} className="rounded-2xl border border-[#e3f0e7] bg-white p-4"><div className="flex flex-wrap items-start justify-between gap-2"><div><p className="text-lg font-semibold tracking-[-.02em] text-[#102a43]">房间 {guest.roomNumber ?? "未分配"}</p><p className="mt-1 text-xs text-[#627d98]">{guest.guestNameMasked} · 尾号 {guest.phoneLast4} · {guest.reservationNo}</p></div><span className={`rounded-full px-2.5 py-1 text-xs ${SERVICE_NEED_TONES[guest.serviceNeed] ?? "bg-[#f2f7fb] text-[#627d98]"}`}>{SERVICE_NEED_NAMES[guest.serviceNeed] ?? guest.serviceNeed}</span></div><div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#627d98] sm:grid-cols-4"><span>入住 {guest.checkedInAt ? new Date(guest.checkedInAt).toLocaleString("zh-CN") : "—"}</span><span>{guest.nights} 晚</span><span>在住消费 ¥{guest.consumption}</span><span className={guest.folioStatus === "open" ? "" : "text-[#248a4d]"}>账务 {guest.folioStatus === "open" ? `¥${guest.folioBalance}` : (guest.folioStatus ?? "未开账")}</span></div>{guest.serviceNeed !== "none" && <p className="mt-2 rounded-lg bg-[#f7fbf8] px-3 py-2 text-xs leading-5 text-[#5f7d6a]">待办：{SERVICE_NEED_NAMES[guest.serviceNeed]}{guest.serviceNote ? ` · ${guest.serviceNote}` : ""}{guest.serviceReportedBy ? ` · 由 ${guest.serviceReportedBy} 于 ${guest.serviceReportedAt ? new Date(guest.serviceReportedAt).toLocaleString("zh-CN") : ""} 标记` : ""}</p>}<div className="mt-3 flex flex-wrap gap-2">{SERVICE_NEED_OPTIONS.map((option) => <button key={option.id} type="button" disabled={busy || guest.serviceNeed === option.id || !guest.roomNumber} onClick={() => void updateServiceNeed(guest.roomNumber as string, option.id)} className={`rounded-full px-3 py-1.5 text-xs disabled:opacity-40 ${guest.serviceNeed === option.id ? "bg-[#1d1d1f] text-white" : option.tone}`}>{option.label}</button>)}</div></article>) : <p className="rounded-2xl bg-white px-4 py-6 text-sm text-[#829ab1]">当前没有在住客人。</p>}</div>
+    <div className="border-t border-[#e3f0e7] px-5 py-4">
+      <p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">数据库表（点击查看前 20 行）</p>
+      <div className="mt-3 flex flex-wrap gap-2">{tables.map((table) => <button key={table.name} type="button" disabled={busy} onClick={() => void openTable(table.name)} className={`rounded-full px-3 py-1.5 text-xs disabled:opacity-40 ${preview?.table === table.name ? "bg-[#2f7d4f] text-white" : "border border-[#cfe3d5] bg-white text-[#3f6b53]"}`}>{table.name} · {table.rows}</button>)}</div>
+      {preview && <div className="mt-4 overflow-hidden rounded-2xl border border-[#e3f0e7] bg-white"><div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eef6f1] px-4 py-3"><div><p className="font-mono text-sm text-[#102a43]">{preview.table}</p><p className="mt-1 text-xs text-[#829ab1]">共 {preview.total} 行，显示前 {preview.rows.length} 行{preview.maskedColumns.length ? ` · 已脱敏：${preview.maskedColumns.join("、")}` : ""}</p></div><button type="button" onClick={() => setPreview(null)} className="rounded-lg border border-[#d9e2ec] px-3 py-1.5 text-xs text-[#627d98]">关闭</button></div><div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-[#f7fbf8] text-[#627d98]"><tr>{preview.columns.map((column) => <th key={column} className="whitespace-nowrap px-3 py-2 font-medium">{column}{preview.maskedColumns.includes(column) ? " 🔒" : ""}</th>)}</tr></thead><tbody>{preview.rows.map((row, index) => <tr key={index} className="border-t border-[#eef6f1]">{preview.columns.map((column) => <td key={column} className="max-w-[280px] truncate whitespace-nowrap px-3 py-2 font-mono text-[#334e68]" title={String(row[column] ?? "")}>{row[column] === null || row[column] === undefined ? "—" : String(row[column])}</td>)}</tr>)}</tbody></table></div></div>}
+    </div>
+  </section>;
+}
+
+const KNOWLEDGE_SOURCE_LABELS: Record<string, string> = { policy: "门店政策", faq: "常见问答", sop: "内部流程", ticket: "工单沉淀", manual: "手工录入" };
+const KNOWLEDGE_AUTHORITY_LABELS: Record<string, string> = { authoritative: "正式政策", reference: "参考资料", hint: "提示" };
+const KNOWLEDGE_AUTHORITY_TONES: Record<string, string> = { authoritative: "bg-[#eaf4ff] text-[#1769aa]", reference: "bg-[#f2f7fb] text-[#627d98]", hint: "bg-[#f7efff] text-[#7b4b9c]" };
+const KNOWLEDGE_VISIBILITY_LABELS: Record<string, string> = { guest: "客人可见", staff: "仅员工可见" };
+const KNOWLEDGE_STATUS_LABELS: Record<string, string> = { active: "生效中", draft: "草稿", retired: "已停用" };
+const KNOWLEDGE_STATUS_TONES: Record<string, string> = { active: "bg-[#e8f7ee] text-[#248a4d]", draft: "bg-[#fff1e5] text-[#ad5b16]", retired: "bg-[#f2f7fb] text-[#627d98]" };
+const KNOWLEDGE_SOURCE_OPTIONS = ["policy", "faq", "sop", "ticket", "manual"];
+const KNOWLEDGE_AUTHORITY_OPTIONS = ["authoritative", "reference", "hint"];
+const KNOWLEDGE_STATUS_OPTIONS = ["active", "draft", "retired"];
+
+type KnowledgeDocumentRow = { documentId: string; title: string; source: string; authority: string; visibility: string; version: number; effectiveFrom: string; effectiveTo: string | null; status: string; chunks: number; updatedAt: string | null };
+type KnowledgeDocumentGroup = { documents: KnowledgeDocumentRow[]; active?: number; guest_visible?: number; chunksDetail?: Array<{ content: string; keywords: string | null }> };
+type KnowledgeDraftForm = { documentId: string | null; title: string; source: string; authority: string; visibility: string; effectiveFrom: string; effectiveTo: string; status: string; chunksText: string; keywords: string };
+type PreparedKnowledgeAction = { action_id: string; title: string; confirm_label: string; cancel_label: string; fields: Array<{ label: string; value: string }>; impacts: string[] };
+type KnowledgePreview = { query: string; answer: string | null; needs_handoff: boolean; confidence: number; citations: Array<{ title: string; version: number }>; hits: Array<{ document_id: string; title: string; version: number; coverage: number; pair_matched: boolean }> };
+
+/** 管理端工具的统一入口：错误码在这里翻译成店长看得懂的话。 */
+async function callAdminTool<T = Record<string, unknown>>(toolName: string, args: Record<string, unknown>): Promise<T> {
+  const response = await fetch("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: toolName, arguments: args }) });
+  const data = await response.json() as { ok?: boolean; result?: T; error?: string };
+  if (!response.ok || !data.ok) throw new Error(data.error === "admin_permission_denied" ? "当前角色没有这个权限" : data.error ?? "读取失败");
+  return (data.result ?? {}) as T;
+}
+
+/**
+ * 政策录入：店长在这里维护门店政策，不用写 SQL，也不用改代码。
+ * 两条硬约束写在界面上而不是注释里：写进去的每一行就是客人被答到的那一句；
+ * 保存先生成确认单，确认后客人才会问到新版本。
+ */
+function AdminKnowledgePanel({ canManage }: { canManage: boolean }) {
+  const [documents, setDocuments] = useState<KnowledgeDocumentRow[]>([]);
+  const [status, setStatus] = useState("正在读取门店政策…");
+  const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState("");
+  const [form, setForm] = useState<KnowledgeDraftForm | null>(null);
+  const [pendingAction, setPendingAction] = useState<PreparedKnowledgeAction | null>(null);
+  const [probe, setProbe] = useState("");
+  const [preview, setPreview] = useState<KnowledgePreview | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!canManage) return;
+    setBusy(true);
+    try {
+      const result = await callAdminTool<KnowledgeDocumentGroup>("admin.list_knowledge_documents", {});
+      const list = result.documents ?? [];
+      setDocuments(list);
+      setStatus(`共 ${list.length} 份文档 · 生效中 ${Number(result.active ?? 0)} 份（其中客人可见 ${Number(result.guest_visible ?? 0)} 份）`);
+    } catch (error) { setStatus(error instanceof Error ? error.message : "读取政策失败"); }
+    finally { setBusy(false); }
+  }, [canManage]);
+
+  useEffect(() => { queueMicrotask(() => { void refresh(); }); }, [refresh]);
+
+  function blankForm(): KnowledgeDraftForm {
+    return { documentId: null, title: "", source: "policy", authority: "authoritative", visibility: "guest", effectiveFrom: new Date().toISOString().slice(0, 10), effectiveTo: "", status: "active", chunksText: "", keywords: "" };
+  }
+
+  async function editDocument(documentId: string) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const detail = await callAdminTool<KnowledgeDocumentRow & { chunksDetail: Array<{ content: string; keywords: string | null }> }>("admin.get_knowledge_document", { document_id: documentId });
+      const keywordUnion = [...new Set((detail.chunksDetail ?? []).flatMap((chunk) => String(chunk.keywords ?? "").split(/\s+/)))].filter(Boolean).join(" ");
+      setForm({ documentId: detail.documentId, title: detail.title, source: detail.source, authority: detail.authority, visibility: detail.visibility, effectiveFrom: detail.effectiveFrom.slice(0, 10), effectiveTo: detail.effectiveTo ? detail.effectiveTo.slice(0, 10) : "", status: detail.status, chunksText: (detail.chunksDetail ?? []).map((chunk) => chunk.content).join("\n"), keywords: keywordUnion });
+      setStatus(`正在编辑「${detail.title}」v${detail.version}：改完点保存，系统会先生成确认单。`);
+    } catch (error) { setStatus(error instanceof Error ? error.message : "读取文档失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function prepareSave() {
+    if (!form || busy) return;
+    setBusy(true); setBusyLabel("正在生成确认单…");
+    try {
+      const action = await callAdminTool<PreparedKnowledgeAction>("admin.prepare_knowledge_document", {
+        ...(form.documentId ? { document_id: form.documentId } : {}),
+        title: form.title.trim(), source: form.source, authority: form.authority, visibility: form.visibility,
+        effective_from: form.effectiveFrom, ...(form.effectiveTo ? { effective_to: form.effectiveTo } : {}),
+        status: form.status, chunks: form.chunksText.split("\n").map((line) => line.trim()).filter(Boolean), keywords: form.keywords.trim(),
+        reason: form.documentId ? "店长在政策录入界面改版" : "店长在政策录入界面新建",
+      });
+      setPendingAction(action);
+      setStatus("已生成确认单：确认前不会改动任何政策。");
+    } catch (error) { setStatus(error instanceof Error ? error.message : "生成确认单失败"); }
+    finally { setBusy(false); setBusyLabel(""); }
+  }
+
+  async function prepareStatus(row: KnowledgeDocumentRow, next: string) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const action = await callAdminTool<PreparedKnowledgeAction>("admin.prepare_knowledge_status", { document_id: row.documentId, status: next, reason: `店长在政策录入界面把「${row.title}」改为${KNOWLEDGE_STATUS_LABELS[next] ?? next}` });
+      setPendingAction(action);
+      setStatus("已生成确认单：确认前不会改动任何政策。");
+    } catch (error) { setStatus(error instanceof Error ? error.message : "生成确认单失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function confirmPending() {
+    if (!pendingAction || busy) return;
+    setBusy(true); setBusyLabel("正在执行…");
+    try {
+      await callAdminTool("admin.confirm_pending_action", { action_id: pendingAction.action_id, confirmation: "CONFIRM" });
+      setPendingAction(null);
+      await refresh();
+      setStatus("已发布：客人从现在起问到的就是新版本。");
+    } catch (error) { setStatus(error instanceof Error ? error.message : "执行失败"); }
+    finally { setBusy(false); setBusyLabel(""); }
+  }
+
+  async function cancelPending() {
+    if (!pendingAction || busy) return;
+    setBusy(true);
+    try {
+      await callAdminTool("admin.cancel_pending_action", { action_id: pendingAction.action_id, reason: "店长在政策录入界面取消" });
+      setPendingAction(null);
+      setStatus("已取消，没有改动任何政策。");
+    } catch (error) { setStatus(error instanceof Error ? error.message : "取消失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function runProbe() {
+    const query = probe.trim();
+    if (!query || busy) return;
+    setBusy(true);
+    try { setPreview(await callAdminTool<KnowledgePreview>("admin.preview_knowledge_answer", { query, visibility: "guest" })); }
+    catch (error) { setPreview(null); setStatus(error instanceof Error ? error.message : "试问失败"); }
+    finally { setBusy(false); }
+  }
+
+  if (!canManage) return null;
+
+  return <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-[#f8fbff] shadow-sm">
+    <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#e2eefb] px-5 py-4">
+      <div>
+        <p className="text-sm text-[#3b78a8]">门店政策</p>
+        <h2 className="mt-1 font-semibold">政策知识库（店长自己维护，不用写 SQL）</h2>
+        <p className="mt-1 text-xs leading-5 text-[#5b7c99]">这里写进去的每一行，就是客人问到时会被答到的那一句话。保存先生成确认单，确认后客人问到的立刻是新版本；停用之后客人问不到，会自动转前台，而不是拿一条旧政策糊弄。改版会整篇替换切片，不会半新半旧。</p>
+      </div>
+      <div className="flex items-center gap-2">
+        <button type="button" onClick={() => void refresh()} disabled={busy} className="rounded-lg border border-[#c6dcf3] bg-white px-3 py-2 text-xs disabled:opacity-40">刷新</button>
+        <button type="button" onClick={() => setForm(blankForm())} disabled={busy} className="rounded-lg bg-[#007aff] px-3 py-2 text-xs text-white disabled:opacity-40">新建政策</button>
+      </div>
+    </div>
+    <div className="px-5 py-2 text-xs text-[#5b7c99]">{busyLabel || status}</div>
+    <div className="grid gap-4 px-5 pb-5 lg:grid-cols-[.9fr_1.1fr]">
+      <div className="grid content-start gap-3">
+        {documents.length ? documents.map((row) => <article key={row.documentId} className="rounded-2xl border border-[#dbe9f8] bg-white p-3">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0"><p className="truncate font-medium">{row.title}</p><p className="mt-1 font-mono text-[11px] text-[#829ab1]">{row.documentId}</p></div>
+            <span className={`shrink-0 rounded-full px-2 py-1 text-[11px] ${KNOWLEDGE_STATUS_TONES[row.status] ?? "bg-[#f2f7fb] text-[#627d98]"}`}>{KNOWLEDGE_STATUS_LABELS[row.status] ?? row.status}</span>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-[#5b7c99]">
+            <span className={`rounded-full px-2 py-0.5 ${KNOWLEDGE_AUTHORITY_TONES[row.authority] ?? "bg-[#f2f7fb] text-[#627d98]"}`}>{KNOWLEDGE_AUTHORITY_LABELS[row.authority] ?? row.authority}</span>
+            <span className={`rounded-full px-2 py-0.5 ${row.visibility === "guest" ? "bg-[#eaf4ff] text-[#1769aa]" : "bg-[#fff1e5] text-[#ad5b16]"}`}>{KNOWLEDGE_VISIBILITY_LABELS[row.visibility] ?? row.visibility}</span>
+            <span className="rounded-full bg-[#f2f7fb] px-2 py-0.5">v{row.version}</span>
+            <span className="rounded-full bg-[#f2f7fb] px-2 py-0.5">{row.chunks} 条切片</span>
+            <span className="rounded-full bg-[#f2f7fb] px-2 py-0.5">生效 {row.effectiveFrom.slice(0, 10)}{row.effectiveTo ? ` 至 ${row.effectiveTo.slice(0, 10)}` : " 起长期"}</span>
+          </div>
+          <div className="mt-2 flex gap-2">
+            <button type="button" onClick={() => void editDocument(row.documentId)} disabled={busy} className="rounded-lg border border-[#c6dcf3] bg-[#f8fbff] px-3 py-1.5 text-xs disabled:opacity-40">编辑</button>
+            {row.status === "active"
+              ? <button type="button" onClick={() => void prepareStatus(row, "retired")} disabled={busy} className="rounded-lg border border-[#f5c2b0] bg-[#fff1ed] px-3 py-1.5 text-xs text-[#8a3a1f] disabled:opacity-40">停用</button>
+              : <button type="button" onClick={() => void prepareStatus(row, "active")} disabled={busy} className="rounded-lg border border-[#cfe3d5] bg-[#fbfffc] px-3 py-1.5 text-xs text-[#2f7d4f] disabled:opacity-40">恢复生效</button>}
+          </div>
+        </article>) : <p className="rounded-2xl border border-[#dbe9f8] bg-white p-4 text-xs text-[#5b7c99]">还没有政策文档。点右上角「新建政策」，把店里的政策一条条录进来。</p>}
+      </div>
+      <div className="grid content-start gap-4">
+        {form && <form className="rounded-2xl border border-[#dbe9f8] bg-white p-4" onSubmit={(event) => { event.preventDefault(); void prepareSave(); }}>
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-sm font-semibold">{form.documentId ? "编辑政策" : "新建政策"}</p>
+            <button type="button" onClick={() => setForm(null)} className="text-xs text-[#627d98]">收起</button>
+          </div>
+          <label className="mt-3 block text-xs text-[#5b7c99]">标题
+            <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} maxLength={80} required placeholder="例如：加床与婴儿床" className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43] outline-none focus:border-[#007aff]" />
+          </label>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <label className="block text-xs text-[#5b7c99]">来源
+              <select value={form.source} onChange={(event) => setForm({ ...form, source: event.target.value })} className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43]">{KNOWLEDGE_SOURCE_OPTIONS.map((option) => <option key={option} value={option}>{KNOWLEDGE_SOURCE_LABELS[option]}</option>)}</select>
+            </label>
+            <label className="block text-xs text-[#5b7c99]">权威度
+              <select value={form.authority} onChange={(event) => setForm({ ...form, authority: event.target.value })} className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43]">{KNOWLEDGE_AUTHORITY_OPTIONS.map((option) => <option key={option} value={option}>{KNOWLEDGE_AUTHORITY_LABELS[option]}</option>)}</select>
+            </label>
+            <label className="block text-xs text-[#5b7c99]">可见范围
+              <select value={form.visibility} onChange={(event) => setForm({ ...form, visibility: event.target.value })} className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43]"><option value="guest">{KNOWLEDGE_VISIBILITY_LABELS.guest}</option><option value="staff">{KNOWLEDGE_VISIBILITY_LABELS.staff}</option></select>
+            </label>
+            <label className="block text-xs text-[#5b7c99]">状态
+              <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })} className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43]">{KNOWLEDGE_STATUS_OPTIONS.map((option) => <option key={option} value={option}>{KNOWLEDGE_STATUS_LABELS[option]}</option>)}</select>
+            </label>
+            <label className="block text-xs text-[#5b7c99]">生效日
+              <input type="date" value={form.effectiveFrom} onChange={(event) => setForm({ ...form, effectiveFrom: event.target.value })} required className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43]" />
+            </label>
+            <label className="block text-xs text-[#5b7c99]">失效日（可空）
+              <input type="date" value={form.effectiveTo} onChange={(event) => setForm({ ...form, effectiveTo: event.target.value })} className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43]" />
+            </label>
+          </div>
+          <label className="mt-3 block text-xs text-[#5b7c99]">政策要点（一行一条，最多 20 行）
+            <textarea rows={6} value={form.chunksText} onChange={(event) => setForm({ ...form, chunksText: event.target.value })} placeholder={"早餐时间是早上七点到十点，地点在二楼餐厅。\n住客凭房卡用餐，无需另外付费。"} className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43] outline-none focus:border-[#007aff]" />
+          </label>
+          <label className="mt-3 block text-xs text-[#5b7c99]">客人可能用到的其他说法（空格分隔，可空）
+            <input value={form.keywords} onChange={(event) => setForm({ ...form, keywords: event.target.value })} maxLength={200} placeholder="例如：车位 停车费 车库 地库" className="mt-1 w-full rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43] outline-none focus:border-[#007aff]" />
+          </label>
+          <p className="mt-1 text-[11px] leading-5 text-[#829ab1]">检索是按字匹配的：客人说「地库」「车库」而正文写的是「地下一层」，就要把那些说法填在这里；它们和正文一样会被索引。</p>
+          {form.visibility === "guest" && <p className="mt-2 rounded-xl bg-[#fff8e7] px-3 py-2 text-[11px] leading-5 text-[#8a6417]">客人可见：这条政策会作为终端上客人看到的答案与出处。涉及加收、赔付、内部底价的内容请改选「仅员工可见」。</p>}
+          <div className="mt-3 flex items-center justify-between gap-2">
+            <span className="text-[11px] text-[#829ab1]">{form.documentId ? "保存后版本自动 +1" : "保存后为 v1"}</span>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => setForm(null)} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-xs">取消</button>
+              <button type="submit" disabled={busy || !form.title.trim() || !form.chunksText.trim()} className="rounded-lg bg-[#007aff] px-3 py-2 text-xs text-white disabled:opacity-40">保存并生成确认单</button>
+            </div>
+          </div>
+        </form>}
+        <div className="rounded-2xl border border-[#dbe9f8] bg-white p-4">
+          <p className="text-sm font-semibold">试问：客人这么问，系统会答什么</p>
+          <div className="mt-2 flex gap-2">
+            <input value={probe} onChange={(event) => setProbe(event.target.value)} placeholder="例如：地库怎么走" className="min-w-0 flex-1 rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm text-[#102a43] outline-none focus:border-[#007aff]" aria-label="试问内容" />
+            <button type="button" onClick={() => void runProbe()} disabled={busy || !probe.trim()} className="rounded-lg border border-[#c6dcf3] bg-[#f8fbff] px-3 py-2 text-xs disabled:opacity-40">试问</button>
+          </div>
+          {preview && <div className="mt-3 rounded-xl bg-[#f8fbff] px-3 py-3 text-xs leading-6 text-[#334e68]">
+            <p className={preview.needs_handoff ? "font-medium text-[#b63d13]" : "font-medium text-[#248a4d]"}>{preview.needs_handoff ? "查不到 → 转人工（不编政策）" : "命中"}{` · 覆盖率 ${Math.round(preview.confidence * 100)}%`}</p>
+            {preview.answer && <p className="mt-1">{preview.answer}</p>}
+            {preview.citations.length > 0 && <p className="mt-1 text-[#829ab1]">依据：{preview.citations.map((citation) => `${citation.title} v${citation.version}`).join("、")}</p>}
+            {preview.hits.length > 0 && <p className="mt-1 text-[#829ab1]">候选：{preview.hits.map((hit) => `${hit.document_id}（${Math.round(hit.coverage * 100)}%${hit.pair_matched ? " · 字对命中" : ""}）`).join("、")}</p>}
+          </div>}
+          <p className="mt-2 text-[11px] leading-5 text-[#829ab1]">试问走的是终端同一条检索路径，看到的就是客人会看到的。写政策前先试问，写完后再试问一次，这条政策才算真的被人验证过。</p>
+        </div>
+      </div>
+    </div>
+    {pendingAction && <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 p-5" role="dialog" aria-modal="true" aria-labelledby="knowledge-confirm-title">
+      <section className="w-full max-w-lg rounded-3xl bg-white p-6 shadow-2xl">
+        <div className="flex items-start justify-between gap-3">
+          <div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#3b78a8]">政策变更确认</p><h2 id="knowledge-confirm-title" className="mt-2 text-lg font-semibold">{pendingAction.title}</h2></div>
+          <button type="button" onClick={() => void cancelPending()} disabled={busy} aria-label="关闭"><X size={19} /></button>
+        </div>
+        <div className="mt-4 grid gap-2 rounded-2xl border border-[#e2eefb] bg-[#f8fbff] p-4 text-sm">
+          {pendingAction.fields.map((field) => <div key={`${field.label}-${field.value}`} className="flex flex-wrap items-baseline justify-between gap-2"><span className="text-xs text-[#829ab1]">{field.label}</span><span className="font-medium">{field.value}</span></div>)}
+        </div>
+        <ul className="mt-3 grid gap-1 text-xs leading-5 text-[#334e68]">{pendingAction.impacts.map((impact) => <li key={impact}>· {impact}</li>)}</ul>
+        <div className="mt-5 flex justify-end gap-3">
+          <button type="button" onClick={() => void cancelPending()} disabled={busy} className="rounded-xl border border-[#cbd9e5] px-4 py-2.5 text-sm disabled:opacity-50">{pendingAction.cancel_label || "取消"}</button>
+          <button type="button" onClick={() => void confirmPending()} disabled={busy} className="rounded-xl bg-[#007aff] px-4 py-2.5 text-sm text-white disabled:opacity-50">{busy ? "执行中…" : pendingAction.confirm_label || "确认发布"}</button>
+        </div>
+      </section>
+    </div>}
+  </section>;
+}
+
+const ROOM_STATUS_LABELS: Record<string, string> = { "vacant-clean": "可售", "vacant-dirty": "待清洁", held: "已锁房", occupied: "已占用", "out-of-order": "维修中", unknown: "未知" };
+const ROOM_STATUS_TONES: Record<string, string> = { "vacant-clean": "bg-[#e8f7ee] text-[#248a4d]", "vacant-dirty": "bg-[#fff1e5] text-[#ad5b16]", held: "bg-[#eaf4ff] text-[#1769aa]", occupied: "bg-[#fff1ed] text-[#b63d13]", "out-of-order": "bg-[#f2f7fb] text-[#627d98]", unknown: "bg-[#f2f7fb] text-[#627d98]" };
 
 type PipelineStageId = "mic" | "asr" | "model" | "tool" | "confirm";
 type PipelineStageStatus = "idle" | "connecting" | "normal" | "timeout" | "failed" | "cancelled";
@@ -639,6 +998,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [listening, setListening] = useState(false);
   const [matchedOrder, setMatchedOrder] = useState<DemoOrder | null>(null);
   const [checkinCase, setCheckinCase] = useState<CheckinCase | null>(null);
+  const [depositStatus, setDepositStatus] = useState<"captured" | "pending" | "failed" | null>(null);
+  const [depositAmount, setDepositAmount] = useState<number | null>(null);
   const [alternatives, setAlternatives] = useState<DemoOrder[]>([]);
   const [walkInDraft, setWalkInDraft] = useState<WalkInDraft | null>(null);
   const [walkInRoomTypes, setWalkInRoomTypes] = useState<WalkInRoomType[]>([]);
@@ -717,6 +1078,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setPhase("idle");
     setMatchedOrder(null);
     setCheckinCase(null);
+    setDepositStatus(null);
+    setDepositAmount(null);
     setAlternatives([]);
     setWalkInDraft(null);
     setWalkInRoomTypes([]);
@@ -1097,6 +1460,17 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       setMessage("我只听到一声回应，请把要办理的事情完整说出来，或直接输入文字");
       return;
     }
+    // “退房” is a terminal operation, not a policy question. Route it straight
+    // to the card-return flow so the guest is not asked about checkout policy.
+    if (/(退房|离店|我要走了|准备走了)/u.test(normalized)) {
+      recordConversation("user", normalized);
+      recordConversation("assistant", "好的，先请把房卡插入收卡器。系统收回房卡后会核对押金并回收房态。");
+      setTerminalMode("checkout");
+      setPhase("idle");
+      setMessage("好的，请先把房卡插入收卡器");
+      speak("好的，请先把房卡插入收卡器。收卡后我会核对押金并回收房态。", voiceEnabled);
+      return;
+    }
     if (submitInFlightRef.current === normalized) return;
     submitInFlightRef.current = normalized;
     const generation = conversationGenerationRef.current;
@@ -1129,10 +1503,18 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         return;
       }
       recordConversation("tool", `调用工具：${agent.tool_name}`);
-      const toolLabel = agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "pms.create_walk_in_draft" ? "创建现场办理草稿" : agent.tool_name === "pms.quote_walk_in" ? "查询房态并报价" : agent.tool_name === "payment.create" ? "生成支付页面" : agent.tool_name === "pms.create_walk_in" ? "创建现场办理单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
+      const toolLabel = agent.tool_name === "pms.start_checkout" ? "进入退房收卡" : agent.tool_name === "pms.search_order" ? "查询订单" : agent.tool_name === "pms.create_walk_in_draft" ? "创建现场办理草稿" : agent.tool_name === "pms.quote_walk_in" ? "查询房态并报价" : agent.tool_name === "payment.create" ? "生成支付页面" : agent.tool_name === "pms.create_walk_in" ? "创建现场办理单" : agent.tool_name === "hotel.policy_answer" ? "查询门店政策" : agent.tool_name === "device.reader.read_identity" ? "调用读卡器仿真" : agent.tool_name === "device.encoder.read_status" ? "查询发卡机仿真" : "受控业务工具";
       setIntentTrace({ label: toolLabel, confidence: 0.96, action: agent.tool_name });
       let result: IntentResponse;
-      if (agent.tool_name === "pms.search_order") {
+      if (agent.tool_name === "pms.start_checkout") {
+        setTerminalMode("checkout");
+        setPhase("idle");
+        const checkoutMessage = "好的，请先把房卡插入收卡器。收卡成功后您就可以离开，押金和房态由后台继续处理。";
+        recordConversation("tool", "已进入退房收卡流程");
+        setMessage(checkoutMessage);
+        speak(checkoutMessage, voiceEnabled);
+        return;
+      } else if (agent.tool_name === "pms.search_order") {
         const phoneLast4 = String(agent.arguments.phone_last4 ?? "");
         setLast4(phoneLast4);
         result = await postDemo<IntentResponse>("interpret", { session_id: sessionId, utterance: normalized });
@@ -1179,16 +1561,23 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         setMessage(paymentMessage);
         speak(paymentMessage, voiceEnabled);
         return;
-      } else if (agent.tool_name === "hotel.policy_answer") {
-        const topic = String(agent.arguments.topic ?? "");
-        const answer = topic === "breakfast" ? "早餐时间是早上七点到十点。" : topic === "parking" ? "酒店提供停车服务，具体位置和费用以门店政策为准。" : topic === "payment" ? "押金和支付方式以当前酒店政策为准，AI 不会自行修改金额。" : "退房时间以订单和门店政策为准，如需延迟退房我会先查询房态。";
-        recordConversation("tool", `门店政策查询完成：${topic}`);
+      } else if (agent.tool_name === "hotel.policy_answer" || agent.tool_name === "hotel.knowledge_search") {
+        // 政策话术不在前端拼：由服务端检索当前门店知识库，命中带出处，命中不到转人工。
+        const topic = agent.tool_name === "hotel.policy_answer" ? String(agent.arguments.topic ?? "") : "";
+        const query = typeof agent.arguments.query === "string" ? agent.arguments.query : "";
+        let answer = "这个我暂时没有可靠依据（门店知识库里没查到），已记录并转前台确认。";
+        try {
+          const lookup = await postDemo<{ query: string; answer: string | null; citations: Array<{ title: string; version: number }>; needs_handoff: boolean; handoff_message: string | null }>("knowledge-search", { session_id: sessionId, topic, query });
+          answer = lookup.needs_handoff || !lookup.answer
+            ? (lookup.handoff_message ?? answer)
+            : `${lookup.answer}${lookup.citations.length ? `\n\n（依据：${lookup.citations.map((citation) => `${citation.title} v${citation.version}`).join("、")}）` : ""}`;
+        } catch { /* 知识库不可用时也不编政策，保持明确的转人工话术 */ }
+        recordConversation("tool", `门店政策查询完成：${query || topic}`);
         setPhase("idle");
         setMessage(answer);
         speak(answer, voiceEnabled);
         await onRefresh();
-        return;
-      } else if (agent.tool_name === "device.encoder.read_status") {
+        return;      } else if (agent.tool_name === "device.encoder.read_status") {
         const answer = checkinCase ? `当前办理状态是 ${checkinCase.status}，发卡机状态是 ${checkinCase.hardware_status}。我只查询状态，不会重复发卡。` : "目前没有正在办理的入住任务。";
         recordConversation("tool", `发卡机状态查询完成：${checkinCase ? "当前办理中" : "暂无办理任务"}`);
         setPhase("idle");
@@ -1221,10 +1610,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         setPhase("not_found");
         setMessage(result.assistantMessage);
         speak(result.assistantMessage, voiceEnabled);
-      } else if (result.outcome === "already_checked_in" || result.outcome === "cancelled") {
+      } else if (result.outcome === "already_checked_in" || result.outcome === "checked_out" || result.outcome === "cancelled") {
         setPhase("blocked");
         setAlternatives(result.orders ?? []);
-        setMessage(result.outcome === "already_checked_in" ? "该订单已经入住，不能重复办理" : "该订单已经取消，不能继续办理");
+        setMessage(result.outcome === "already_checked_in"
+          ? "该订单已经入住，不能重复办理"
+          : result.outcome === "checked_out"
+            ? "该订单已经退房，如需再住请重新预订或现场办理"
+            : "该订单已经取消，不能继续办理");
       } else {
         setPhase("idle");
         setMessage(result.assistantMessage);
@@ -1328,7 +1721,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     setFlowError(null);
     let activeStep = FLOW_STEPS[1];
     try {
-      let result: { checkinCase: CheckinCase };
+      let result: { checkinCase: CheckinCase; deposit_amount?: number; deposit_payment_status?: "captured" | "pending" | "failed" };
       if (currentCase.status === "CHECKIN_COMPLETE") {
         setFlowStep(7);
         setPhase("complete");
@@ -1378,8 +1771,10 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       if (currentCase.status === "POLICE_COMPLETED") {
         setFlowStep(5);
         activeStep = FLOW_STEPS[4];
-        result = await postDemo("confirm-checkin", { session_id: sessionId, case_id: caseId }, activeStep);
+        result = await postDemo<{ checkinCase: CheckinCase; deposit_amount?: number; deposit_payment_status?: "captured" | "pending" | "failed" }>("confirm-checkin", { session_id: sessionId, case_id: caseId }, activeStep);
         applyCase(result.checkinCase);
+        setDepositStatus(result.deposit_payment_status ?? "pending");
+        setDepositAmount(typeof result.deposit_amount === "number" ? result.deposit_amount : null);
         setMatchedOrder((current) => current ? { ...current, status: "checkin_confirmed", room_number: result.checkinCase.room_number } : current);
         speak("入住已确认，自动发卡机正在制作房卡。", voiceEnabled);
         await new Promise((resolve) => window.setTimeout(resolve, 650));
@@ -1432,7 +1827,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
   const showEntry = (phase === "idle" || phase === "searching") && terminalMode === "checkin";
   return <main className="min-h-screen bg-[#f5f5f7] px-5 py-6 text-[#1d1d1f] md:px-10">
-    <header className="mx-auto flex max-w-6xl items-center justify-between"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>
+    <header className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><nav aria-label="终端业务" className="hidden rounded-full bg-white p-1 shadow-sm sm:flex"><button type="button" onClick={() => setTerminalMode("checkin")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkin" ? "bg-[#eaf4ff] text-[#1769aa]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>办理入住</button><button type="button" onClick={() => setTerminalMode("checkout")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkout" ? "bg-[#effaf4] text-[#248a4d]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>退房 / 换房</button></nav><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>
     <section className="mx-auto flex min-h-[calc(100vh-7rem)] max-w-5xl flex-col items-center justify-center py-12 text-center">
       {terminalMode === "choose" ? (<>
         <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />AI Native 自助终端 · 请先选择业务</div>
@@ -1440,10 +1835,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         <p className="mt-4 text-base text-[#86868b]">先选业务，再由系统按业务需要逐步索取信息；随时可以返回重选。</p>
         <TerminalModeChooser onChoose={setTerminalMode} />
       </>) : terminalMode === "checkout" ? (<>
-        <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#34c759]" />自助退房 · 房间号 + 手机号后四位</div>
-        <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-5xl">办理退房</h1>
-        <p className="mt-4 text-base text-[#86868b]">先核对账目，确认后才结算，并把房间回收为待清洁。</p>
-        <TerminalCheckoutPanel sessionId={sessionId} onExit={() => setTerminalMode("choose")} onFinished={onRefresh} />
+        <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#34c759]" />退房终端 · 先收房卡，再核对押金和房态</div>
+        <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-5xl">退房 / 换房</h1>
+        <p className="mt-4 text-base text-[#86868b]">退房在终端核对账目并结算；换房由前台确认房态后执行。</p>
+        <div className="mt-6 grid w-full max-w-3xl gap-3 text-left sm:grid-cols-2">
+          <div className="rounded-2xl border border-[#bde7cf] bg-white p-4 shadow-sm"><p className="text-sm font-semibold text-[#248a4d]">自助退房</p><p className="mt-1 text-xs leading-5 text-[#6e6e73]">先把房卡插入收卡器；收卡成功后再核对押金、结算并把房间转为待清洁。</p></div>
+          <button type="button" onClick={onOpenAdmin} className="rounded-2xl border border-[#d8e9f8] bg-white p-4 text-left shadow-sm transition hover:border-[#007aff]"><p className="text-sm font-semibold text-[#1769aa]">需要换房？进入前台流程 →</p><p className="mt-1 text-xs leading-5 text-[#6e6e73]">前台会核对住客、目标房态并生成确认单，确认后才修改数据库。</p></button>
+        </div>
+        <TerminalCheckoutPanel sessionId={sessionId} onExit={() => setTerminalMode("choose")} onFinished={onRefresh} onOpenFrontdesk={onOpenAdmin} />
       </>) : (<>
       <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />AI Native 对话 · 您怎么说都可以</div>
       <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">{activeMessage}</h1>
@@ -1452,7 +1851,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
       {showEntry && audioInputs.length > 1 && <label className="mx-auto mt-5 flex w-fit items-center gap-2 text-xs text-[#86868b]">输入设备<select value={selectedAudioDeviceId} onChange={(event) => { setSelectedAudioDeviceId(event.target.value); if (event.target.value) localStorage.setItem("hotel_audio_input_device", event.target.value); else localStorage.removeItem("hotel_audio_input_device"); }} disabled={listening} className="rounded-lg border border-[#d9d9df] bg-white px-2 py-1 text-xs"><option value="">系统默认麦克风</option>{audioInputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select></label>}
 
-      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在平台订了房，帮我查一下订单" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "取消语音输入" : "开始语音输入"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 说完后点击发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 说完后点击发送" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 浏览器识别备用 · 说完后点击发送"}</p>{audioCaptureStatus !== "unknown" && <div className="mt-2 flex items-center justify-center gap-2 text-xs text-[#86868b]"><span>麦克风：{audioCaptureStatus === "checking" ? "等待声音" : audioCaptureStatus === "ok" ? `已采到声音${audioDeviceLabel ? ` · ${audioDeviceLabel}` : ""}` : audioCaptureStatus === "silent" ? "未检测到有效声音" : "检测失败"}</span>{listening && <span className="h-1.5 w-16 overflow-hidden rounded-full bg-[#e5e5ea]"><span className={`block h-full rounded-full ${audioCaptureStatus === "ok" ? "bg-[#34c759]" : "bg-[#ff9500]"}`} style={{ width: `${Math.max(4, Math.round(audioLevel * 100))}%` }} /></span>}</div>}{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据仅用于本地验收，支持任意四位尾号输入</p></div>}
+      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在平台订了房，帮我查一下订单" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><button type="button" onClick={startListening} disabled={phase === "searching"} className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${listening ? "bg-[#ff3b30]" : "bg-[#f2f2f7] text-[#1d1d1f]"} disabled:opacity-50`} aria-label={listening ? "取消语音输入" : "开始语音输入"}>{listening ? <X size={19} className="text-white" /> : <Mic size={19} />}</button><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button><button type="button" onClick={() => { setTerminalMode("choose"); setUtterance(""); }} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#f2f2f7] px-3 py-2.5 text-sm font-medium text-[#6e6e73] disabled:opacity-40">上一步</button><button type="button" onClick={() => { void submitUtterance("确认"); }} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#34c759] px-4 py-2.5 text-sm font-medium text-white shadow-sm disabled:opacity-40">确认</button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 说完后点击发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 说完后点击发送" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 浏览器识别备用 · 说完后点击发送"}</p>{audioCaptureStatus !== "unknown" && <div className="mt-2 flex items-center justify-center gap-2 text-xs text-[#86868b]"><span>麦克风：{audioCaptureStatus === "checking" ? "等待声音" : audioCaptureStatus === "ok" ? `已采到声音${audioDeviceLabel ? ` · ${audioDeviceLabel}` : ""}` : audioCaptureStatus === "silent" ? "未检测到有效声音" : "检测失败"}</span>{listening && <span className="h-1.5 w-16 overflow-hidden rounded-full bg-[#e5e5ea]"><span className={`block h-full rounded-full ${audioCaptureStatus === "ok" ? "bg-[#34c759]" : "bg-[#ff9500]"}`} style={{ width: `${Math.max(4, Math.round(audioLevel * 100))}%` }} /></span>}</div>}{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据仅用于本地验收，支持任意四位尾号输入</p></div>}
 
       {walkInDraft && <section className="mt-8 w-full max-w-2xl rounded-[2rem] border border-[#d8e9f8] bg-white p-6 text-left shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#1769aa]">现场办理草稿</p><h2 className="mt-2 text-xl font-semibold">手机号 {walkInDraft.phone_masked}</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">{walkInDraft.status === "AWAITING_PAYMENT" ? "等待支付" : walkInDraft.status === "QUOTED" ? "等待确认" : "等待选房"}</span></div><p className="mt-3 text-xs leading-5 text-[#6e6e73]">这是临时草稿。未确认金额并完成支付前，不会创建正式订单，也不会进入身份证、公安或发卡流程。</p>{walkInRoomTypes.length > 0 && <div className="mt-5 grid gap-2">{walkInRoomTypes.map((room) => <button key={room.code} onClick={() => void quoteWalkIn(room.code)} disabled={phase === "searching" || walkInDraft.status === "AWAITING_PAYMENT"} className={`flex items-center justify-between rounded-2xl border px-4 py-3 text-left text-sm ${walkInDraft.room_type_code === room.code ? "border-[#007aff] bg-[#eef6ff]" : "border-[#e5e5ea] bg-white"}`}><span><span className="font-medium">{room.name}</span><span className="ml-2 text-xs text-[#86868b]">余 {room.available} 间</span></span><span className="text-[#6e6e73]">¥{room.nightly_rate}/晚</span></button>)}</div>}{walkInDraft.room_type_code && <div className="mt-5 grid grid-cols-2 gap-3 rounded-2xl bg-[#f5f5f7] p-4 text-sm"><div><p className="text-xs text-[#86868b]">已选房型</p><p className="mt-1 font-medium">{walkInDraft.room_type_name}</p></div><label className="text-xs text-[#86868b]">入住晚数<input type="number" min={1} max={30} value={walkInDraft.nights} disabled={walkInDraft.status === "AWAITING_PAYMENT"} onChange={(event) => setWalkInDraft((current) => current ? { ...current, nights: Math.min(30, Math.max(1, Number(event.target.value) || 1)), status: "DRAFT", total_amount: null, room_amount: null, deposit_amount: null } : current)} className="mt-1 w-full rounded-lg border border-[#d9d9df] bg-white px-2 py-1.5 text-sm" /></label><label className="text-xs text-[#86868b]">房间数<input type="number" min={1} max={4} value={walkInDraft.room_count} disabled={walkInDraft.status === "AWAITING_PAYMENT"} onChange={(event) => setWalkInDraft((current) => current ? { ...current, room_count: Math.min(4, Math.max(1, Number(event.target.value) || 1)), status: "DRAFT", total_amount: null, room_amount: null, deposit_amount: null } : current)} className="mt-1 w-full rounded-lg border border-[#d9d9df] bg-white px-2 py-1.5 text-sm" /></label>{walkInDraft.total_amount !== null && <div className="col-span-2 border-t border-[#e5e5ea] pt-3"><p className="text-xs text-[#86868b]">房费 ¥{walkInDraft.room_amount} + 押金 ¥{walkInDraft.deposit_amount}</p><p className="mt-1 text-lg font-semibold">合计 ¥{walkInDraft.total_amount}</p></div>}</div>}{walkInDraft.status === "QUOTED" && !walkInPayment && <div className="mt-5 flex flex-wrap gap-2"><button onClick={() => void createWalkInPayment("wechat")} disabled={phase === "searching"} className="flex-1 rounded-2xl bg-[#07c160] px-4 py-3 text-sm font-medium text-white">生成微信支付</button><button onClick={() => void createWalkInPayment("alipay")} disabled={phase === "searching"} className="flex-1 rounded-2xl bg-[#1677ff] px-4 py-3 text-sm font-medium text-white">生成支付宝支付</button></div>}{walkInPayment && <div className="mt-5 rounded-2xl border border-[#bde7cf] bg-[#effaf4] p-4"><div className="flex items-center justify-between text-sm"><span>{walkInPayment.method === "alipay" ? "支付宝" : "微信"}模拟支付</span><span className="font-semibold">¥{walkInPayment.amount}</span></div><p className="mt-2 font-mono text-xs text-[#52745f]">支付码：{walkInPayment.qr_token ?? "DEMO"}</p><button onClick={() => void completeWalkInPayment()} disabled={phase === "searching" || walkInPayment.status === "PAID"} className="mt-4 w-full rounded-2xl bg-[#1d1d1f] px-4 py-3 text-sm font-medium text-white">模拟支付成功</button></div>}</section>}
       {transcript.length > 0 && <section className="mt-8 w-full max-w-2xl rounded-[2rem] bg-white p-5 text-left shadow-sm"><div className="flex items-center justify-between"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">完整对话记录</p><span className="text-xs text-[#a1a1a6]">本次会话 · {transcript.length} 条</span></div><div className="mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">{transcript.map((entry) => <div key={entry.id} className={`whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${entry.role === "user" ? "ml-8 bg-[#eaf4ff] text-[#174a72]" : entry.role === "tool" ? "mr-8 bg-[#f5f5f7] text-[#6e6e73]" : "mr-8 bg-[#eefaf2] text-[#245d38]"}`}><p className="mb-1 text-[10px] uppercase tracking-[.14em] opacity-60">{entry.role === "user" ? "您" : entry.role === "tool" ? "系统动作" : "AI"}</p>{entry.content}</div>)}</div></section>}
@@ -1466,10 +1865,10 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
       {(phase === "processing" || phase === "complete" || phase === "error") && <div className="mt-8 grid w-full gap-5 lg:grid-cols-[1fr_.9fr]">
         <section className="rounded-[2rem] bg-white p-6 text-left shadow-sm"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">业务状态机</p><div className="mt-5 space-y-3">{TERMINAL_PROGRESS.map(([label, detail], index) => <div key={label} className={`flex items-center gap-3 rounded-2xl p-3 ${index === flowStep ? "bg-[#eef6ff]" : ""}`}><div className={`grid h-8 w-8 shrink-0 place-items-center rounded-full ${index < flowStep || phase === "complete" ? "bg-[#1d1d1f] text-white" : index === flowStep ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#86868b]"}`}>{index < flowStep || phase === "complete" ? <Check size={15} /> : index + 1}</div><div><p className="text-sm font-medium">{label}</p><p className="mt-0.5 text-xs text-[#86868b]">{detail}</p></div></div>)}</div></section>
-        <section className="overflow-hidden rounded-[2rem] bg-[#15171a] text-left text-white shadow-sm"><div className="flex items-center justify-between border-b border-white/10 px-5 py-4"><div className="flex gap-1.5"><span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" /><span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" /><span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" /></div><span className="text-[11px] text-[#8e8e93]">设备与登记回执</span></div><div className="p-6">{flowStep >= 6 ? <CreditCard className="text-[#64d2ff]" /> : <MonitorCog className="text-[#64d2ff]" />}<p className="mt-5 text-xs uppercase tracking-[.16em] text-[#8e8e93]">一体化终端 · 自动设备链路</p><h2 className="mt-2 text-xl font-semibold">{flowStep < 4 ? "等待身份与房态核验" : flowStep < 6 ? "模拟住宿登记与入住确认" : flowStep === 6 ? "自动写卡与回读校验" : phase === "complete" ? "证件与房卡均已取走" : "请取走房卡和身份证"}</h2><div className="mt-5 space-y-3 font-mono text-xs text-[#aeaeb2]"><p>identity: {flowStep >= 2 ? "VERIFIED_TOKEN" : "pending"}</p><p>room: {checkinCase?.room_number ?? "pending"}</p><p>receipt: {checkinCase?.police_receipt ?? "pending"}</p><p>card_machine: {checkinCase?.hardware_status ?? "not_started"}</p></div><p className="mt-6 rounded-xl bg-white/5 p-3 text-xs leading-5 text-[#8e8e93]">演示不会连接真实公安或门锁系统；生产由受控设备适配器执行并返回可审计回执。</p></div></section>
+        <section className="overflow-hidden rounded-[2rem] bg-[#15171a] text-left text-white shadow-sm"><div className="flex items-center justify-between border-b border-white/10 px-5 py-4"><div className="flex gap-1.5"><span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" /><span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" /><span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" /></div><span className="text-[11px] text-[#8e8e93]">设备与登记回执</span></div><div className="p-6">{flowStep >= 6 ? <CreditCard className="text-[#64d2ff]" /> : <MonitorCog className="text-[#64d2ff]" />}<p className="mt-5 text-xs uppercase tracking-[.16em] text-[#8e8e93]">一体化终端 · 自动设备链路</p><h2 className="mt-2 text-xl font-semibold">{flowStep < 4 ? "等待身份与房态核验" : flowStep < 6 ? "模拟住宿登记与入住确认" : flowStep === 6 ? "自动写卡与回读校验" : phase === "complete" ? "证件与房卡均已取走" : "请取走房卡和身份证"}</h2><div className="mt-5 space-y-3 font-mono text-xs text-[#aeaeb2]"><p>identity: {flowStep >= 2 ? "VERIFIED_TOKEN" : "pending"}</p><p>room: {checkinCase?.room_number ?? "pending"}</p><p>receipt: {checkinCase?.police_receipt ?? "pending"}</p><p>card_machine: {checkinCase?.hardware_status ?? "not_started"}</p><p>deposit: {depositStatus ?? "pending"}{depositAmount !== null ? ` (${depositAmount} CNY)` : ""}</p></div><p className="mt-6 rounded-xl bg-white/5 p-3 text-xs leading-5 text-[#8e8e93]">演示不会连接真实公安或门锁系统；生产由受控设备适配器执行并返回可审计回执。</p></div></section>
       </div>}
 
-      {phase === "complete" && <section className="mt-6 w-full max-w-3xl rounded-[2rem] border border-[#bde7cf] bg-[#effaf4] p-6"><CircleCheck className="mx-auto text-[#248a4d]" size={30} /><h2 className="mt-3 text-2xl font-semibold">自助入住完成</h2><p className="mt-2 text-sm text-[#52745f]">发卡机已完成写卡、回读和吐卡模拟，传感器确认身份证与房卡均已取走。</p></section>}
+      {phase === "complete" && <section className="mt-6 w-full max-w-3xl rounded-[2rem] border border-[#bde7cf] bg-[#effaf4] p-6"><CircleCheck className="mx-auto text-[#248a4d]" size={30} /><h2 className="mt-3 text-2xl font-semibold">自助入住完成</h2><p className="mt-2 text-sm text-[#52745f]">发卡机已完成写卡、回读和吐卡模拟，传感器确认身份证与房卡均已取走。</p><div className="mx-auto mt-5 grid max-w-xl gap-2 text-left sm:grid-cols-2"><div className="rounded-xl bg-white/70 px-3 py-3 text-xs text-[#52745f]"><p className="text-[#7a9b86]">押金状态</p><p className="mt-1 font-medium text-[#248a4d]">{depositStatus === "captured" ? `已收 ¥${depositAmount ?? 0}` : depositStatus === "pending" ? "等待支付回执" : depositStatus === "failed" ? "收款失败，已转人工" : "已由入住系统确认"}</p></div><div className="rounded-xl bg-white/70 px-3 py-3 text-xs text-[#52745f]"><p className="text-[#7a9b86]">账本状态</p><p className="mt-1 font-medium text-[#248a4d]">已建立 · 在住中</p></div></div></section>}
       {!showEntry && <button onClick={reset} className="mt-7 inline-flex items-center gap-2 text-sm text-[#6e6e73]"><RefreshCcw size={15} />办理下一位</button>}
       </>)}
     </section>
@@ -1493,6 +1892,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
   const [password, setPassword] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [purgeRange, setPurgeRange] = useState("30d");
   const [resetting, setResetting] = useState(false);
   const [faultTarget, setFaultTarget] = useState("reader");
   const [faultType, setFaultType] = useState("reader_timeout");
@@ -1692,6 +2092,52 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       window.clearTimeout(timeout);
     }
   }
+  /**
+   * Housekeeping confirming a cleaned room. One tap on purpose: the action is
+   * reversible and the room state machine already refuses anything but
+   * VACANT_DIRTY -> VACANT_CLEAN, so an occupied room cannot be declared clean.
+   */
+  async function markAdminRoomClean(roomNumber: string) {
+    if (adminBusy) return;
+    setAdminBusy(true);
+    setAdminReply(`正在把房间 ${roomNumber} 标记为已完成打扫…`);
+    try {
+      const response = await fetchAdminStep("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.mark_room_clean", arguments: { room_number: roomNumber } }) }, "正在提交房态清洁", "房态清洁提交超时，结果未确认，请先重新查询房态再决定是否重试");
+      const data = await response.json() as { ok?: boolean; result?: { idempotent?: boolean }; error?: string };
+      if (!response.ok || !data.ok) {
+        const code = data.error ?? "";
+        throw new Error(code === "admin_permission_denied" ? "当前角色没有客房清洁权限，只有客房、店长和老板可以把房间改为可售。"
+          : code === "formal_core_unavailable" ? "正式房态不可用，无法标记清洁，请检查迁移是否已执行。"
+          : code.startsWith("invalid_room_transition") ? `房间 ${roomNumber} 当前不是待清洁状态，不能标记为可售。`
+          : code || "房态清洁失败");
+      }
+      setAdminResult({ type: "room", roomNumber, status: "vacant-clean", version: null });
+      setAdminReply(`房间 ${roomNumber} 已打扫完成，房态回到可售${data.result?.idempotent ? "（重复确认，未重复写房态流水）" : ""}。`);
+    } catch (error) { setAdminReply(error instanceof Error ? error.message : "房态清洁失败，请转人工核对"); }
+    finally { setAdminBusy(false); }
+  }
+  /**
+   * Retention cleanup. The preview *is* the confirmation card: the server freezes
+   * the window and the row counts into a pending action, and nothing is deleted
+   * until that card is confirmed.
+   */
+  async function preparePurgeCleanup(range: string) {
+    if (adminBusy) return;
+    const label = RETENTION_OPTIONS.find((option) => option.id === range)?.label ?? range;
+    setAdminBusy(true);
+    setAdminReply(`正在统计${label}的已退房记录…`);
+    try {
+      const response = await fetchAdminStep("/api/admin/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_name: "admin.prepare_purge_closed_loops", arguments: { range } }) }, "正在统计将被清理的记录", "统计超时，未生成清理确认单，也没有删除任何记录");
+      const data = await response.json() as { ok?: boolean; result?: Record<string, unknown>; error?: string };
+      if (!response.ok || !data.ok || !data.result) {
+        const code = data.error ?? "";
+        throw new Error(code === "admin_permission_denied" ? "当前角色不能清理历史数据，只有店长和老板可以。" : code || "生成清理确认单失败");
+      }
+      setPendingActionFromResult(data.result);
+      setAdminReply("清理确认单已生成，请核对将删除的数量后再确认；确认前不会删除任何记录。");
+    } catch (error) { setAdminReply(error instanceof Error ? error.message : "生成清理确认单失败，未删除任何记录"); }
+    finally { setAdminBusy(false); }
+  }
   async function fetchAdminStreamStep(text: string): Promise<{ response?: AdminResponse; error?: string }> {
     const controller = new AbortController();
     const started = performance.now();
@@ -1860,7 +2306,11 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
         const roomNumber = String(toolResult.room_number ?? "");
         const roomStatus = String(toolResult.status ?? "unknown");
         setAdminResult({ type: "room", roomNumber, status: roomStatus, version: toolResult.version === null || toolResult.version === undefined ? null : Number(toolResult.version) });
-        setAdminReply(roomStatus === "occupied" ? `房间 ${roomNumber} 当前有人入住，已隐藏完整客人信息。` : `房间 ${roomNumber} 当前空闲，可继续核对。`);
+        setAdminReply(roomStatus === "occupied" ? `房间 ${roomNumber} 当前有人入住，已隐藏完整客人信息。` : roomStatus === "vacant-dirty" ? `房间 ${roomNumber} 是待清洁房，打扫完成后才能重新售卖。` : `房间 ${roomNumber} 当前${ROOM_STATUS_LABELS[roomStatus] ?? "空闲"}，可继续核对。`);
+      } else if (result.tool_name === "admin.mark_room_clean") {
+        const roomNumber = String(toolResult.room_number ?? "");
+        setAdminResult({ type: "room", roomNumber, status: Number(toolResult.room_status ?? 0) === 0 ? "vacant-clean" : "vacant-dirty", version: null });
+        setAdminReply(`房间 ${roomNumber} 已打扫完成，房态回到可售${toolResult.idempotent ? "（重复确认，未重复写流水）" : ""}。`);
       } else if (result.tool_name.startsWith("admin.prepare_")) {
         setPendingActionFromResult(toolResult);
         if (String(toolResult.action_type ?? "") === "room_change") setAdminWorkflow({ kind: "room_change", step: "confirmation", targetRoom: String(toolResult.to_room ?? ""), candidates: [], selectedOrder: null, room: null, message: "换房确认单已生成，请核对后点击确认修改。" });
@@ -1888,9 +2338,11 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
     await loadFaults();
   }
   return <main className="min-h-screen bg-[#f3f6f8] text-[#102a43]"><header className="border-b border-[#d9e2ec] bg-white px-5 py-5 md:px-9"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4"><div className="flex items-center gap-3"><button onClick={onBack} className="grid h-9 w-9 place-items-center rounded-full bg-[#f3f6f8]" aria-label="返回入住界面"><ArrowLeft size={18} /></button><div><p className="text-sm text-[#627d98]">独立管理后台 · {adminUser.display_name}（{adminUser.role}）</p><h1 className="font-semibold">{adapter.hotelName}</h1></div></div><div className="flex gap-2"><button onClick={() => void onRefresh()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">{loading ? "刷新中…" : "刷新数据"}</button><button onClick={onPairing} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">环境检测</button><button onClick={onReconfigure} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">重新适配</button><button onClick={() => void logout()} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm">退出登录</button></div></div></header>
-    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 动作确认 → PMS / 设备 / 公安执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；AI 先生成待确认动作，改库、改金额、发卡、公安提交都必须弹窗核对后才执行。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821的总金额改成680")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备改金额</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366重新发房卡")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备发卡</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366提交广州公安登记")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备公安登记</button>{pendingAdminActionId && pendingAdminAction && <button type="button" onClick={() => setConfirmActionOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行：{pendingAdminAction.title}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：把尾号4821换到1306，或把尾号4821的总金额改成680" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} onListeningChange={setAdminVoiceListening} submitSignal={adminVoiceSubmitSignal} retrySignal={adminVoiceRetrySignal} onPipelineStage={(stage, status, detail, latencyMs) => updatePipelineStage(stage, { status, detail, latencyMs })} />{adminVoiceListening && <button type="button" onClick={() => setAdminVoiceSubmitSignal((value) => value + 1)} className="rounded-xl border border-[#cbd9e5] bg-white px-4 py-3 text-sm text-[#102a43]">结束录音</button>}<button type="submit" disabled={adminBusy || !adminUtterance.trim()} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : "发送"}</button><button type="button" onClick={() => { setAdminUtterance(""); setAdminVoiceRetrySignal((value) => value + 1); }} disabled={adminBusy || adminVoiceListening} className="rounded-xl border border-[#cbd9e5] bg-white px-4 py-3 text-sm text-[#102a43]">重试</button></form><AdminPipeline stages={pipeline} /><AdminResultPanel result={adminResult} status={adminReply} suggestionRoom={suggestionRoom} onSuggestionRoomChange={setSuggestionRoom} onPrepareSuggestion={(command) => void submitAdminCommand(command)} /></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
+    <div className="mx-auto max-w-7xl p-5 md:p-9"><section className="rounded-2xl border border-[#b9d8f4] bg-white p-5 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm text-[#3b78a8]">管理员 AI Native</p><h2 className="mt-1 text-xl font-semibold">语音指令 → 动作确认 → PMS / 设备 / 公安执行</h2><p className="mt-1 text-sm text-[#627d98]">管理员可以自然说话；AI 先生成待确认动作，改库、改金额、发卡、公安提交都必须弹窗核对后才执行。客房说“1208 打扫完成”是唯一例外：它只会把待清洁房改成可售，占用中的房间会被房态机直接拒绝。</p></div><span className="rounded-full bg-[#e8f7ee] px-3 py-1.5 text-xs text-[#248a4d]">{adminUser.role} · 已认证</span></div><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void submitAdminCommand("查询尾号4821")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询尾号 4821</button><button type="button" onClick={() => void submitAdminCommand("查询房态1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">查询房态 1306</button><button type="button" onClick={() => void submitAdminCommand("1208 打扫完成")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">标记打扫完成</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821换到1306")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备换房</button><button type="button" onClick={() => void submitAdminCommand("把尾号4821的总金额改成680")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备改金额</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366重新发房卡")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备发卡</button><button type="button" onClick={() => void submitAdminCommand("给尾号7366提交广州公安登记")} className="rounded-full border border-[#d9e2ec] px-3 py-2 text-sm">准备公安登记</button>{pendingAdminActionId && pendingAdminAction && <button type="button" onClick={() => setConfirmActionOpen(true)} className="rounded-full bg-[#007aff] px-3 py-2 text-sm text-white">确认执行：{pendingAdminAction.title}</button>}</div><form onSubmit={(event) => { event.preventDefault(); void submitAdminCommand(); }} className="mt-4 flex items-center gap-2"><input value={adminUtterance} onChange={(event) => setAdminUtterance(event.target.value)} placeholder="例如：把尾号4821换到1306，或把尾号4821的总金额改成680" className="min-w-0 flex-1 rounded-xl border border-[#cbd9e5] bg-[#f8fbfd] px-4 py-3 text-sm outline-none focus:border-[#007aff]" aria-label="管理员语音或文字指令" /><AdminVoiceInputControls adapter={adapter} onText={setAdminUtterance} onListeningChange={setAdminVoiceListening} submitSignal={adminVoiceSubmitSignal} retrySignal={adminVoiceRetrySignal} onPipelineStage={(stage, status, detail, latencyMs) => updatePipelineStage(stage, { status, detail, latencyMs })} />{adminVoiceListening && <button type="button" onClick={() => setAdminVoiceSubmitSignal((value) => value + 1)} className="rounded-xl border border-[#cbd9e5] bg-white px-4 py-3 text-sm text-[#102a43]">结束录音</button>}<button type="submit" disabled={adminBusy || !adminUtterance.trim()} className="rounded-xl bg-[#007aff] px-4 py-3 text-sm text-white disabled:opacity-40">{adminBusy ? "处理中…" : "发送"}</button><button type="button" onClick={() => { setAdminUtterance(""); setAdminVoiceRetrySignal((value) => value + 1); }} disabled={adminBusy || adminVoiceListening} className="rounded-xl border border-[#cbd9e5] bg-white px-4 py-3 text-sm text-[#102a43]">重试</button></form><AdminPipeline stages={pipeline} /><AdminResultPanel result={adminResult} status={adminReply} suggestionRoom={suggestionRoom} onSuggestionRoomChange={setSuggestionRoom} onPrepareSuggestion={(command) => void submitAdminCommand(command)} onMarkRoomClean={(roomNumber) => void markAdminRoomClean(roomNumber)} /></section><section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">商业价值</p><h2 className="mt-1 text-xl font-semibold">四条价值线</h2></div><span className="rounded-full bg-[#e8eef3] px-3 py-1.5 text-xs text-[#627d98]">演示指标 · 生产接入后替换为真实数据</span></div><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><ValueMetric icon={<TrendingUp size={20} />} label="收益" value="待接 PMS" note="跟踪 RevPAR、ADR 与增值成交" tone="blue" /><ValueMetric icon={<Users size={20} />} label="人力" value={`${estimatedMinutesSaved} 分钟`} note={`已自动完成 ${completedCases} 笔，按每笔节省6分钟估算`} tone="violet" /><ValueMetric icon={<Clock3 size={20} />} label="响应" value="< 3 秒" note="单路首段语音 P95 目标 · 7×24" tone="orange" /><ValueMetric icon={<FileCheck2 size={20} />} label="合规" value={snapshot.cases.length ? "100%" : "待产生"} note={`${snapshot.auditEvents.length} 条脱敏动作记录`} tone="green" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#cfe0f2] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#3b78a8]">AI Native</p><h2 className="mt-1 font-semibold">意图识别与动作对齐审计</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">只保留脱敏表达</span></div><div className="divide-y divide-[#edf2f7]">{intentEvents.length ? intentEvents.slice(0, 8).map((event) => <div key={event.id} className="grid gap-2 px-5 py-4 md:grid-cols-[1fr_auto]"><div><p className="text-sm leading-6 text-[#334e68]">{event.detail}</p><p className="mt-1 text-xs text-[#9fb3c8]">顾客表达 → 意图 → 置信度 → 受控业务动作</p></div><span className="font-mono text-xs text-[#829ab1]">#{event.id}</span></div>) : <Empty text="与AI说一句话后，这里会显示脱敏的意图识别和动作对齐记录" />}</div></section>
-      <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>
+      <AdminDataPanel />
+      <AdminKnowledgePanel canManage={adminUser.permissions.includes("admin:manage_knowledge")} />
+      <section className="mt-7 overflow-hidden rounded-2xl border border-[#e0d2ea] bg-[#fdfbff] shadow-sm"><div className="border-b border-[#eee1f4] px-5 py-4"><p className="text-sm text-[#7b4b9c]">数据保留</p><h2 className="mt-1 font-semibold">清理已退房的历史闭环</h2><p className="mt-1 text-xs leading-5 text-[#7d6a8a]">只删已退房的闭环（入住记录、账本、分录、预订、订单）；在住的客人、他们的账本和房间当前状态都不会被改动。删除不可撤销，所以先生成确认单，确认单里会列出每一类将被删除的数量。</p></div><div className="flex flex-wrap items-center gap-2 px-5 py-4">{RETENTION_OPTIONS.map((option) => <button key={option.id} type="button" onClick={() => setPurgeRange(option.id)} className={`rounded-full px-3 py-2 text-sm ${purgeRange === option.id ? "bg-[#7b4b9c] text-white" : "border border-[#ddcbe4] bg-white text-[#6b4f7d]"}`}>{option.label}</button>)}<button type="button" disabled={adminBusy} onClick={() => void preparePurgeCleanup(purgeRange)} className="rounded-lg bg-[#7b4b9c] px-4 py-2 text-sm text-white disabled:opacity-40">生成清理确认单</button></div></section>      <section className="mt-7 overflow-hidden rounded-2xl border border-[#f0d7b7] bg-[#fffaf4] shadow-sm"><div className="border-b border-[#f3e3cd] px-5 py-4"><p className="text-sm text-[#ad6a16]">验收工具</p><h2 className="mt-1 font-semibold">设备与公安仿真器故障开关</h2><p className="mt-1 text-xs leading-5 text-[#8a6a45]">只影响当前会话；每次注入默认只触发一次，失败会自动生成人工任务和审计记录。</p></div><div className="flex flex-wrap items-end gap-3 px-5 py-4"><label className="text-xs text-[#627d98]">目标<select value={faultTarget} onChange={(event) => { const target = event.target.value; setFaultTarget(target); setFaultType(target === "reader" ? "reader_timeout" : target === "encoder" ? "encoder_offline" : "captcha_required"); }} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm"><option value="reader">读卡器</option><option value="encoder">发卡机</option><option value="police">公安浏览器</option></select></label><label className="text-xs text-[#627d98]">故障类型<select value={faultType} onChange={(event) => setFaultType(event.target.value)} className="mt-1 block rounded-lg border border-[#d9e2ec] bg-white px-3 py-2 text-sm">{(faultTarget === "reader" ? ["reader_timeout", "reader_offline", "duplicate_read", "identity_mismatch"] : faultTarget === "encoder" ? ["encoder_offline", "write_failed", "readback_mismatch", "output_jammed", "card_not_collected", "encoder_timeout"] : ["captcha_required", "system_maintenance", "certificate_error", "submission_rejected", "receipt_lost", "police_timeout"]).map((fault) => <option key={fault} value={fault}>{fault}</option>)}</select></label><button onClick={() => void configureFault()} className="rounded-lg bg-[#b66a16] px-4 py-2 text-sm text-white">注入一次</button><button onClick={() => void resetFaults()} className="rounded-lg border border-[#e3c79e] bg-white px-4 py-2 text-sm text-[#8a5b1d]">恢复正常</button>{faultMessage && <span className="text-xs text-[#8a6a45]">{faultMessage}</span>}</div><div className="border-t border-[#f3e3cd] px-5 py-3 text-xs text-[#8a6a45]">{faults.filter((fault) => fault.enabled).length ? faults.filter((fault) => fault.enabled).map((fault) => <span key={fault.id} className="mr-2 inline-flex rounded-full bg-white px-2.5 py-1">{fault.target}/{fault.fault_type} · 已调用 {fault.call_count} 次</span>) : "当前没有启用的故障"}</div></section>
       <section className="mt-7"><p className="text-sm text-[#627d98]">系统运行</p><h2 className="mt-1 text-xl font-semibold">实时业务数据</h2><div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><AdminMetric label="假订单" value={String(snapshot.orders.length)} note="每个浏览器会话独立" /><AdminMetric label="办理任务" value={String(snapshot.cases.length)} note="状态变更写入数据库" /><AdminMetric label="浏览器任务" value={String(snapshot.browserJobs.length)} note="仅隔离模拟" /><AdminMetric label="审计事件" value={String(snapshot.auditEvents.length)} note="倒序显示最近 80 条" /></div></section>
       <section className="mt-7 overflow-hidden rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">D1 假数据</p><h2 className="mt-1 font-semibold">订单状态与手机号测试集</h2></div><div className="overflow-x-auto"><table className="w-full min-w-[850px] text-left text-sm"><thead className="bg-[#f8fbfd] text-xs text-[#627d98]"><tr>{["来源", "订单号", "手机号", "日期", "房型", "订单状态", "房间"].map((name) => <th key={name} className="px-5 py-3 font-medium">{name}</th>)}</tr></thead><tbody>{snapshot.orders.map((order) => <tr key={order.id} className="border-t border-[#edf2f7]"><td className="px-5 py-3 font-medium">{order.source}</td><td className="px-5 py-3 font-mono text-xs">{order.order_code}</td><td className="px-5 py-3">{order.phone_masked}</td><td className="px-5 py-3">{order.stay_date}</td><td className="px-5 py-3">{order.room_type}</td><td className="px-5 py-3"><StatusPill value={order.status} /></td><td className="px-5 py-3">{order.room_number ?? "—"}</td></tr>)}</tbody></table></div></section>
       <div className="mt-7 grid gap-7 lg:grid-cols-[1fr_.85fr]"><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8eef3] px-5 py-4"><div><p className="text-sm text-[#627d98]">AI 决策链回放</p><h2 className="mt-1 font-semibold">表达 → 意图 → 计划 → 策略 → 工具 → 回执</h2></div><button type="button" onClick={() => void loadAiChain()} disabled={aiChainBusy} className="rounded-lg border border-[#cbd9e5] px-3 py-2 text-sm disabled:opacity-50">{aiChainBusy ? "读取中…" : "读取当前会话"}</button></div>{aiChain ? <div className="grid gap-4 p-5 lg:grid-cols-2"><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">理解（意图）</p><div className="mt-2 space-y-2">{aiChain.intents.length ? aiChain.intents.map((item, index) => <div key={`${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">“{item.raw_text_redacted}”</p><p className="text-[#627d98]">{item.intent} · 置信度 {item.confidence ?? "—"} · {item.source}</p></div>) : <p className="text-xs text-[#829ab1]">暂无记录</p>}</div></div><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">计划与策略</p><div className="mt-2 space-y-2">{aiChain.plans.map((item, index) => <div key={`plan-${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">{item.status}</p><p className="font-mono text-[10px] text-[#829ab1]">{(item.plan_json ?? "").slice(0, 120)}</p></div>)}{aiChain.policyDecisions.map((item, index) => <div key={`${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">{item.action} · 风险 {item.risk_level}</p><p className="text-[#627d98]">{item.decision} — {item.reason}</p></div>)}</div></div><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">工具与回执</p><div className="mt-2 space-y-2">{aiChain.toolCalls.length ? aiChain.toolCalls.map((item, index) => <div key={`${item.created_at}-${index}`} className="text-xs leading-5"><p className="text-[#334e68]">{item.tool_name} · <span className={item.status === "SUCCEEDED" ? "text-[#248a4d]" : item.status === "PROPOSED" ? "text-[#1769aa]" : "text-[#b63d13]"}>{item.status}</span></p><p className="font-mono text-[10px] text-[#829ab1]">{item.result_json ? item.result_json.slice(0, 120) : "等待回执"}</p></div>) : <p className="text-xs text-[#829ab1]">暂无工具调用</p>}</div></div><div className="rounded-xl bg-[#f8fbfd] p-4"><p className="text-xs uppercase tracking-[.14em] text-[#829ab1]">工作流</p>{aiChain.workflow ? <div className="mt-2 space-y-1 text-xs leading-5 text-[#627d98]"><p>状态：{aiChain.workflow.status} · 当前步骤：{aiChain.workflow.current_step ?? "—"}</p><p>最后更新：{new Date(aiChain.workflow.updated_at).toLocaleString("zh-CN")}</p><p className="font-mono text-[10px]">{aiChain.workflow.id}</p></div> : <p className="mt-2 text-xs text-[#829ab1]">该会话还没有 AI 记录</p>}</div></div> : <p className="p-5 text-sm text-[#627d98]">点击“读取当前会话”，查看这位客人的完整 AI 决策链。</p>}</section><section className="rounded-2xl border border-[#f3d9c0] bg-white shadow-sm"><div className="border-b border-[#f6e6d5] px-5 py-4"><p className="text-sm text-[#8a5b1d]">人工接管</p><h2 className="mt-1 font-semibold">待处理人工任务</h2></div><div className="divide-y divide-[#fdf1e6]">{snapshot.manualTasks.length ? snapshot.manualTasks.map((task) => <div key={task.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="text-sm font-medium">{task.department} · {task.status === "open" ? "待处理" : task.status}</p><p className="mt-1 text-xs leading-5 text-[#627d98]">{task.reason}</p><p className="mt-1 font-mono text-[10px] text-[#9fb3c8]">命令 {task.command_id ? task.command_id.slice(0, 8) : "—"} · 任务 {task.case_id.slice(0, 8)}</p></div><span className="rounded-full bg-[#fff1e5] px-3 py-1 text-xs text-[#8a5b1d]">{new Date(task.created_at).toLocaleString("zh-CN")}</span></div>) : <Empty text="当前没有待处理的人工任务" />}</div></section><section className="rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="border-b border-[#e8eef3] px-5 py-4"><p className="text-sm text-[#627d98]">办理任务</p><h2 className="mt-1 font-semibold">数据库状态机</h2></div><div className="divide-y divide-[#edf2f7]">{snapshot.cases.length ? snapshot.cases.map((item) => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4"><div><p className="font-mono text-xs text-[#627d98]">{item.id.slice(0, 12)}… · v{item.version}</p><p className="mt-1 text-sm">房间 {item.room_number ?? "未锁定"} · 硬件 {item.hardware_status}</p></div><StatusPill value={item.status} /></div>) : <Empty text="尚无办理任务" />}</div></section>
@@ -1910,7 +2362,7 @@ function AdminConsole({ sessionId, adapter, snapshot, loading, onRefresh, onBack
       </AlertDialogContent>
     </AlertDialog>
     {confirmReset && <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 p-5" role="dialog" aria-modal="true" aria-labelledby="reset-title"><section className="w-full max-w-md rounded-3xl bg-white p-6 shadow-2xl"><div className="flex items-start justify-between"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#b63d13]">需要确认</p><h2 id="reset-title" className="mt-2 text-xl font-semibold">重置本次演示数据？</h2></div><button onClick={() => setConfirmReset(false)} aria-label="关闭"><X size={19} /></button></div><p className="mt-4 text-sm leading-6 text-[#627d98]">当前浏览器会话的办理任务、浏览器任务和审计记录会被删除，假订单恢复到初始状态。不会影响其他会话。</p><div className="mt-6 flex justify-end gap-3"><button onClick={() => setConfirmReset(false)} className="rounded-xl border border-[#cbd9e5] px-4 py-2.5 text-sm">取消</button><button onClick={() => void resetData()} disabled={resetting} className="rounded-xl bg-[#b63d13] px-4 py-2.5 text-sm text-white disabled:opacity-50">{resetting ? "重置中…" : "确认重置"}</button></div></section></div>}
-    <AdminCharts sourceData={orderSourceData} statusData={orderStatusData} roomData={roomStatusData} caseData={caseStatusData} auditData={auditTrendData} result={adminResult} status={adminReply} suggestionRoom={suggestionRoom} onSuggestionRoomChange={setSuggestionRoom} onPrepareSuggestion={(command) => void submitAdminCommand(command)} />
+    <AdminCharts sourceData={orderSourceData} statusData={orderStatusData} roomData={roomStatusData} caseData={caseStatusData} auditData={auditTrendData} result={adminResult} status={adminReply} suggestionRoom={suggestionRoom} onSuggestionRoomChange={setSuggestionRoom} onPrepareSuggestion={(command) => void submitAdminCommand(command)} onMarkRoomClean={(roomNumber) => void markAdminRoomClean(roomNumber)} />
   </main>;
 }
 
@@ -2250,28 +2702,28 @@ function AdminConfirmationCardV2({ state, busy, onOpen, onCancel, onRetry, onAud
     const next: PendingAdminAction = { ...state.action, fields: draft, toRoom: state.action.actionType === "room_change" && target ? target : state.action.toRoom, newAmount: amountField ? (amount ?? state.action.newAmount) : state.action.newAmount };
     onEdit(next); setEditing(false);
   }
-  return <section className="fixed bottom-5 right-5 z-40 w-[min(620px,calc(100vw-2.5rem))] rounded-2xl border border-[#b9d8f4] bg-[#fbfdff] p-4 shadow-xl" aria-label="管理员确认单"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">管理员确认单</p><h3 className="mt-1 text-base font-semibold text-[#102a43]">{state.action.title}</h3></div><span className={`rounded-full px-3 py-1 text-xs ${statusClass}`}>{labels[status]}</span></div><div className="mt-3 grid gap-3 sm:grid-cols-2">{[...[{ label: "客人", value: state.action.phone }, { label: "订单号", value: state.action.orderCode || "已匹配订单" }], ...draft].map((field, index) => <label key={`${field.label}-${index}`} className="text-xs text-[#829ab1]">{field.label}{editing && index >= 2 ? <input value={field.value} onChange={(event) => setDraft((current) => current.map((item, itemIndex) => itemIndex === index - 2 ? { ...item, value: event.target.value } : item))} className="mt-1 w-full rounded-lg border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68] outline-none focus:border-[#007aff]" /> : <span className="mt-1 block font-medium text-[#334e68]">{field.value || "—"}</span>}</label>)}</div>{editError && <p className="mt-2 rounded-lg bg-[#fff1ed] px-3 py-2 text-xs text-[#b63d13]">{editError}</p>}<div className="mt-3 rounded-xl bg-[#f5f8fb] px-3 py-2 text-xs leading-5 text-[#627d98]">{status === "AWAITING_CONFIRMATION" && !locallyExpired ? <>有效期至 {state.action.expiresAt ? new Date(state.action.expiresAt).toLocaleString("zh-CN") : "5分钟内"} · 剩余 {remaining === null ? "—" : `${Math.ceil(remaining / 1000)} 秒`}</> : status === "EXPIRED" ? "确认单已过期，系统不会执行，请重新核对并生成。" : status === "CONFLICTED" ? (state.error ?? "目标房间状态已变化，系统未修改业务数据。") : status === "CANCELLED" ? "已取消确认，业务数据未修改。" : "已执行并写入操作审计。"}</div><div className="mt-3 flex flex-wrap gap-2">{editing ? <><button type="button" onClick={saveEdits} className="rounded-xl bg-[#007aff] px-3 py-2 text-sm font-medium text-white">保存字段</button><button type="button" onClick={() => { setDraft(state.action.fields); setEditing(false); }} className="rounded-xl border border-[#cbd9e5] px-3 py-2 text-sm">取消编辑</button></> : <button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={() => setEditing(true)} className="rounded-xl border border-[#007aff] px-3 py-2 text-sm text-[#1769aa] disabled:opacity-40">编辑字段</button>}<button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={onOpen} className="rounded-xl bg-[#007aff] px-3 py-2 text-sm font-medium text-white disabled:opacity-40">查看并确认</button><button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={onCancel} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68] disabled:opacity-40">取消确认</button>{(status === "EXPIRED" || status === "CONFLICTED") && <button type="button" onClick={onRetry} className="rounded-xl border border-[#007aff] px-3 py-2 text-sm text-[#1769aa]">重新核对并生成</button>}<button type="button" disabled={auditBusy} onClick={onAudit} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68]">{auditBusy ? "读取审计…" : "查看审计详情"}</button></div></section>;
+  return <section className="fixed bottom-5 right-5 z-40 w-[min(620px,calc(100vw-2.5rem))] rounded-2xl border border-[#b9d8f4] bg-[#fbfdff] p-4 shadow-xl" aria-label="管理员确认单"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">管理员确认单</p><h3 className="mt-1 text-base font-semibold text-[#102a43]">{state.action.title}</h3></div><span className={`rounded-full px-3 py-1 text-xs ${statusClass}`}>{labels[status]}</span></div><div className="mt-3 grid gap-3 sm:grid-cols-2">{[...[{ label: "客人", value: state.action.phone }, { label: "订单号", value: state.action.orderCode || "已匹配订单" }], ...draft].map((field, index) => <label key={`${field.label}-${index}`} className="text-xs text-[#829ab1]">{field.label}{editing && index >= 2 ? <input value={field.value} onChange={(event) => setDraft((current) => current.map((item, itemIndex) => itemIndex === index - 2 ? { ...item, value: event.target.value } : item))} className="mt-1 w-full rounded-lg border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68] outline-none focus:border-[#007aff]" /> : <span className="mt-1 block font-medium text-[#334e68]">{field.value || "—"}</span>}</label>)}</div>{editError && <p className="mt-2 rounded-lg bg-[#fff1ed] px-3 py-2 text-xs text-[#b63d13]">{editError}</p>}<div className="mt-3 rounded-xl bg-[#f5f8fb] px-3 py-2 text-xs leading-5 text-[#627d98]">{status === "AWAITING_CONFIRMATION" && !locallyExpired ? <>有效期至 {state.action.expiresAt ? new Date(state.action.expiresAt).toLocaleString("zh-CN") : "5分钟内"} · 剩余 {remaining === null ? "—" : `${Math.ceil(remaining / 1000)} 秒`}</> : status === "EXPIRED" ? "确认单已过期，系统不会执行，请重新核对并生成。" : status === "CONFLICTED" ? (state.error ?? "目标房间状态已变化，系统未修改业务数据。") : status === "CANCELLED" ? "已取消确认，业务数据未修改。" : "已执行并写入操作审计。"}</div><div className="mt-3 flex flex-wrap gap-2">{state.action.actionType === "purge_closed_loops" ? null : editing ? <><button type="button" onClick={saveEdits} className="rounded-xl bg-[#007aff] px-3 py-2 text-sm font-medium text-white">保存字段</button><button type="button" onClick={() => { setDraft(state.action.fields); setEditing(false); }} className="rounded-xl border border-[#cbd9e5] px-3 py-2 text-sm">取消编辑</button></> : <button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={() => setEditing(true)} className="rounded-xl border border-[#007aff] px-3 py-2 text-sm text-[#1769aa] disabled:opacity-40">编辑字段</button>}<button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={onOpen} className="rounded-xl bg-[#007aff] px-3 py-2 text-sm font-medium text-white disabled:opacity-40">查看并确认</button><button type="button" disabled={busy || status !== "AWAITING_CONFIRMATION" || locallyExpired} onClick={onCancel} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68] disabled:opacity-40">取消确认</button>{(status === "EXPIRED" || status === "CONFLICTED") && <button type="button" onClick={onRetry} className="rounded-xl border border-[#007aff] px-3 py-2 text-sm text-[#1769aa]">重新核对并生成</button>}<button type="button" disabled={auditBusy} onClick={onAudit} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm text-[#334e68]">{auditBusy ? "读取审计…" : "查看审计详情"}</button></div></section>;
 }
 
 function AdminAuditDetailPanel({ events, onClose }: { events: AdminAuditRecord[]; onClose: () => void }) {
   return <section className="fixed inset-x-5 bottom-5 z-50 mx-auto max-w-3xl rounded-2xl border border-[#d9e2ec] bg-white p-4 shadow-2xl" aria-label="操作审计详情"><div className="flex items-center justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">操作审计详情</p><h3 className="mt-1 font-semibold text-[#102a43]">确认单完整时间线</h3></div><button type="button" onClick={onClose} className="rounded-lg border border-[#cbd9e5] px-3 py-1.5 text-xs text-[#627d98]">收起</button></div>{events.length ? <div className="mt-3 max-h-[55vh] divide-y divide-[#edf2f7] overflow-y-auto">{events.map((event) => <div key={event.id} className="grid gap-2 py-3 sm:grid-cols-[150px_1fr_auto]"><span className="text-xs text-[#829ab1]">{new Date(event.created_at).toLocaleString("zh-CN")}</span><div><p className="text-sm font-medium text-[#334e68]">{event.event_type}</p><p className="mt-1 text-xs leading-5 text-[#627d98]">{event.detail}</p></div><span className="text-xs text-[#829ab1]">{event.username ?? "系统"}{event.role ? ` · ${event.role}` : ""}</span></div>)}</div> : <p className="mt-4 rounded-xl bg-[#f5f8fb] px-3 py-3 text-sm text-[#627d98]">该确认单暂时没有审计事件。</p>}</section>;
 }
 
-function AdminResultPanel({ result, status, suggestionRoom, onSuggestionRoomChange, onPrepareSuggestion }: { result: AdminResult; status: string; suggestionRoom: string; onSuggestionRoomChange: (value: string) => void; onPrepareSuggestion: (command: string) => void }) {
+function AdminResultPanel({ result, status, suggestionRoom, onSuggestionRoomChange, onPrepareSuggestion, onMarkRoomClean }: { result: AdminResult; status: string; suggestionRoom: string; onSuggestionRoomChange: (value: string) => void; onPrepareSuggestion: (command: string) => void; onMarkRoomClean: (roomNumber: string) => void }) {
   const orders = result?.type === "orders" ? result.orders : [];
   const firstPhone = orders[0] ? String(orders[0].phone_last4 ?? String(orders[0].phone ?? "").replace(/\D/g, "").slice(-4)) : "";
   const workflow = result?.type === "workflow" ? result.workflow : null;
   const workflowSteps: Array<[AdminWorkflowStep, string]> = [["guest_search", "查找客人"], ["guest_selection", "选择订单"], ["room_check", "核对房态"], ["confirmation", "换房确认"], ["executing", "PMS执行"]];
   const selected = workflow?.selectedOrder;
-  return <section className="mt-4 overflow-hidden rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf2f7] px-4 py-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">管理员工作流</p><p className="mt-1 text-sm text-[#334e68]">{workflow ? workflow.message : status}</p></div><span className={`rounded-full px-3 py-1 text-xs ${workflow?.step === "blocked" ? "bg-[#fff1ed] text-[#b63d13]" : "bg-[#f2f7fb] text-[#627d98]"}`}>{workflow ? "受控流程 · 脱敏" : "查询结果 · 脱敏"}</span></div>{workflow && <div className="p-4"><div className="grid gap-2 sm:grid-cols-5">{workflowSteps.map(([step, label], index) => { const currentIndex = workflowSteps.findIndex(([value]) => value === workflow.step); const done = workflow.step === "completed" || (currentIndex >= 0 && index < currentIndex); const active = workflow.step === step; return <div key={step} className={`rounded-xl border p-3 ${done ? "border-[#bde7cf] bg-[#effaf4]" : active ? "border-[#b9d8f4] bg-[#eaf4ff]" : "border-[#e8eef3] bg-[#fbfdff]"}`}><div className="flex items-center gap-2"><span className={`grid h-6 w-6 place-items-center rounded-full text-xs ${done ? "bg-[#34c759] text-white" : active ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#829ab1]"}`}>{done ? <Check size={13} /> : index + 1}</span><span className="text-xs font-medium">{label}</span></div></div>; })}</div>{workflow.step === "guest_selection" && <div className="mt-4"><p className="text-sm font-medium">尾号 {String(workflow.candidates[0]?.phone_last4 ?? "")} 对应多笔订单，请选择一笔</p><div className="mt-3 grid gap-3 md:grid-cols-2">{workflow.candidates.map((order) => { const phone = String(order.phone ?? order.phone_masked ?? `***${order.phone_last4 ?? ""}`); const key = String(order.id ?? order.order_code); return <article key={key} className="rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-[#102a43]">{String(order.source ?? "订单")} · {String(order.order_code ?? "未编号")}</p><p className="mt-1 text-xs text-[#627d98]">手机号 {phone} · 房间 {String(order.room_number ?? "未分配")}</p></div><StatusPill value={String(order.status ?? "未知")} /></div><button type="button" onClick={() => onPrepareSuggestion(`__select:${key}`)} className="mt-4 w-full rounded-xl bg-[#007aff] px-3 py-2.5 text-sm font-medium text-white">选择此订单</button></article>; })}</div></div>}{(workflow.step === "room_check" || workflow.step === "confirmation" || workflow.step === "executing" || workflow.step === "completed") && selected && <div className="mt-4 rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="grid gap-3 sm:grid-cols-2"><AdminDataField label="客人" value={String(selected.guest_label ?? "已脱敏")} /><AdminDataField label="手机号" value={String(selected.phone ?? selected.phone_masked ?? `***${selected.phone_last4 ?? ""}`)} /><AdminDataField label="当前房间" value={String(selected.room_number ?? "未分配")} /><AdminDataField label="目标房间" value={workflow.targetRoom} /></div>{workflow.room && <div className="mt-4 flex items-center justify-between rounded-xl bg-[#f5f8fb] px-3 py-2 text-sm"><span>目标房态：{workflow.room.status === "vacant-clean" ? "空闲可用" : "不可用"}</span><StatusPill value={workflow.room.status} /></div>}{workflow.step === "confirmation" && <button type="button" onClick={() => onPrepareSuggestion("__open_confirmation")} className="mt-4 w-full rounded-xl bg-[#007aff] px-4 py-3 text-sm font-medium text-white">查看确认单并确认修改</button>}{workflow.step === "completed" && <p className="mt-4 rounded-xl bg-[#effaf4] px-3 py-2 text-sm text-[#248a4d]">换房已完成，数据库与审计记录已更新。</p>}</div>}{workflow.step === "blocked" && <div className="mt-4 rounded-xl bg-[#fff8f4] px-4 py-3 text-sm text-[#765444]">流程已停止：{workflow.message}</div>}</div>}{result?.type === "orders" && <div className="p-4">{orders.length ? <div className="grid gap-3 md:grid-cols-2">{orders.map((order) => { const phone = String(order.phone_masked ?? (order.phone_last4 ? `****${order.phone_last4}` : "***")); return <article key={String(order.id ?? order.order_code)} className="rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold text-[#102a43]">{String(order.source ?? "订单")} · {String(order.order_code ?? "未编号")}</p><p className="mt-1 text-xs text-[#627d98]">客人 {String(order.guest_label ?? "已脱敏")} · 手机号 {phone}</p></div><StatusPill value={String(order.status ?? "未知")} /></div><dl className="mt-4 grid grid-cols-2 gap-3 text-xs"><AdminDataField label="入住日期" value={String(order.stay_date ?? "—")} /><AdminDataField label="房型" value={String(order.room_type ?? "—")} /><AdminDataField label="房间" value={String(order.room_number ?? "未分配")} /><AdminDataField label="晚数/间数" value={`${String(order.nights ?? "—")} 晚 · ${String(order.room_count ?? "—")} 间`} /></dl></article>; })}</div> : <Empty text="没有找到符合条件的客人或订单" />} {firstPhone && <div className="mt-4 rounded-2xl bg-[#f5f8fb] p-4"><div className="flex items-start gap-3"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#eaf4ff] text-[#1769aa]"><Settings2 size={17} /></div><div><p className="text-sm font-medium text-[#334e68]">可执行建议</p><p className="mt-1 text-xs leading-5 text-[#627d98]">建议只生成受控修改草案，确认弹窗通过后才会调用 PMS，不会直接改库。</p></div></div><div className="mt-3 flex flex-wrap items-center gap-2"><input value={suggestionRoom} onChange={(event) => onSuggestionRoomChange(event.target.value.replace(/\D/g, "").slice(0, 4))} inputMode="numeric" placeholder="目标房号" className="w-28 rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm outline-none focus:border-[#007aff]" aria-label="建议目标房号" /><button type="button" disabled={!suggestionRoom.trim()} onClick={() => onPrepareSuggestion(`把尾号${firstPhone}换到${suggestionRoom}`)} className="rounded-xl bg-[#007aff] px-3 py-2 text-xs font-medium text-white disabled:opacity-40">生成换房草案</button><button type="button" onClick={() => onPrepareSuggestion(`把尾号${firstPhone}的总金额改成`)} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-xs text-[#334e68]">生成金额草案</button></div></div>}</div>}{result?.type === "room" && <div className="flex items-center justify-between gap-4 p-5"><div><p className="text-2xl font-semibold tracking-[-.03em] text-[#102a43]">房间 {result.roomNumber}</p><p className="mt-1 text-sm text-[#627d98]">当前状态：{result.status === "occupied" ? "有人入住" : "空闲，可继续核对"}</p></div><span className={`rounded-full px-3 py-1.5 text-xs ${result.status === "occupied" ? "bg-[#fff1ed] text-[#b63d13]" : "bg-[#e8f7ee] text-[#248a4d]"}`}>{result.status === "occupied" ? "已占用" : "可用"}</span></div>}</section>;
+  return <section className="mt-4 overflow-hidden rounded-2xl border border-[#d9e2ec] bg-white shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf2f7] px-4 py-3"><div><p className="text-xs font-medium uppercase tracking-[.14em] text-[#829ab1]">管理员工作流</p><p className="mt-1 text-sm text-[#334e68]">{workflow ? workflow.message : status}</p></div><span className={`rounded-full px-3 py-1 text-xs ${workflow?.step === "blocked" ? "bg-[#fff1ed] text-[#b63d13]" : "bg-[#f2f7fb] text-[#627d98]"}`}>{workflow ? "受控流程 · 脱敏" : "查询结果 · 脱敏"}</span></div>{workflow && <div className="p-4"><div className="grid gap-2 sm:grid-cols-5">{workflowSteps.map(([step, label], index) => { const currentIndex = workflowSteps.findIndex(([value]) => value === workflow.step); const done = workflow.step === "completed" || (currentIndex >= 0 && index < currentIndex); const active = workflow.step === step; return <div key={step} className={`rounded-xl border p-3 ${done ? "border-[#bde7cf] bg-[#effaf4]" : active ? "border-[#b9d8f4] bg-[#eaf4ff]" : "border-[#e8eef3] bg-[#fbfdff]"}`}><div className="flex items-center gap-2"><span className={`grid h-6 w-6 place-items-center rounded-full text-xs ${done ? "bg-[#34c759] text-white" : active ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#829ab1]"}`}>{done ? <Check size={13} /> : index + 1}</span><span className="text-xs font-medium">{label}</span></div></div>; })}</div>{workflow.step === "guest_selection" && <div className="mt-4"><p className="text-sm font-medium">尾号 {String(workflow.candidates[0]?.phone_last4 ?? "")} 对应多笔订单，请选择一笔</p><div className="mt-3 grid gap-3 md:grid-cols-2">{workflow.candidates.map((order) => { const phone = String(order.phone ?? order.phone_masked ?? `***${order.phone_last4 ?? ""}`); const key = String(order.id ?? order.order_code); return <article key={key} className="rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-[#102a43]">{String(order.source ?? "订单")} · {String(order.order_code ?? "未编号")}</p><p className="mt-1 text-xs text-[#627d98]">手机号 {phone} · 房间 {String(order.room_number ?? "未分配")}</p></div><StatusPill value={String(order.status ?? "未知")} /></div><button type="button" onClick={() => onPrepareSuggestion(`__select:${key}`)} className="mt-4 w-full rounded-xl bg-[#007aff] px-3 py-2.5 text-sm font-medium text-white">选择此订单</button></article>; })}</div></div>}{(workflow.step === "room_check" || workflow.step === "confirmation" || workflow.step === "executing" || workflow.step === "completed") && selected && <div className="mt-4 rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="grid gap-3 sm:grid-cols-2"><AdminDataField label="客人" value={String(selected.guest_label ?? "已脱敏")} /><AdminDataField label="手机号" value={String(selected.phone ?? selected.phone_masked ?? `***${selected.phone_last4 ?? ""}`)} /><AdminDataField label="当前房间" value={String(selected.room_number ?? "未分配")} /><AdminDataField label="目标房间" value={workflow.targetRoom} /></div>{workflow.room && <div className="mt-4 flex items-center justify-between rounded-xl bg-[#f5f8fb] px-3 py-2 text-sm"><span>目标房态：{workflow.room.status === "vacant-clean" ? "空闲可用" : "不可用"}</span><StatusPill value={workflow.room.status} /></div>}{workflow.step === "confirmation" && <button type="button" onClick={() => onPrepareSuggestion("__open_confirmation")} className="mt-4 w-full rounded-xl bg-[#007aff] px-4 py-3 text-sm font-medium text-white">查看确认单并确认修改</button>}{workflow.step === "completed" && <p className="mt-4 rounded-xl bg-[#effaf4] px-3 py-2 text-sm text-[#248a4d]">换房已完成，数据库与审计记录已更新。</p>}</div>}{workflow.step === "blocked" && <div className="mt-4 rounded-xl bg-[#fff8f4] px-4 py-3 text-sm text-[#765444]">流程已停止：{workflow.message}</div>}</div>}{result?.type === "orders" && <div className="p-4">{orders.length ? <div className="grid gap-3 md:grid-cols-2">{orders.map((order) => { const phone = String(order.phone_masked ?? (order.phone_last4 ? `****${order.phone_last4}` : "***")); return <article key={String(order.id ?? order.order_code)} className="rounded-2xl border border-[#e8eef3] bg-[#fbfdff] p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold text-[#102a43]">{String(order.source ?? "订单")} · {String(order.order_code ?? "未编号")}</p><p className="mt-1 text-xs text-[#627d98]">客人 {String(order.guest_label ?? "已脱敏")} · 手机号 {phone}</p></div><StatusPill value={String(order.status ?? "未知")} /></div><dl className="mt-4 grid grid-cols-2 gap-3 text-xs"><AdminDataField label="入住日期" value={String(order.stay_date ?? "—")} /><AdminDataField label="房型" value={String(order.room_type ?? "—")} /><AdminDataField label="房间" value={String(order.room_number ?? "未分配")} /><AdminDataField label="晚数/间数" value={`${String(order.nights ?? "—")} 晚 · ${String(order.room_count ?? "—")} 间`} /></dl></article>; })}</div> : <Empty text="没有找到符合条件的客人或订单" />} {firstPhone && <div className="mt-4 rounded-2xl bg-[#f5f8fb] p-4"><div className="flex items-start gap-3"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#eaf4ff] text-[#1769aa]"><Settings2 size={17} /></div><div><p className="text-sm font-medium text-[#334e68]">可执行建议</p><p className="mt-1 text-xs leading-5 text-[#627d98]">建议只生成受控修改草案，确认弹窗通过后才会调用 PMS，不会直接改库。</p></div></div><div className="mt-3 flex flex-wrap items-center gap-2"><input value={suggestionRoom} onChange={(event) => onSuggestionRoomChange(event.target.value.replace(/\D/g, "").slice(0, 4))} inputMode="numeric" placeholder="目标房号" className="w-28 rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-sm outline-none focus:border-[#007aff]" aria-label="建议目标房号" /><button type="button" disabled={!suggestionRoom.trim()} onClick={() => onPrepareSuggestion(`把尾号${firstPhone}换到${suggestionRoom}`)} className="rounded-xl bg-[#007aff] px-3 py-2 text-xs font-medium text-white disabled:opacity-40">生成换房草案</button><button type="button" onClick={() => onPrepareSuggestion(`把尾号${firstPhone}的总金额改成`)} className="rounded-xl border border-[#cbd9e5] bg-white px-3 py-2 text-xs text-[#334e68]">生成金额草案</button></div></div>}</div>}{result?.type === "room" && <div className="flex flex-wrap items-center justify-between gap-4 p-5"><div><p className="text-2xl font-semibold tracking-[-.03em] text-[#102a43]">房间 {result.roomNumber}</p><p className="mt-1 text-sm text-[#627d98]">当前状态：{ROOM_STATUS_LABELS[result.status] ?? "未知"}{result.status === "vacant-dirty" ? " · 打扫完成后才会重新参与售卖" : result.status === "occupied" ? " · 已隐藏完整客人信息" : ""}</p></div><div className="flex items-center gap-2"><span className={`rounded-full px-3 py-1.5 text-xs ${ROOM_STATUS_TONES[result.status] ?? "bg-[#f2f7fb] text-[#627d98]"}`}>{ROOM_STATUS_LABELS[result.status] ?? "未知"}</span>{result.status === "vacant-dirty" && <button type="button" onClick={() => onMarkRoomClean(result.roomNumber)} className="rounded-xl bg-[#34c759] px-4 py-2 text-sm font-medium text-white">打扫完成，改为可售</button>}</div></div>}</section>;
 }
 
 function AdminDataField({ label, value }: { label: string; value: string }) {
   return <div><dt className="text-[#829ab1]">{label}</dt><dd className="mt-1 font-medium text-[#334e68]">{value}</dd></div>;
 }
 
-function AdminCharts({ sourceData, statusData, roomData, caseData, auditData, result, status, suggestionRoom, onSuggestionRoomChange, onPrepareSuggestion }: { sourceData: AdminChartDatum[]; statusData: AdminChartDatum[]; roomData: AdminChartDatum[]; caseData: AdminChartDatum[]; auditData: AdminChartDatum[]; result: AdminResult; status: string; suggestionRoom: string; onSuggestionRoomChange: (value: string) => void; onPrepareSuggestion: (command: string) => void }) {
-  return <><AdminResultPanel result={result} status={status} suggestionRoom={suggestionRoom} onSuggestionRoomChange={onSuggestionRoomChange} onPrepareSuggestion={onPrepareSuggestion} /><section className="mt-7"><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">数据概览</p><h2 className="mt-1 text-xl font-semibold tracking-[-.02em]">让状态一眼看懂</h2></div><span className="rounded-full bg-[#f2f7fb] px-3 py-1.5 text-xs text-[#627d98]">数据来自当前演示会话</span></div><div className="mt-4 grid gap-4 lg:grid-cols-3"><ChartCard title="订单来源" subtitle="不同渠道的订单量"><ResponsiveContainer width="100%" height={220}><BarChart data={sourceData} margin={{ top: 8, right: 8, left: -20, bottom: 4 }}><CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="name" tick={{ fontSize: 11, fill: "#829ab1" }} axisLine={false} tickLine={false} /><YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#829ab1" }} axisLine={false} tickLine={false} /><Tooltip cursor={{ fill: "#f5f8fb" }} contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Bar dataKey="value" name="订单数" fill="#007aff" radius={[6, 6, 0, 0]} /></BarChart></ResponsiveContainer></ChartCard><ChartCard title="订单状态" subtitle="待入住、已入住与取消"><ResponsiveContainer width="100%" height={220}><BarChart data={statusData} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 4 }}><CartesianGrid horizontal={false} stroke="#edf2f7" /><XAxis type="number" allowDecimals={false} hide /><YAxis type="category" dataKey="name" width={72} tick={{ fontSize: 11, fill: "#627d98" }} axisLine={false} tickLine={false} /><Tooltip cursor={{ fill: "#f5f8fb" }} contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Bar dataKey="value" name="订单数" fill="#34c759" radius={[0, 6, 6, 0]} /></BarChart></ResponsiveContainer></ChartCard><ChartCard title="房态结构" subtitle="按订单与入住状态汇总"><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={roomData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={82} paddingAngle={3}>{roomData.map((item, index) => <Cell key={item.name} fill={["#34c759", "#ff9500", "#d2d2d7"][index % 3]} />)}</Pie><Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Legend iconType="circle" wrapperStyle={{ fontSize: 11, color: "#627d98" }} /></PieChart></ResponsiveContainer></ChartCard></div><div className="mt-4 grid gap-4 lg:grid-cols-2"><ChartCard title="办理任务状态" subtitle="状态机当前分布"><ResponsiveContainer width="100%" height={210}><BarChart data={caseData} margin={{ top: 8, right: 8, left: -20, bottom: 4 }}><CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="name" tick={{ fontSize: 10, fill: "#829ab1" }} axisLine={false} tickLine={false} /><YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#829ab1" }} axisLine={false} tickLine={false} /><Tooltip cursor={{ fill: "#f5f8fb" }} contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Bar dataKey="value" name="任务数" fill="#af52de" radius={[6, 6, 0, 0]} /></BarChart></ResponsiveContainer></ChartCard><ChartCard title="审计事件序列" subtitle="最近事件按发生顺序排列"><ResponsiveContainer width="100%" height={210}><LineChart data={auditData} margin={{ top: 12, right: 12, left: -20, bottom: 4 }}><CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="name" tick={{ fontSize: 10, fill: "#829ab1" }} axisLine={false} tickLine={false} /><YAxis allowDecimals={false} hide /><Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Line type="monotone" dataKey="value" name="事件" stroke="#ff9500" strokeWidth={3} dot={{ r: 3, fill: "#ff9500" }} /></LineChart></ResponsiveContainer></ChartCard></div></section></>;
+function AdminCharts({ sourceData, statusData, roomData, caseData, auditData, result, status, suggestionRoom, onSuggestionRoomChange, onPrepareSuggestion, onMarkRoomClean }: { sourceData: AdminChartDatum[]; statusData: AdminChartDatum[]; roomData: AdminChartDatum[]; caseData: AdminChartDatum[]; auditData: AdminChartDatum[]; result: AdminResult; status: string; suggestionRoom: string; onSuggestionRoomChange: (value: string) => void; onPrepareSuggestion: (command: string) => void; onMarkRoomClean: (roomNumber: string) => void }) {
+  return <><AdminResultPanel result={result} status={status} suggestionRoom={suggestionRoom} onSuggestionRoomChange={onSuggestionRoomChange} onPrepareSuggestion={onPrepareSuggestion} onMarkRoomClean={onMarkRoomClean} /><section className="mt-7"><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm text-[#627d98]">数据概览</p><h2 className="mt-1 text-xl font-semibold tracking-[-.02em]">让状态一眼看懂</h2></div><span className="rounded-full bg-[#f2f7fb] px-3 py-1.5 text-xs text-[#627d98]">数据来自当前演示会话</span></div><div className="mt-4 grid gap-4 lg:grid-cols-3"><ChartCard title="订单来源" subtitle="不同渠道的订单量"><ResponsiveContainer width="100%" height={220}><BarChart data={sourceData} margin={{ top: 8, right: 8, left: -20, bottom: 4 }}><CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="name" tick={{ fontSize: 11, fill: "#829ab1" }} axisLine={false} tickLine={false} /><YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#829ab1" }} axisLine={false} tickLine={false} /><Tooltip cursor={{ fill: "#f5f8fb" }} contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Bar dataKey="value" name="订单数" fill="#007aff" radius={[6, 6, 0, 0]} /></BarChart></ResponsiveContainer></ChartCard><ChartCard title="订单状态" subtitle="待入住、已入住与取消"><ResponsiveContainer width="100%" height={220}><BarChart data={statusData} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 4 }}><CartesianGrid horizontal={false} stroke="#edf2f7" /><XAxis type="number" allowDecimals={false} hide /><YAxis type="category" dataKey="name" width={72} tick={{ fontSize: 11, fill: "#627d98" }} axisLine={false} tickLine={false} /><Tooltip cursor={{ fill: "#f5f8fb" }} contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Bar dataKey="value" name="订单数" fill="#34c759" radius={[0, 6, 6, 0]} /></BarChart></ResponsiveContainer></ChartCard><ChartCard title="房态结构" subtitle="按订单与入住状态汇总"><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={roomData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={82} paddingAngle={3}>{roomData.map((item, index) => <Cell key={item.name} fill={["#34c759", "#ff9500", "#d2d2d7"][index % 3]} />)}</Pie><Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Legend iconType="circle" wrapperStyle={{ fontSize: 11, color: "#627d98" }} /></PieChart></ResponsiveContainer></ChartCard></div><div className="mt-4 grid gap-4 lg:grid-cols-2"><ChartCard title="办理任务状态" subtitle="状态机当前分布"><ResponsiveContainer width="100%" height={210}><BarChart data={caseData} margin={{ top: 8, right: 8, left: -20, bottom: 4 }}><CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="name" tick={{ fontSize: 10, fill: "#829ab1" }} axisLine={false} tickLine={false} /><YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#829ab1" }} axisLine={false} tickLine={false} /><Tooltip cursor={{ fill: "#f5f8fb" }} contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Bar dataKey="value" name="任务数" fill="#af52de" radius={[6, 6, 0, 0]} /></BarChart></ResponsiveContainer></ChartCard><ChartCard title="审计事件序列" subtitle="最近事件按发生顺序排列"><ResponsiveContainer width="100%" height={210}><LineChart data={auditData} margin={{ top: 12, right: 12, left: -20, bottom: 4 }}><CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="name" tick={{ fontSize: 10, fill: "#829ab1" }} axisLine={false} tickLine={false} /><YAxis allowDecimals={false} hide /><Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #d9e2ec", fontSize: 12 }} /><Line type="monotone" dataKey="value" name="事件" stroke="#ff9500" strokeWidth={3} dot={{ r: 3, fill: "#ff9500" }} /></LineChart></ResponsiveContainer></ChartCard></div></section></>;
 }
 
 function ChartCard({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {

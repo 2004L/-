@@ -37,7 +37,7 @@ export type { CheckoutQuote, CheckoutResult, EnsureFolioResult, FolioRecord, Fol
  * in lib/settlement-core.ts / lib/checkout-core.ts so the integration tests run
  * the exact same logic against a real SQLite engine.
  */
-function d1ListRunner(): ListRunner {
+export function d1ListRunner(): ListRunner {
   return {
     run: async (sql: string, params: SqlValue[]) => {
       const result = await getD1().prepare(sql).bind(...params).run();
