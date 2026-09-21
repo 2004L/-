@@ -130,7 +130,7 @@ export function routeIntent(text: string, context?: { case_id?: string; pending_
     if (!candidatePhone) return { type: "clarification", message: "好的，现场办理需要登记完整手机号。请说 11 位手机号，系统会先让您核对，再进入选房和支付。", intent: "walk_in", confidence: 0.98 };
     if (phoneNumber && /(确认|没错|正确|是的|可以)/.test(normalized)) return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "pms.create_walk_in_draft", arguments: { phone_number: candidatePhone }, implementation: "business_api", response_hint: "已确认完整手机号，将创建现场办理草稿，不会在支付前创建正式订单。" };
     if (context?.pending_walk_in_phone && /^(确认|确定|没错|正确|是的|可以)[。！!？?\s]*$/u.test(normalized)) return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "pms.create_walk_in_draft", arguments: { phone_number: candidatePhone }, implementation: "business_api", response_hint: "已确认完整手机号，将创建现场办理草稿，不会在支付前创建正式订单。" };
-    return { type: "clarification", message: `已收到手机号 ${candidatePhone.slice(0, 3)}****${candidatePhone.slice(-4)}。请确认手机号无误，确认后我会查询可用房型和现场支付金额。`, intent: "walk_in", confidence: 0.99, requires_confirmation: true };
+    return { type: "clarification", message: `我识别到的完整手机号是：${candidatePhone}。请核对语音转写是否正确；确认后我会查询可用房型和现场支付金额。`, intent: "walk_in", confidence: 0.99, requires_confirmation: true };
   }
   if (context?.walk_in_draft_id) {
     const draftStatus = context.walk_in_draft_status ?? "DRAFT";

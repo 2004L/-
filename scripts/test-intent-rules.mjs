@@ -29,7 +29,7 @@ const cases = [
   {
     id: "walk-in-follow-up-full-phone",
     result: routeIntent("一三八零零一三八零零零", { pending_walk_in: true }),
-    assert: (result) => result.type === "clarification" && result.intent === "walk_in" && result.message.includes("确认手机号"),
+    assert: (result) => result.type === "clarification" && result.intent === "walk_in" && result.requires_confirmation === true && result.message.includes("13800138000"),
   },
   {
     id: "policy-does-not-search-order",
