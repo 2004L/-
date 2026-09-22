@@ -136,6 +136,29 @@ async function legacyOrderRef(orderId: string) {
 }
 
 /**
+ * The simulator is deliberately session-friendly: formal room rows are shared
+ * by all browser sessions, while the simulator catalog is only a tiny fixture.
+ * Reusing that fixture across test runs eventually exhausts every VACANT_CLEAN
+ * room and correctly produces HANDOFF_REQUIRED, which is useful for production
+ * but makes a demo kiosk look permanently broken. Allocate a case-scoped room
+ * in a reserved demo range instead. It is still inserted and held by the same
+ * formal CAS workflow, so the later identity/police/check-in steps remain real.
+ */
+async function allocateSimulatorRoom(hotelId: string, caseId: string) {
+  const digits = caseId.replace(/\D/g, "");
+  let hash = 0;
+  for (const char of caseId) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  const seed = Number(digits.slice(-3) || hash % 1000);
+  const db = getD1();
+  for (let offset = 0; offset < 1000; offset += 1) {
+    const candidate = String(9000 + ((seed + offset) % 1000));
+    const exists = await db.prepare("SELECT 1 AS present FROM rooms WHERE hotel_id = ? AND room_number = ? LIMIT 1").bind(hotelId, candidate).first<{ present: number }>();
+    if (!exists) return candidate;
+  }
+  throw new Error("demo_room_pool_exhausted");
+}
+
+/**
  * Room-critical steps cannot degrade. Telling a guest the room is locked when the
  * formal tables never recorded it ends with a keycard to a room the hotel still
  * believes is empty, and the same guest cannot check out afterwards. These steps
@@ -839,16 +862,26 @@ export async function POST(request: Request, context: RouteContext) {
       const ref = await legacyOrderRef(current.order_id);
       if (ref) {
         const scope = await sessionScope(sessionId);
+        const simulator = (process.env.PMS_PROVIDER || "simulator").toLowerCase() === "simulator";
+        // A real PMS owns the room number. In the simulator, use a fresh
+        // case-scoped demo room so old test sessions cannot consume the tiny
+        // catalog and strand every later guest at HANDOFF_REQUIRED.
+        const roomForHold = simulator
+          ? await allocateSimulatorRoom(scope.hotelId, current.id)
+          : requestedRoom;
         // The catalog is what makes "pick a sellable room" possible. It never
         // overwrites an existing room status, and a failure just means no new
         // rooms to choose from.
         await syncPmsRoomCatalog({ tenantId: scope.tenantId, hotelId: scope.hotelId, hotelCode: scope.hotelCode }).catch(() => undefined);
-        const held = await requireFormal(sessionId, current.id, "hold-room", () => holdFormalRoom({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, roomNumber: requestedRoom, roomTypeName: ref.roomTypeName, requestId: `${sessionId}:${current.id}:hold` }));
+        const held = await requireFormal(sessionId, current.id, "hold-room", () => holdFormalRoom({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, roomNumber: roomForHold, roomTypeName: ref.roomTypeName, requestId: `${sessionId}:${current.id}:hold` }));
         if (!held.ok) {
           const handed = await requireHandoff(sessionId, current.id, `锁定房间失败：${held.reason}，已转人工接手`);
           return json({ checkinCase: handed, handoff: handoffReply(held.reason) });
         }
-        const updated = await transition({ sessionId, caseId: current.id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail: `已锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`, fields: { roomNumber: held.value.roomNumber } });
+        const detail = simulator
+          ? `模拟 PMS 已分配并锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`
+          : `已锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`;
+        const updated = await transition({ sessionId, caseId: current.id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail, fields: { roomNumber: held.value.roomNumber } });
         await projectFormal(sessionId, scope, ref.orderCode, { roomNumber: held.value.roomNumber });
         return json({ checkinCase: updated });
       }
