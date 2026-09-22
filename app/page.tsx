@@ -1021,6 +1021,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
   const [voiceFinalizing, setVoiceFinalizing] = useState(false);
+  const [continuousConversation, setContinuousConversation] = useState(true);
   const [computerUseEnabled, setComputerUseEnabled] = useState(true);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionRef = useRef<RecognitionLike | null>(null);
@@ -1030,6 +1031,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const silenceTimerRef = useRef<number | null>(null);
   const localAsrResultRef = useRef(false);
   const voiceSubmitRequestedRef = useRef(false);
+  const voiceAutoSubmitRef = useRef(false);
+  const continuousResumeRef = useRef(false);
   const asrChunkTailRef = useRef(Promise.resolve());
   const asrAudioBytesRef = useRef(0);
   const asrAudioChunksRef = useRef(0);
@@ -1200,28 +1203,38 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
   function stopListening() {
     voiceSubmitRequestedRef.current = false;
+    voiceAutoSubmitRef.current = false;
+    continuousResumeRef.current = false;
     setVoiceFinalizing(false);
     releaseVoiceResources(true);
   }
 
-  function finishBrowserSubmission() {
+  function finishBrowserSubmission(autoSubmit = voiceAutoSubmitRef.current) {
     const finalText = [browserFinalTranscriptRef.current, browserInterimTranscriptRef.current].filter(Boolean).join(" ").trim();
     if (finalText) {
       setUtterance(finalText);
-      setMessage("语音已识别，请检查文字后点击发送");
+      if (autoSubmit) {
+        continuousResumeRef.current = continuousConversation;
+        setMessage("已听清，正在交给 AI 处理");
+      } else {
+        setMessage("语音已识别，请检查文字后点击发送");
+      }
     } else setMessage("没有听清内容，请再说一次，或直接输入文字");
     voiceSubmitRequestedRef.current = false;
+    voiceAutoSubmitRef.current = false;
     setVoiceFinalizing(false);
     releaseVoiceResources(true);
+    if (autoSubmit && finalText) void submitUtterance(finalText);
   }
 
-  function finishListeningAndSubmit() {
+  function finishListeningAndSubmit(autoSubmit = false) {
     if (!listening) {
       if (utterance.trim()) void submitUtterance();
       return;
     }
     if (voiceFinalizing) return;
-    voiceSubmitRequestedRef.current = false;
+    voiceSubmitRequestedRef.current = autoSubmit;
+    voiceAutoSubmitRef.current = autoSubmit;
     setVoiceFinalizing(true);
     setMessage("正在整理语音内容，请稍候；识别后可先修改文字");
     if (voiceBackend === "browser") {
@@ -1254,6 +1267,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     } else {
       releaseVoiceResources(true);
       setVoiceFinalizing(false);
+      voiceSubmitRequestedRef.current = false;
+      voiceAutoSubmitRef.current = false;
       setMessage("本地语音服务没有返回结果，请重试或直接输入文字");
       return;
     }
@@ -1262,6 +1277,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     voiceFinalizationTimerRef.current = window.setTimeout(() => {
       const hadText = utterance.trim();
       releaseVoiceResources(true);
+      voiceSubmitRequestedRef.current = false;
+      voiceAutoSubmitRef.current = false;
+      continuousResumeRef.current = false;
       setVoiceFinalizing(false);
       setMessage(hadText ? "语音已整理完成，确认无误后点击发送" : "本地语音识别超时，请重新录音或直接输入文字");
     }, 25000);
@@ -1391,6 +1409,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         }
         if (isFillerTranscript(transcript)) {
           voiceSubmitRequestedRef.current = false;
+          voiceAutoSubmitRef.current = false;
+          continuousResumeRef.current = false;
           setUtterance("");
           setAudioCaptureStatus(audioSignalSeenRef.current ? "ok" : "silent");
           setVoiceFinalizing(false);
@@ -1402,6 +1422,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         setVoiceFinalizing(false);
         if (voiceSubmitRequestedRef.current) {
           voiceSubmitRequestedRef.current = false;
+          voiceAutoSubmitRef.current = false;
+          continuousResumeRef.current = continuousConversation;
           void submitUtterance(transcript);
         } else {
           setMessage("语音已整理完成，确认无误后点击发送");
@@ -1494,6 +1516,24 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       startBrowserRecognition();
     }
   }
+
+  useEffect(() => {
+    if (!continuousConversation || !continuousResumeRef.current || phase !== "idle" || listening || voiceFinalizing) return undefined;
+    let timer: number | null = null;
+    const resume = () => {
+      if (!continuousConversation || !continuousResumeRef.current || phase !== "idle" || listening || voiceFinalizing) return;
+      if (window.speechSynthesis?.speaking) {
+        timer = window.setTimeout(resume, 350);
+        return;
+      }
+      continuousResumeRef.current = false;
+      void startListening();
+    };
+    timer = window.setTimeout(resume, 650);
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [continuousConversation, listening, phase, voiceFinalizing]);
 
   async function submitUtterance(value = utterance) {
     const normalized = value.trim();
@@ -1903,12 +1943,12 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         if (deviceId) handleAudioDeviceChange(deviceId);
         if (!listening) void startListening();
       },
-      stopVoice: () => finishListeningAndSubmit(),
+      stopVoice: () => finishListeningAndSubmit(continuousConversation),
       confirm: () => commitCurrentAction("digital_human"),
       back: () => goBackOrRegret(),
       handoffAdmin: () => onOpenAdmin(),
     });
-  }, [commitCurrentAction, computerUseEnabled, finishListeningAndSubmit, goBackOrRegret, handleAudioDeviceChange, listening, onOpenAdmin, startListening, submitUtterance]);
+  }, [commitCurrentAction, computerUseEnabled, continuousConversation, finishListeningAndSubmit, goBackOrRegret, handleAudioDeviceChange, listening, onOpenAdmin, startListening, submitUtterance]);
 
   const handleDigitalHumanInput = useCallback((event: DigitalHumanInputEvent) => {
     if (digitalEventIdsRef.current.has(event.eventId)) return;
@@ -1922,7 +1962,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         if (!listening) void startListening();
         break;
       case "voice_stop":
-        finishListeningAndSubmit();
+        finishListeningAndSubmit(continuousConversation);
         break;
       case "text_submit":
       case "quick_intent":
@@ -1940,7 +1980,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         handleComputerUseAction(event.action);
         break;
     }
-  }, [commitCurrentAction, finishListeningAndSubmit, goBackOrRegret, handleComputerUseAction, listening, startListening, submitUtterance]);
+  }, [commitCurrentAction, continuousConversation, finishListeningAndSubmit, goBackOrRegret, handleComputerUseAction, listening, startListening, submitUtterance]);
 
   const showEntry = (phase === "idle" || phase === "searching") && terminalMode === "checkin";
   const digitalHumanInput = useMemo(() => ({
@@ -1949,6 +1989,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     activeMessage,
     listening,
     voiceFinalizing,
+    continuousConversation,
     audioLevel,
     flowStep,
     flowError: flowError?.code ?? null,
@@ -1957,11 +1998,11 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     canBack: terminalMode !== "choose" && phase !== "searching",
     computerUseEnabled,
     computerUseStatus,
-  }), [activeMessage, audioLevel, computerUseEnabled, computerUseStatus, flowError?.code, flowStep, listening, message, phase, terminalMode, voiceEnabled, voiceFinalizing]);
+  }), [activeMessage, audioLevel, computerUseEnabled, computerUseStatus, continuousConversation, flowError?.code, flowStep, listening, message, phase, terminalMode, voiceEnabled, voiceFinalizing]);
 
   return <main className="min-h-screen bg-[#f5f5f7] px-5 py-6 text-[#1d1d1f] md:px-10">
     <header className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><nav aria-label="终端业务" className="hidden rounded-full bg-white p-1 shadow-sm sm:flex"><button type="button" onClick={() => setTerminalMode("checkin")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkin" ? "bg-[#eaf4ff] text-[#1769aa]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>办理入住</button><button type="button" onClick={() => setTerminalMode("checkout")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkout" ? "bg-[#effaf4] text-[#248a4d]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>退房 / 换房</button></nav><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>
-    <DigitalHuman input={digitalHumanInput} onInput={handleDigitalHumanInput} audioInputs={audioInputs} selectedAudioDeviceId={selectedAudioDeviceId} onAudioDeviceChange={handleAudioDeviceChange} onToggleComputerUse={() => setComputerUseEnabled((value) => !value)} />
+    <DigitalHuman input={digitalHumanInput} onInput={handleDigitalHumanInput} audioInputs={audioInputs} selectedAudioDeviceId={selectedAudioDeviceId} onAudioDeviceChange={handleAudioDeviceChange} onToggleComputerUse={() => setComputerUseEnabled((value) => !value)} onToggleContinuousConversation={() => { setContinuousConversation((value) => { const next = !value; if (!next) continuousResumeRef.current = false; return next; }); }} />
     <section className="mx-auto flex min-h-[calc(100vh-7rem)] max-w-5xl flex-col items-center justify-center py-12 text-center lg:pl-[min(30rem,34vw)]">
       {terminalMode === "choose" ? (<>
         <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />AI Native 自助终端 · 请先选择业务</div>
