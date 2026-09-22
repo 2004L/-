@@ -64,4 +64,13 @@ assert.ok(calls.every((call) => call.init.headers['X-Hotel-ID'] === 'hotel-test'
 assert.ok(calls.every((call) => call.init.headers.Authorization === 'Bearer test-token'));
 assert.ok(calls.some((call) => call.url.endsWith('/api/police/status/police%3Acase-001')));
 
+let transientAttempts = 0;
+const retryingClient = createHotelApiClient(config, async () => {
+  transientAttempts += 1;
+  if (transientAttempts < 3) return new Response(JSON.stringify({ error: 'temporarily_unavailable' }), { status: 503 });
+  return new Response(JSON.stringify({ ok: true, recovered: true }), { status: 200 });
+});
+assert.deepEqual(await retryingClient.read('/api/pms/ping'), { ok: true, recovered: true });
+assert.equal(transientAttempts, 3);
+
 console.log('MCP read-only gateway checks passed: scoped config, safe GET-only handlers and command-id validation.');
