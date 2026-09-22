@@ -1789,9 +1789,24 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       setWalkInRoomTypes(quote.room_types ?? walkInRoomTypes);
       setPhase("idle");
       setMessage(`报价已生成，合计 ¥${quote.draft.total_amount}。请核对金额后选择支付方式。`);
-    } catch {
-      setPhase("error");
-      setMessage("房型报价暂时失败，请重新选择或联系工作人员。");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "";
+      if (reason === "draft_not_found" || reason.includes("invalid_draft_status")) {
+        setWalkInDraft(null);
+        setWalkInRoomTypes([]);
+        setWalkInPayment(null);
+        setPhase("idle");
+        setMessage("现场办理草稿已失效或已取消，请重新说一次手机号；不会重复创建订单。");
+      } else if (reason === "room_not_available") {
+        setPhase("idle");
+        setMessage("所选房型或房间数当前没有可售余量，请换一个房型或减少房间数。");
+      } else if (reason === "invalid_room_type") {
+        setPhase("idle");
+        setMessage("房型信息已变化，请重新选择当前页面显示的房型。");
+      } else {
+        setPhase("error");
+        setMessage("房型报价接口暂时不可用，请稍后重试；未创建正式订单。");
+      }
     }
   }
 
