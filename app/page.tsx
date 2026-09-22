@@ -1020,6 +1020,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [audioInputs, setAudioInputs] = useState<AudioInputDevice[]>([]);
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
+  const [voiceFinalizing, setVoiceFinalizing] = useState(false);
   const [computerUseEnabled, setComputerUseEnabled] = useState(true);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionRef = useRef<RecognitionLike | null>(null);
@@ -1035,6 +1036,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioMonitorFrameRef = useRef<number | null>(null);
   const audioSignalSeenRef = useRef(false);
+  const voiceFinalizationTimerRef = useRef<number | null>(null);
   const browserFinalTranscriptRef = useRef("");
   const browserInterimTranscriptRef = useRef("");
   const submitInFlightRef = useRef<string | null>(null);
@@ -1130,6 +1132,8 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   function clearVoiceTimer() {
     if (silenceTimerRef.current !== null) window.clearTimeout(silenceTimerRef.current);
     silenceTimerRef.current = null;
+    if (voiceFinalizationTimerRef.current !== null) window.clearTimeout(voiceFinalizationTimerRef.current);
+    voiceFinalizationTimerRef.current = null;
   }
 
   function stopAudioMonitor() {
@@ -1196,6 +1200,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
   function stopListening() {
     voiceSubmitRequestedRef.current = false;
+    setVoiceFinalizing(false);
     releaseVoiceResources(true);
   }
 
@@ -1206,6 +1211,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       setMessage("语音已识别，请检查文字后点击发送");
     } else setMessage("没有听清内容，请再说一次，或直接输入文字");
     voiceSubmitRequestedRef.current = false;
+    setVoiceFinalizing(false);
     releaseVoiceResources(true);
   }
 
@@ -1214,7 +1220,9 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       if (utterance.trim()) void submitUtterance();
       return;
     }
+    if (voiceFinalizing) return;
     voiceSubmitRequestedRef.current = false;
+    setVoiceFinalizing(true);
     setMessage("正在整理语音内容，请稍候；识别后可先修改文字");
     if (voiceBackend === "browser") {
       const recognition = recognitionRef.current;
@@ -1245,11 +1253,18 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       });
     } else {
       releaseVoiceResources(true);
+      setVoiceFinalizing(false);
       setMessage("本地语音服务没有返回结果，请重试或直接输入文字");
+      return;
     }
-    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-    mediaStreamRef.current = null;
-    setListening(false);
+    // Keep the recorder and stream alive until the final dataavailable chunk
+    // has been sent and ASR replies. Stopping tracks here can truncate audio.
+    voiceFinalizationTimerRef.current = window.setTimeout(() => {
+      const hadText = utterance.trim();
+      releaseVoiceResources(true);
+      setVoiceFinalizing(false);
+      setMessage(hadText ? "语音已整理完成，确认无误后点击发送" : "本地语音识别超时，请重新录音或直接输入文字");
+    }, 25000);
   }
 
   function startBrowserRecognition() {
@@ -1320,7 +1335,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     startAudioMonitor(stream);
     const socket = new WebSocket(resolveAsrWebSocketUrl(adapter.asrWsUrl));
     const opened = new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(() => reject(new Error("local_asr_timeout")), 1400);
+      const timer = window.setTimeout(() => reject(new Error("local_asr_timeout")), 3000);
       socket.onopen = () => { window.clearTimeout(timer); resolve(); };
       socket.onerror = () => { window.clearTimeout(timer); reject(new Error("local_asr_socket_error")); };
     });
@@ -1378,11 +1393,13 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
           voiceSubmitRequestedRef.current = false;
           setUtterance("");
           setAudioCaptureStatus(audioSignalSeenRef.current ? "ok" : "silent");
+          setVoiceFinalizing(false);
           releaseVoiceResources(true);
           setMessage(audioSignalSeenRef.current ? "只识别到很短的回应，请完整说出要办理的事情或直接输入文字" : "没有检测到有效麦克风声音，请检查输入设备后再试");
           return;
         }
         releaseVoiceResources(true);
+        setVoiceFinalizing(false);
         if (voiceSubmitRequestedRef.current) {
           voiceSubmitRequestedRef.current = false;
           void submitUtterance(transcript);
@@ -1391,6 +1408,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         }
       } else if (payload.type === "error") {
         setMessage(payload.message || "本地语音识别失败，请再说一次");
+        setVoiceFinalizing(false);
         stopListening();
       }
     };
@@ -1930,6 +1948,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     message,
     activeMessage,
     listening,
+    voiceFinalizing,
     audioLevel,
     flowStep,
     flowError: flowError?.code ?? null,
@@ -1938,7 +1957,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     canBack: terminalMode !== "choose" && phase !== "searching",
     computerUseEnabled,
     computerUseStatus,
-  }), [activeMessage, audioLevel, computerUseEnabled, computerUseStatus, flowError?.code, flowStep, listening, message, phase, terminalMode, voiceEnabled]);
+  }), [activeMessage, audioLevel, computerUseEnabled, computerUseStatus, flowError?.code, flowStep, listening, message, phase, terminalMode, voiceEnabled, voiceFinalizing]);
 
   return <main className="min-h-screen bg-[#f5f5f7] px-5 py-6 text-[#1d1d1f] md:px-10">
     <header className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><nav aria-label="终端业务" className="hidden rounded-full bg-white p-1 shadow-sm sm:flex"><button type="button" onClick={() => setTerminalMode("checkin")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkin" ? "bg-[#eaf4ff] text-[#1769aa]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>办理入住</button><button type="button" onClick={() => setTerminalMode("checkout")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkout" ? "bg-[#effaf4] text-[#248a4d]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>退房 / 换房</button></nav><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>

@@ -40,6 +40,7 @@ export type DigitalHumanInput = {
   message: string;
   activeMessage: string;
   listening: boolean;
+  voiceFinalizing: boolean;
   audioLevel: number;
   flowStep: number;
   flowError: string | null;
