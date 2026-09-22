@@ -863,7 +863,12 @@ export default function Home() {
       setPairingComplete(false);
     }} />;
   }
-  return <VoiceTerminal sessionId={sessionId} adapter={adapter} snapshot={snapshot} onRefresh={refresh} onOpenAdmin={() => setView("admin")} />;
+  return <VoiceTerminal sessionId={sessionId} adapter={adapter} snapshot={snapshot} onRefresh={refresh} onOpenAdmin={() => setView("admin")} onNewSession={() => {
+    const nextSession = createSessionId();
+    localStorage.setItem("hotel_demo_session", nextSession);
+    setSessionId(nextSession);
+    setSnapshot(EMPTY_SNAPSHOT);
+  }} />;
 }
 
 function LoadingScreen() {
@@ -1019,7 +1024,7 @@ const SAMPLE_UTTERANCES = ["我在平台订了房，帮我查一下订单", "我
 
 type TerminalPhase = "idle" | "searching" | "matched" | "processing" | "ambiguous" | "not_found" | "blocked" | "complete" | "error";
 
-function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }: { sessionId: string; adapter: AdapterConfig; snapshot: Snapshot; onRefresh: () => Promise<void>; onOpenAdmin: () => void }) {
+function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin, onNewSession }: { sessionId: string; adapter: AdapterConfig; snapshot: Snapshot; onRefresh: () => Promise<void>; onOpenAdmin: () => void; onNewSession: () => void }) {
   const [conversationId, setConversationId] = useState(() => `conv_${crypto.randomUUID().replaceAll("-", "")}`);
   const [last4, setLast4] = useState("");
   const [utterance, setUtterance] = useState("");
@@ -1126,6 +1131,10 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
 
   function reset() {
     stopListening();
+    // A terminal/manual-handoff state belongs to the old browser session. A
+    // new guest must not inherit its check-in case, external commands, or
+    // simulator faults, so rotate the demo session before starting over.
+    onNewSession();
     startNewConversation("办理下一位");
     setLast4("");
     setUtterance("");
