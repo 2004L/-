@@ -96,6 +96,9 @@ type CheckinCase = {
   updated_at: string;
 };
 
+type JourneyState = "waiting" | "active" | "done";
+type JourneyStep = { label: string; detail: string; state: JourneyState };
+
 type BrowserJob = {
   id: string;
   case_id: string;
@@ -760,6 +763,29 @@ function resolveAsrWebSocketUrl(value: string) {
 
 function isFillerTranscript(value: string) {
   return /^(嗯+|啊+|呃+|额+|唉+|哦+)[。！!？?，,、\s]*$/u.test(value.trim());
+}
+
+function maskJourneyPhone(value: string) {
+  const digits = value.replace(/\D/g, "");
+  if (digits.length >= 7) return `${digits.slice(0, 3)}****${digits.slice(-4)}`;
+  return digits ? `尾号 ${digits.slice(-4)}` : "尚未提供";
+}
+
+function GuestJourneyPanel({ steps }: { steps: JourneyStep[] }) {
+  const firstActive = steps.findIndex((step) => step.state === "active");
+  const activeIndex = firstActive >= 0 ? firstActive : steps.length - 1;
+  return <section aria-label="当前办理进度" className="mt-6 w-full max-w-3xl rounded-[1.7rem] border border-[#d8e9f8] bg-white/90 p-4 text-left shadow-sm backdrop-blur-md">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div><p className="text-xs font-semibold uppercase tracking-[.15em] text-[#1769aa]">当前办理进度</p><p className="mt-1 text-sm text-[#4f6478]">手机号、身份证和确认状态会实时同步显示</p></div>
+      <span className="rounded-full bg-[#eef6ff] px-3 py-1.5 text-xs font-medium text-[#1769aa]">第 {Math.min(activeIndex + 1, steps.length)} 步</span>
+    </div>
+    <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      {steps.map((step, index) => <div key={step.label} className={`rounded-2xl border p-3 ${step.state === "done" ? "border-[#bde7cf] bg-[#effaf4]" : step.state === "active" ? "border-[#b9d8f4] bg-[#eef6ff]" : "border-[#e5e5ea] bg-[#fafafa]"}`}>
+        <div className="flex items-center gap-2"><span className={`grid h-7 w-7 shrink-0 place-items-center rounded-full text-xs font-semibold ${step.state === "done" ? "bg-[#34c759] text-white" : step.state === "active" ? "bg-[#007aff] text-white" : "bg-[#e5e5ea] text-[#86868b]"}`}>{step.state === "done" ? <Check size={14} /> : index + 1}</span><p className="text-sm font-semibold">{step.label}</p></div>
+        <p className={`mt-2 text-xs leading-5 ${step.state === "active" ? "text-[#1769aa]" : "text-[#6e6e73]"}`}>{step.detail}</p>
+      </div>)}
+    </div>
+  </section>;
 }
 
 export default function Home() {
@@ -2011,6 +2037,41 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     computerUseStatus,
   }), [activeMessage, audioLevel, computerUseEnabled, computerUseStatus, continuousConversation, flowError?.code, flowStep, listening, message, phase, terminalMode, voiceEnabled, voiceFinalizing]);
 
+  const journeySteps = useMemo<JourneyStep[]>(() => {
+    const caseStatus = checkinCase?.status ?? "";
+    const phoneReady = Boolean(walkInDraft || matchedOrder || last4);
+    const phoneWaitingConfirmation = Boolean(pendingWalkInPhone);
+    const identityDone = phase === "complete" || ["IDENTITY_VERIFIED", "ROOM_HELD", "POLICE_RUNNING", "POLICE_COMPLETED", "PMS_CHECKIN_CONFIRMED", "KEYCARD_WRITING", "KEYCARD_DISPENSED", "CHECKIN_COMPLETE"].includes(caseStatus);
+    const orderOrRoomDone = Boolean(matchedOrder) || walkInDraft?.status === "ORDER_CREATED";
+    const confirmationDone = phase === "complete";
+    const confirmationActive = !confirmationDone && (phase === "matched" || (Boolean(walkInDraft?.total_amount) && walkInPayment?.status === "PENDING"));
+    const phoneValue = pendingWalkInPhone ?? walkInDraft?.phone_masked ?? matchedOrder?.phone_masked ?? (last4 ? `尾号 ${last4}` : "");
+    return [
+      {
+        label: "手机号",
+        state: phoneWaitingConfirmation ? "active" : phoneReady ? "done" : "active",
+        detail: phoneWaitingConfirmation ? `已识别 ${maskJourneyPhone(pendingWalkInPhone)} · 等待确认` : phoneReady ? `已确认 ${phoneValue}` : "请说完整手机号或预订手机号后四位",
+      },
+      {
+        label: walkInDraft ? "房型与支付" : "订单匹配",
+        state: orderOrRoomDone ? "done" : phoneReady ? "active" : "waiting",
+        detail: walkInDraft
+          ? walkInDraft.status === "AWAITING_PAYMENT" ? "等待支付完成" : walkInDraft.status === "QUOTED" ? "报价已生成，等待确认" : "请选择房型和入住信息"
+          : orderOrRoomDone ? "订单已匹配" : phoneReady ? "正在核对订单" : "手机号确认后开始",
+      },
+      {
+        label: "身份证",
+        state: identityDone ? "done" : checkinCase ? "active" : "waiting",
+        detail: identityDone ? "身份已核验" : checkinCase ? (phase === "processing" ? "正在读取并核验" : "请放置身份证" ) : "订单确认后进行",
+      },
+      {
+        label: "确认提交",
+        state: confirmationDone ? "done" : confirmationActive ? "active" : "waiting",
+        detail: confirmationDone ? "入住已完成" : confirmationActive ? "请核对信息后点击确认" : "高风险动作仍需您确认",
+      },
+    ];
+  }, [checkinCase, last4, matchedOrder, pendingWalkInPhone, phase, walkInDraft, walkInPayment?.status]);
+
   return <main className="min-h-screen bg-[#f5f5f7] px-5 py-6 text-[#1d1d1f] md:px-10">
     <header className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><nav aria-label="终端业务" className="hidden rounded-full bg-white p-1 shadow-sm sm:flex"><button type="button" onClick={() => setTerminalMode("checkin")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkin" ? "bg-[#eaf4ff] text-[#1769aa]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>办理入住</button><button type="button" onClick={() => setTerminalMode("checkout")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkout" ? "bg-[#effaf4] text-[#248a4d]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>退房 / 换房</button></nav><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>
     <DigitalHuman input={digitalHumanInput} onInput={handleDigitalHumanInput} audioInputs={audioInputs} selectedAudioDeviceId={selectedAudioDeviceId} onAudioDeviceChange={handleAudioDeviceChange} onToggleComputerUse={() => setComputerUseEnabled((value) => !value)} onToggleContinuousConversation={() => { setContinuousConversation((value) => { const next = !value; if (!next) continuousResumeRef.current = false; return next; }); }} />
@@ -2034,6 +2095,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">{activeMessage}</h1>
       <p className="mt-4 text-base text-[#86868b]">系统理解您的意图，再由受控业务接口完成动作。</p>
       {showEntry && <button onClick={() => setTerminalMode("choose")} className="mt-5 inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm transition hover:bg-[#f2f2f7]"><ArrowLeft size={13} />返回选择办理 / 退房</button>}
+      {terminalMode === "checkin" && <GuestJourneyPanel steps={journeySteps} />}
 
       {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input ref={utteranceInputRef} value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在平台订了房，帮我查一下订单" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><span className="hidden shrink-0 items-center gap-1 rounded-full bg-[#eef6ff] px-2.5 py-2 text-[11px] text-[#1769aa] sm:flex"><Mic size={13} />数字人语音</span><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button><button type="button" onClick={() => goBackOrRegret()} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#f2f2f7] px-3 py-2.5 text-sm font-medium text-[#6e6e73] disabled:opacity-40">上一步</button><button type="button" onClick={() => commitCurrentAction("physical")} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#34c759] px-4 py-2.5 text-sm font-medium text-white shadow-sm disabled:opacity-40">确认</button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 由数字人控制，识别后可直接发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 由数字人控制" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 数字人控制语音输入 · 说完后点击发送"}</p>{audioCaptureStatus !== "unknown" && <div className="mt-2 flex items-center justify-center gap-2 text-xs text-[#86868b]"><span>麦克风：{audioCaptureStatus === "checking" ? "等待声音" : audioCaptureStatus === "ok" ? `已采到声音${audioDeviceLabel ? ` · ${audioDeviceLabel}` : ""}` : audioCaptureStatus === "silent" ? "未检测到有效声音" : "检测失败"}</span>{listening && <span className="h-1.5 w-16 overflow-hidden rounded-full bg-[#e5e5ea]"><span className={`block h-full rounded-full ${audioCaptureStatus === "ok" ? "bg-[#34c759]" : "bg-[#ff9500]"}`} style={{ width: `${Math.max(4, Math.round(audioLevel * 100))}%` }} /></span>}</div>}{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据仅用于本地验收，支持任意四位尾号输入</p></div>}
 
