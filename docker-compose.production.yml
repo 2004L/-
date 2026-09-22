@@ -1,0 +1,54 @@
+services:
+  hotel-agent-os:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    image: hotel-agent-os:production-candidate
+    env_file:
+      - .env.production
+    environment:
+      PORT: "8787"
+      HOSTNAME: "0.0.0.0"
+    command:
+      - node
+      - --import
+      - ./scripts/sites-env.mjs
+      - ./node_modules/wrangler/bin/wrangler.js
+      - dev
+      - --config
+      - dist/server/wrangler.json
+      - --env-file
+      - /app/.env.production
+      - --local
+      - --persist-to
+      - /data/wrangler
+      - --ip
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --inspector-port
+      - "0"
+    ports:
+      # Keep the app private to the server; put Caddy/Nginx in front later.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./runtime/wrangler:/data/wrangler
+      - ./runtime/logs:/app/runtime/logs
+      - ./.env.production:/app/.env.production:ro
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://127.0.0.1:8787/api/pms/ping')
+          .then(r => process.exit(r.ok ? 0 : 1))
+          .catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  default:
+    name: hotel-agent-os-private

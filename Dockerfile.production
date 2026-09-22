@@ -1,0 +1,30 @@
+# Hotel Agent OS - production candidate runtime
+#
+# The application currently uses the Wrangler/Vinext runtime and local D1
+# bindings. This image keeps that runtime, but moves its persistent state to
+# /data/wrangler so Docker volumes can live on D:. Do not treat this as a
+# Cloudflare production deployment until the D1 persistence decision is made.
+
+FROM node:22-bookworm-slim AS dependencies
+WORKDIR /app
+RUN corepack enable && corepack prepare pnpm@10.15.0 --activate
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+RUN pnpm install --frozen-lockfile
+
+FROM dependencies AS build
+COPY . .
+RUN pnpm build
+
+FROM node:22-bookworm-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+RUN corepack enable && corepack prepare pnpm@10.15.0 --activate
+COPY --from=dependencies /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/scripts ./scripts
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/.npmrc ./.npmrc
+RUN mkdir -p /data/wrangler /app/runtime/logs
+EXPOSE 8787
+
+CMD ["node", "--import", "./scripts/sites-env.mjs", "./node_modules/wrangler/bin/wrangler.js", "dev", "--config", "dist/server/wrangler.json", "--local", "--persist-to", "/data/wrangler", "--ip", "0.0.0.0", "--port", "8787", "--inspector-port", "0"]

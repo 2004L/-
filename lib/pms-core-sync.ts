@@ -1,6 +1,6 @@
 import { getD1 } from "@/db";
 import { canonicalRoomType, formalRoomId, formalRoomTypeId } from "@/lib/hotel-core";
-import { simulatorPms } from "@/services/pms/simulator-adapter";
+import { getPmsAdapter } from "@/services/pms/factory";
 
 /**
  * Syncs the PMS room catalog into the formal rooms projection.
@@ -11,7 +11,7 @@ import { simulatorPms } from "@/services/pms/simulator-adapter";
  * occupancy changes must go through the compare-and-swap room workflow.
  */
 export async function syncPmsRoomCatalog(input: { tenantId: string; hotelId: string; hotelCode: string }) {
-  const rooms = await simulatorPms.getRooms({}, {
+  const rooms = await getPmsAdapter().getRooms({}, {
     hotelId: input.hotelId,
     hotelCode: input.hotelCode,
     requestId: `pms-room-sync-${crypto.randomUUID()}`,

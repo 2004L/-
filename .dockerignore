@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+.next
+.vinext
+.wrangler
+dist
+runtime
+work
+outputs
+_ppt_inspect
+*.tar.gz
+.env*
+!.env.production.example
+gitleaks-report.*
+NUL

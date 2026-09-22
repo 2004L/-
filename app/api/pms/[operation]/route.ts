@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getD1 } from "@/db";
 import { ensureAdminSchema, getAdminFromRequest } from "@/lib/admin-auth";
 import { ROOM_STATUS } from "@/lib/hotel-core";
+import { getPmsAdapter } from "@/services/pms/factory";
 
 export const runtime = "edge";
 
@@ -14,12 +15,20 @@ const TEMPORARY_API_KEY = "TEMP_PMS_API_KEY_REPLACE_ME";
 function config() {
   const apiKey = process.env.PMS_API_KEY ?? TEMPORARY_API_KEY;
   return {
-    provider: process.env.PMS_PROVIDER ?? "qloapps",
+    provider: process.env.PMS_PROVIDER ?? "simulator",
     version: process.env.PMS_VERSION ?? "1.6.1",
     baseUrl: process.env.PMS_BASE_URL ?? "https://pms.example.local/api",
     apiKey,
     temporaryKey: apiKey === TEMPORARY_API_KEY,
   };
+}
+
+async function readExternalOrders(input: { phoneLast4?: string; reservationNo?: string }, hotelId: string, hotelCode: string, requestId: string) {
+  return getPmsAdapter().searchOrders(input, { hotelId, hotelCode, requestId });
+}
+
+async function readExternalRooms(input: { roomTypeCode?: string; status?: number }, hotelId: string, hotelCode: string, requestId: string) {
+  return getPmsAdapter().getRooms(input as never, { hotelId, hotelCode, requestId });
 }
 
 async function readOrders(hotelId: string, phoneLast4?: string, reservationNo?: string) {
@@ -82,10 +91,28 @@ async function handle(request: NextRequest, params: Promise<{ operation: string 
   if (operation === "orders") {
     const phoneLast4 = String(input.phone_last4 ?? url.searchParams.get("phone_last4") ?? "").replace(/\D/g, "").slice(-4) || undefined;
     const reservationNo = String(input.reservation_no ?? url.searchParams.get("reservation_no") ?? "") || undefined;
-    return NextResponse.json({ ...base, source: "formal-reservations", property: { code: auth.user.hotel_code }, orders: await readOrders(auth.user.hotel_id, phoneLast4, reservationNo) });
+    let orders;
+    try {
+      orders = c.provider === "kamra"
+        ? await readExternalOrders({ phoneLast4, reservationNo }, auth.user.hotel_id, auth.user.hotel_code, requestId)
+        : await readOrders(auth.user.hotel_id, phoneLast4, reservationNo);
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "kamra_unavailable";
+      return NextResponse.json({ ...base, ok: false, error: code.startsWith("kamra_") ? code : "pms_read_failed", message: "PMS 查询失败，未修改本地数据，请检查 PMS 服务和配置。" }, { status: 502 });
+    }
+    return NextResponse.json({ ...base, source: c.provider === "kamra" ? "kamra" : "formal-reservations", property: { code: auth.user.hotel_code }, orders });
   }
   const status = input.status === undefined || input.status === null ? undefined : Number(input.status);
-  return NextResponse.json({ ...base, source: "formal-rooms", property: { code: auth.user.hotel_code }, rooms: await readRooms(auth.user.hotel_id, input.room_type_code ? String(input.room_type_code) : undefined, status !== undefined && Number.isFinite(status) ? status : undefined) });
+  let rooms;
+  try {
+    rooms = c.provider === "kamra"
+      ? await readExternalRooms({ roomTypeCode: input.room_type_code ? String(input.room_type_code) : undefined, status: status !== undefined && Number.isFinite(status) ? status : undefined }, auth.user.hotel_id, auth.user.hotel_code, requestId)
+      : await readRooms(auth.user.hotel_id, input.room_type_code ? String(input.room_type_code) : undefined, status !== undefined && Number.isFinite(status) ? status : undefined);
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "kamra_unavailable";
+    return NextResponse.json({ ...base, ok: false, error: code.startsWith("kamra_") ? code : "pms_read_failed", message: "PMS 房态查询失败，未修改本地数据，请检查 PMS 服务和配置。" }, { status: 502 });
+  }
+  return NextResponse.json({ ...base, source: c.provider === "kamra" ? "kamra" : "formal-rooms", property: { code: auth.user.hotel_code }, rooms });
 }
 
 export async function GET(request: NextRequest, context: { params: Promise<{ operation: string }> }) {

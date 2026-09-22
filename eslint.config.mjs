@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // The bundled Cubism 2 runtime is vendored/minified legacy JavaScript.
+    // It is loaded by the browser as an asset and is not application source.
+    "public/live2d/runtime/**",
   ]),
   {
     files: ["components/ui/**/*.{ts,tsx}", "hooks/use-mobile.ts"],
