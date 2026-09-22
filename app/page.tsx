@@ -1896,7 +1896,10 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin, o
       if (currentCase.status === "IDENTITY_VERIFIED") {
         setFlowStep(3);
         activeStep = FLOW_STEPS[2];
-        result = await postDemo("hold-room", { session_id: sessionId, case_id: caseId, room_number: "1208" }, activeStep);
+        // Do not force a demo room number here. 1208 is intentionally occupied
+        // in the simulator; the adapter must choose a clean sellable room for
+        // the selected room type (and a future PMS will make the same choice).
+        result = await postDemo("hold-room", { session_id: sessionId, case_id: caseId }, activeStep);
         applyCase(result.checkinCase);
         await new Promise((resolve) => window.setTimeout(resolve, 650));
       }
