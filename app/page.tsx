@@ -1542,6 +1542,17 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       setMessage("我只听到一声回应，请把要办理的事情完整说出来，或直接输入文字");
       return;
     }
+    // The landing screen is a business chooser, so a clear spoken business
+    // intent should move through the same allow-listed UI transition as the
+    // visible "办理入住" / "退房" buttons. This is not a business mutation:
+    // phone, identity, payment, and final confirmation remain gated below.
+    if (computerUseEnabled && terminalMode === "choose") {
+      if (/(退房|离店|换房|归还房卡)/u.test(normalized)) {
+        setTerminalMode("checkout");
+      } else if (/(现场|到店|没有?预订|直接入住|办理入住|入住|预订|订单)/u.test(normalized)) {
+        setTerminalMode("checkin");
+      }
+    }
     // “退房” is a terminal operation, not a policy question. Route it straight
     // to the card-return flow so the guest is not asked about checkout policy.
     if (/(退房|离店|我要走了|准备走了)/u.test(normalized)) {
