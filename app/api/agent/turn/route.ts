@@ -14,6 +14,14 @@ function reconcileAgentResult(modelResult: AgentResult | null, fallbackResult: A
   // The model is the primary interpreter. Rules only provide a safe, schema-checked
   // fallback when the model is unavailable or fails to produce a usable plan.
   if (!modelResult) return { result: fallbackResult, source: "rule_fallback" };
+  // A complete walk-in phone number is a safety-critical field: it must be shown
+  // back to the guest and confirmed before a draft is created. The model may
+  // otherwise answer from an older masked number in the conversation or emit a
+  // premature create-draft tool call. Keep the deterministic clarification so the
+  // physical/voice confirmation path remains authoritative.
+  if (fallbackResult.type === "clarification" && fallbackResult.requires_confirmation) {
+    return { result: fallbackResult, source: "rule_fallback" };
+  }
   if (modelResult.type === "tool_call" && fallbackResult.type === "tool_call") {
     const conflicts = criticalFields.filter((field) => {
       const modelValue = modelResult.arguments[field];
