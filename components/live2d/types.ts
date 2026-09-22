@@ -16,7 +16,24 @@ export type DigitalHumanInputEvent =
   | { type: "quick_intent"; eventId: string; intent: string; text: string }
   | { type: "confirm"; eventId: string; source: "digital_human" | "physical" }
   | { type: "cancel"; eventId: string; source: "digital_human" | "physical" }
-  | { type: "model_interaction"; eventId: string; action: "tap" | "motion" };
+  | { type: "model_interaction"; eventId: string; action: "tap" | "motion" }
+  | { type: "computer_use"; eventId: string; action: ComputerUseAction };
+
+/**
+ * The page-level computer-use contract. It is intentionally allow-listed:
+ * these actions can operate the current hotel flow, but cannot execute
+ * arbitrary DOM, browser, or operating-system commands.
+ */
+export type ComputerUseAction =
+  | { type: "focus_input"; target: "utterance" }
+  | { type: "submit_text"; text: string }
+  | { type: "start_voice"; deviceId?: string }
+  | { type: "stop_voice" }
+  | { type: "confirm" }
+  | { type: "back" }
+  | { type: "handoff_admin" };
+
+export type ComputerUseStatus = "idle" | "planning" | "executing" | "waiting_confirmation" | "handoff" | "blocked";
 
 export type DigitalHumanInput = {
   phase: DigitalHumanPhase;
@@ -29,4 +46,6 @@ export type DigitalHumanInput = {
   voiceEnabled: boolean;
   canConfirm: boolean;
   canBack: boolean;
+  computerUseEnabled: boolean;
+  computerUseStatus: ComputerUseStatus;
 };

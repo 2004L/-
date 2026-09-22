@@ -53,7 +53,8 @@ import {
 import { isRoomNumber, parseAmount } from "@/lib/admin-tools";
 import { TerminalCheckoutPanel, TerminalModeChooser } from "@/components/terminal-checkout";
 import { DigitalHuman } from "@/components/live2d/digital-human";
-import type { DigitalHumanInputEvent } from "@/components/live2d/types";
+import { dispatchComputerUseAction } from "@/components/live2d/computer-use-controller";
+import type { ComputerUseStatus, DigitalHumanInputEvent } from "@/components/live2d/types";
 
 type AdapterConfig = {
   provider: string;
@@ -1019,6 +1020,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const [audioInputs, setAudioInputs] = useState<AudioInputDevice[]>([]);
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
+  const [computerUseEnabled, setComputerUseEnabled] = useState(true);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const recognitionRef = useRef<RecognitionLike | null>(null);
   const asrSocketRef = useRef<WebSocket | null>(null);
@@ -1039,6 +1041,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
   const digitalEventIdsRef = useRef<Set<string>>(new Set());
   const conversationRef = useRef<AgentHistoryMessage[]>([]);
   const conversationGenerationRef = useRef(0);
+  const utteranceInputRef = useRef<HTMLInputElement>(null);
 
   const refreshAudioInputs = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -1061,6 +1064,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     mediaDevices?.addEventListener?.("devicechange", handleDeviceChange);
     return () => mediaDevices?.removeEventListener?.("devicechange", handleDeviceChange);
   }, [refreshAudioInputs]);
+
+  const computerUseStatus = useMemo<ComputerUseStatus>(() => {
+    if (!computerUseEnabled) return "idle";
+    if (phase === "searching" || phase === "processing") return "executing";
+    if (phase === "matched" || phase === "ambiguous") return "waiting_confirmation";
+    if (phase === "error" || phase === "blocked") return "blocked";
+    return "idle";
+  }, [computerUseEnabled, phase]);
 
   const handleAudioDeviceChange = useCallback((deviceId: string) => {
     setSelectedAudioDeviceId(deviceId);
@@ -1865,6 +1876,22 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     if (source === "digital_human") setMessage("已收到数字人确认，正在按原办理流程提交。");
   }, [phase]);
 
+  const handleComputerUseAction = useCallback((action: import("@/components/live2d/types").ComputerUseAction) => {
+    if (!computerUseEnabled) return;
+    dispatchComputerUseAction(action, {
+      focusInput: () => utteranceInputRef.current?.focus(),
+      submitText: (text) => { void submitUtterance(text); },
+      startVoice: (deviceId) => {
+        if (deviceId) handleAudioDeviceChange(deviceId);
+        if (!listening) void startListening();
+      },
+      stopVoice: () => finishListeningAndSubmit(),
+      confirm: () => commitCurrentAction("digital_human"),
+      back: () => goBackOrRegret(),
+      handoffAdmin: () => onOpenAdmin(),
+    });
+  }, [commitCurrentAction, computerUseEnabled, finishListeningAndSubmit, goBackOrRegret, handleAudioDeviceChange, listening, onOpenAdmin, startListening, submitUtterance]);
+
   const handleDigitalHumanInput = useCallback((event: DigitalHumanInputEvent) => {
     if (digitalEventIdsRef.current.has(event.eventId)) return;
     digitalEventIdsRef.current.add(event.eventId);
@@ -1891,8 +1918,11 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
         break;
       case "model_interaction":
         break;
+      case "computer_use":
+        handleComputerUseAction(event.action);
+        break;
     }
-  }, [commitCurrentAction, finishListeningAndSubmit, goBackOrRegret, listening, startListening, submitUtterance]);
+  }, [commitCurrentAction, finishListeningAndSubmit, goBackOrRegret, handleComputerUseAction, listening, startListening, submitUtterance]);
 
   const showEntry = (phase === "idle" || phase === "searching") && terminalMode === "checkin";
   const digitalHumanInput = useMemo(() => ({
@@ -1906,12 +1936,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
     voiceEnabled,
     canConfirm: terminalMode !== "choose" && !["searching", "processing", "complete", "error"].includes(phase),
     canBack: terminalMode !== "choose" && phase !== "searching",
-  }), [activeMessage, audioLevel, flowError?.code, flowStep, listening, message, phase, terminalMode, voiceEnabled]);
+    computerUseEnabled,
+    computerUseStatus,
+  }), [activeMessage, audioLevel, computerUseEnabled, computerUseStatus, flowError?.code, flowStep, listening, message, phase, terminalMode, voiceEnabled]);
 
   return <main className="min-h-screen bg-[#f5f5f7] px-5 py-6 text-[#1d1d1f] md:px-10">
     <header className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3"><div><p className="font-semibold tracking-tight">Hotel Agent OS</p><p className="mt-1 text-xs text-[#86868b]">广州示范店 · 数据库演示环境</p></div><div className="flex items-center gap-2"><nav aria-label="终端业务" className="hidden rounded-full bg-white p-1 shadow-sm sm:flex"><button type="button" onClick={() => setTerminalMode("checkin")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkin" ? "bg-[#eaf4ff] text-[#1769aa]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>办理入住</button><button type="button" onClick={() => setTerminalMode("checkout")} className={`rounded-full px-3 py-1.5 text-xs transition ${terminalMode === "checkout" ? "bg-[#effaf4] text-[#248a4d]" : "text-[#6e6e73] hover:bg-[#f5f5f7]"}`}>退房 / 换房</button></nav><button onClick={() => setVoiceEnabled((value) => !value)} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Volume2 size={14} className="mr-1 inline" />{voiceEnabled ? "语音开启" : "已静音"}</button><button onClick={onOpenAdmin} className="rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm"><Settings2 size={14} className="mr-1 inline" />管理后台</button></div></header>
-    <DigitalHuman input={digitalHumanInput} onInput={handleDigitalHumanInput} audioInputs={audioInputs} selectedAudioDeviceId={selectedAudioDeviceId} onAudioDeviceChange={handleAudioDeviceChange} />
-    <section className="mx-auto flex min-h-[calc(100vh-7rem)] max-w-5xl flex-col items-center justify-center py-12 text-center">
+    <DigitalHuman input={digitalHumanInput} onInput={handleDigitalHumanInput} audioInputs={audioInputs} selectedAudioDeviceId={selectedAudioDeviceId} onAudioDeviceChange={handleAudioDeviceChange} onToggleComputerUse={() => setComputerUseEnabled((value) => !value)} />
+    <section className="mx-auto flex min-h-[calc(100vh-7rem)] max-w-5xl flex-col items-center justify-center py-12 text-center lg:pl-[min(30rem,34vw)]">
       {terminalMode === "choose" ? (<>
         <div className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs text-[#6e6e73] shadow-sm"><span className="h-2 w-2 rounded-full bg-[#30d158]" />AI Native 自助终端 · 请先选择业务</div>
         <h1 className="mt-7 max-w-4xl text-4xl font-semibold tracking-[-.055em] md:text-6xl">您好，今天想办理什么？</h1>
@@ -1932,7 +1964,7 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       <p className="mt-4 text-base text-[#86868b]">系统理解您的意图，再由受控业务接口完成动作。</p>
       {showEntry && <button onClick={() => setTerminalMode("choose")} className="mt-5 inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-2 text-xs text-[#6e6e73] shadow-sm transition hover:bg-[#f2f2f7]"><ArrowLeft size={13} />返回选择办理 / 退房</button>}
 
-      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在平台订了房，帮我查一下订单" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><span className="hidden shrink-0 items-center gap-1 rounded-full bg-[#eef6ff] px-2.5 py-2 text-[11px] text-[#1769aa] sm:flex"><Mic size={13} />数字人语音</span><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button><button type="button" onClick={() => goBackOrRegret()} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#f2f2f7] px-3 py-2.5 text-sm font-medium text-[#6e6e73] disabled:opacity-40">上一步</button><button type="button" onClick={() => commitCurrentAction("physical")} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#34c759] px-4 py-2.5 text-sm font-medium text-white shadow-sm disabled:opacity-40">确认</button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 由数字人控制，识别后可直接发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 由数字人控制" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 数字人控制语音输入 · 说完后点击发送"}</p>{audioCaptureStatus !== "unknown" && <div className="mt-2 flex items-center justify-center gap-2 text-xs text-[#86868b]"><span>麦克风：{audioCaptureStatus === "checking" ? "等待声音" : audioCaptureStatus === "ok" ? `已采到声音${audioDeviceLabel ? ` · ${audioDeviceLabel}` : ""}` : audioCaptureStatus === "silent" ? "未检测到有效声音" : "检测失败"}</span>{listening && <span className="h-1.5 w-16 overflow-hidden rounded-full bg-[#e5e5ea]"><span className={`block h-full rounded-full ${audioCaptureStatus === "ok" ? "bg-[#34c759]" : "bg-[#ff9500]"}`} style={{ width: `${Math.max(4, Math.round(audioLevel * 100))}%` }} /></span>}</div>}{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据仅用于本地验收，支持任意四位尾号输入</p></div>}
+      {showEntry && <div className="mt-10 w-full max-w-2xl"><form onSubmit={(event) => { event.preventDefault(); if (listening) finishListeningAndSubmit(); else void submitUtterance(); }} className="flex items-center gap-2 rounded-[1.7rem] bg-white p-2 pl-5 shadow-[0_10px_40px_rgba(0,0,0,.07)]"><MessageSquareText size={20} className="shrink-0 text-[#86868b]" /><input ref={utteranceInputRef} value={utterance} onChange={(event) => setUtterance(event.target.value)} disabled={phase === "searching"} maxLength={200} placeholder="例如：我在平台订了房，帮我查一下订单" className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none placeholder:text-[#a1a1a6]" aria-label="告诉AI您想办理的事情" /><span className="hidden shrink-0 items-center gap-1 rounded-full bg-[#eef6ff] px-2.5 py-2 text-[11px] text-[#1769aa] sm:flex"><Mic size={13} />数字人语音</span><button type="submit" disabled={(!utterance.trim() && !listening) || phase === "searching"} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#007aff] text-white disabled:opacity-30" aria-label={listening ? "结束录音并发送" : "发送"}><ArrowUp size={19} /></button><button type="button" onClick={() => goBackOrRegret()} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#f2f2f7] px-3 py-2.5 text-sm font-medium text-[#6e6e73] disabled:opacity-40">上一步</button><button type="button" onClick={() => commitCurrentAction("physical")} disabled={phase === "searching"} className="shrink-0 rounded-full bg-[#34c759] px-4 py-2.5 text-sm font-medium text-white shadow-sm disabled:opacity-40">确认</button></form><div className="mt-4 flex flex-wrap justify-center gap-2">{SAMPLE_UTTERANCES.map((sample) => <button key={sample} onClick={() => { setUtterance(sample); void submitUtterance(sample); }} disabled={phase === "searching" || listening} className="rounded-full border border-[#d9d9df] bg-white/70 px-3 py-2 text-xs text-[#6e6e73] disabled:opacity-40">{sample}</button>)}</div><p className="mt-3 text-xs text-[#86868b]">{voiceBackend === "local" ? "本地 Qwen3-ASR · 由数字人控制，识别后可直接发送" : voiceBackend === "browser" ? "浏览器语音识别备用通道 · 由数字人控制" : voiceBackend === "unavailable" ? "当前环境不支持语音输入 · 可直接打字" : "本地 ASR 优先 · 数字人控制语音输入 · 说完后点击发送"}</p>{audioCaptureStatus !== "unknown" && <div className="mt-2 flex items-center justify-center gap-2 text-xs text-[#86868b]"><span>麦克风：{audioCaptureStatus === "checking" ? "等待声音" : audioCaptureStatus === "ok" ? `已采到声音${audioDeviceLabel ? ` · ${audioDeviceLabel}` : ""}` : audioCaptureStatus === "silent" ? "未检测到有效声音" : "检测失败"}</span>{listening && <span className="h-1.5 w-16 overflow-hidden rounded-full bg-[#e5e5ea]"><span className={`block h-full rounded-full ${audioCaptureStatus === "ok" ? "bg-[#34c759]" : "bg-[#ff9500]"}`} style={{ width: `${Math.max(4, Math.round(audioLevel * 100))}%` }} /></span>}</div>}{intentTrace && <div className="mx-auto mt-4 inline-flex flex-wrap items-center justify-center gap-2 rounded-full bg-[#eaf4ff] px-4 py-2 text-xs text-[#1769aa]"><span>已理解：{intentTrace.label}</span><span className="text-[#7b9bb8]">{Math.round(intentTrace.confidence * 100)}%</span><span className="text-[#7b9bb8]">→ {intentTrace.action}</span></div>}<p className="mt-3 text-xs text-[#86868b]">演示数据仅用于本地验收，支持任意四位尾号输入</p></div>}
 
       {walkInDraft && <section className="mt-8 w-full max-w-2xl rounded-[2rem] border border-[#d8e9f8] bg-white p-6 text-left shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-medium uppercase tracking-[.16em] text-[#1769aa]">现场办理草稿</p><h2 className="mt-2 text-xl font-semibold">手机号 {walkInDraft.phone_masked}</h2></div><span className="rounded-full bg-[#eaf4ff] px-3 py-1.5 text-xs text-[#1769aa]">{walkInDraft.status === "AWAITING_PAYMENT" ? "等待支付" : walkInDraft.status === "QUOTED" ? "等待确认" : "等待选房"}</span></div><p className="mt-3 text-xs leading-5 text-[#6e6e73]">这是临时草稿。未确认金额并完成支付前，不会创建正式订单，也不会进入身份证、公安或发卡流程。</p>{walkInRoomTypes.length > 0 && <div className="mt-5 grid gap-2">{walkInRoomTypes.map((room) => <button key={room.code} onClick={() => void quoteWalkIn(room.code)} disabled={phase === "searching" || walkInDraft.status === "AWAITING_PAYMENT"} className={`flex items-center justify-between rounded-2xl border px-4 py-3 text-left text-sm ${walkInDraft.room_type_code === room.code ? "border-[#007aff] bg-[#eef6ff]" : "border-[#e5e5ea] bg-white"}`}><span><span className="font-medium">{room.name}</span><span className="ml-2 text-xs text-[#86868b]">余 {room.available} 间</span></span><span className="text-[#6e6e73]">¥{room.nightly_rate}/晚</span></button>)}</div>}{walkInDraft.room_type_code && <div className="mt-5 grid grid-cols-2 gap-3 rounded-2xl bg-[#f5f5f7] p-4 text-sm"><div><p className="text-xs text-[#86868b]">已选房型</p><p className="mt-1 font-medium">{walkInDraft.room_type_name}</p></div><label className="text-xs text-[#86868b]">入住晚数<input type="number" min={1} max={30} value={walkInDraft.nights} disabled={walkInDraft.status === "AWAITING_PAYMENT"} onChange={(event) => setWalkInDraft((current) => current ? { ...current, nights: Math.min(30, Math.max(1, Number(event.target.value) || 1)), status: "DRAFT", total_amount: null, room_amount: null, deposit_amount: null } : current)} className="mt-1 w-full rounded-lg border border-[#d9d9df] bg-white px-2 py-1.5 text-sm" /></label><label className="text-xs text-[#86868b]">房间数<input type="number" min={1} max={4} value={walkInDraft.room_count} disabled={walkInDraft.status === "AWAITING_PAYMENT"} onChange={(event) => setWalkInDraft((current) => current ? { ...current, room_count: Math.min(4, Math.max(1, Number(event.target.value) || 1)), status: "DRAFT", total_amount: null, room_amount: null, deposit_amount: null } : current)} className="mt-1 w-full rounded-lg border border-[#d9d9df] bg-white px-2 py-1.5 text-sm" /></label>{walkInDraft.total_amount !== null && <div className="col-span-2 border-t border-[#e5e5ea] pt-3"><p className="text-xs text-[#86868b]">房费 ¥{walkInDraft.room_amount} + 押金 ¥{walkInDraft.deposit_amount}</p><p className="mt-1 text-lg font-semibold">合计 ¥{walkInDraft.total_amount}</p></div>}</div>}{walkInDraft.status === "QUOTED" && !walkInPayment && <div className="mt-5 flex flex-wrap gap-2"><button onClick={() => void createWalkInPayment("wechat")} disabled={phase === "searching"} className="flex-1 rounded-2xl bg-[#07c160] px-4 py-3 text-sm font-medium text-white">生成微信支付</button><button onClick={() => void createWalkInPayment("alipay")} disabled={phase === "searching"} className="flex-1 rounded-2xl bg-[#1677ff] px-4 py-3 text-sm font-medium text-white">生成支付宝支付</button></div>}{walkInPayment && <div className="mt-5 rounded-2xl border border-[#bde7cf] bg-[#effaf4] p-4"><div className="flex items-center justify-between text-sm"><span>{walkInPayment.method === "alipay" ? "支付宝" : "微信"}模拟支付</span><span className="font-semibold">¥{walkInPayment.amount}</span></div><p className="mt-2 font-mono text-xs text-[#52745f]">支付码：{walkInPayment.qr_token ?? "DEMO"}</p><button onClick={() => void completeWalkInPayment()} disabled={phase === "searching" || walkInPayment.status === "PAID"} className="mt-4 w-full rounded-2xl bg-[#1d1d1f] px-4 py-3 text-sm font-medium text-white">模拟支付成功</button></div>}</section>}
       {transcript.length > 0 && <section className="mt-8 w-full max-w-2xl rounded-[2rem] bg-white p-5 text-left shadow-sm"><div className="flex items-center justify-between"><p className="text-xs font-medium uppercase tracking-[.16em] text-[#86868b]">完整对话记录</p><span className="text-xs text-[#a1a1a6]">本次会话 · {transcript.length} 条</span></div><div className="mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">{transcript.map((entry) => <div key={entry.id} className={`whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${entry.role === "user" ? "ml-8 bg-[#eaf4ff] text-[#174a72]" : entry.role === "tool" ? "mr-8 bg-[#f5f5f7] text-[#6e6e73]" : "mr-8 bg-[#eefaf2] text-[#245d38]"}`}><p className="mb-1 text-[10px] uppercase tracking-[.14em] opacity-60">{entry.role === "user" ? "您" : entry.role === "tool" ? "系统动作" : "AI"}</p>{entry.content}</div>)}</div></section>}
