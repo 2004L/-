@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getD1 } from "@/db";
+import { getPmsAdapter } from "@/services/pms/factory";
 
 export const runtime = "edge";
 
@@ -30,6 +31,40 @@ export async function GET(request: NextRequest) {
   if (!allowed.has(operation)) return NextResponse.json({ ok: false, error: "unsupported_read_model", request_id: requestId }, { status: 400 });
   try {
     let data: unknown;
+    const provider = (process.env.PMS_PROVIDER ?? "simulator").toLowerCase();
+    // When a live PMS is configured, MCP must read through the same adapter as
+    // the normal PMS API. This prevents the agent from seeing a stale local
+    // projection while the front desk is using Kamra as the source of truth.
+    if (provider === "kamra" && (operation === "orders" || operation === "rooms")) {
+      const adapter = getPmsAdapter();
+      const context = { hotelId, hotelCode: hotelId, requestId };
+      if (operation === "orders") {
+        const phone = request.nextUrl.searchParams.get("phone_last4")?.replace(/\D/g, "").slice(-4) || undefined;
+        const reservationNo = request.nextUrl.searchParams.get("reservation_no") || undefined;
+        const orders = await adapter.searchOrders({ phoneLast4: phone, reservationNo }, context);
+        data = orders.map((order) => ({
+          orderId: order.reservationNo,
+          source: order.source,
+          status: order.status,
+          phoneLast4: order.phoneLast4,
+          stayDate: order.stayDate,
+          nights: order.nights,
+          roomCount: order.roomCount,
+          totalAmountFen: order.totalAmount,
+        }));
+      } else {
+        const rooms = await adapter.getRooms({}, context);
+        data = rooms.map((room) => ({
+          number: room.roomNumber,
+          status: room.status,
+          version: null,
+          pmsCode: room.pmsRoomId,
+          roomTypeCode: room.roomTypeCode,
+        }));
+      }
+      await audit(hotelId, tenantId, operation, requestId, true);
+      return NextResponse.json({ ok: true, request_id: requestId, tenant_id: tenantId, hotel_id: hotelId, operation, source: provider, data });
+    }
     if (operation === "rooms") {
       const rows = await getD1().prepare("SELECT r.room_number, r.status, r.version, r.pms_room_id, rt.code AS room_type_code FROM rooms r LEFT JOIN room_types rt ON rt.id = r.room_type_id WHERE r.tenant_id = ? AND r.hotel_id = ? ORDER BY r.room_number LIMIT 500").bind(tenantId, hotelId).all<Record<string, unknown>>();
       data = rows.results.map((r) => ({ number: r.room_number, status: Number(r.status), version: Number(r.version), pmsCode: r.pms_room_id, roomTypeCode: r.room_type_code }));
