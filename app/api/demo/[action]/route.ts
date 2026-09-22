@@ -3,7 +3,7 @@ import { completeGuestToolCall } from "@/lib/ai-control";
 import { ensureAdminSchema, requireAdmin } from "@/lib/admin-auth";
 import { confirmFormalCheckin, ensureFormalCheckinOrder, holdFormalRoom, projectCheckinToLegacy } from "@/lib/checkin";
 import { checkinCommandKey, runDeviceCommand } from "@/lib/device-commands";
-import { ORDER_STATUS, RESERVATION_STATUS } from "@/lib/hotel-core";
+import { ORDER_STATUS, RESERVATION_STATUS, ROOM_STATUS } from "@/lib/hotel-core";
 import { checkoutAndSettle, ensureStayFolio, findCheckoutCandidates, markRoomClean, quoteCheckout, verifyStayFolio, type StayCandidate } from "@/lib/folio";
 import { demoOrderReconcileAllStatement } from "@/lib/legacy-projection-core";
 import { askKnowledge, policyQuery } from "@/lib/knowledge";
@@ -45,8 +45,8 @@ const LAST4_PATTERN = /^\d{4}$/;
 
 const ROOM_TYPE_OPTIONS = [
   { code: "STD-KING", name: "标准大床房", nightlyRate: 260, deposit: 200, available: 3 },
-  { code: "DLX-KING", name: "高级大床房", nightlyRate: 380, deposit: 300, available: 2 },
-  { code: "DLX-TWIN", name: "豪华双床房", nightlyRate: 420, deposit: 300, available: 1 },
+  { code: "DLX-KING", name: "高级大床房", nightlyRate: 380, deposit: 300, available: 3 },
+  { code: "DLX-TWIN", name: "豪华双床房", nightlyRate: 420, deposit: 300, available: 2 },
 ] as const;
 
 const STATE_LABELS: Record<string, string> = {
@@ -133,29 +133,6 @@ async function ensureFormalForOrder(scope: DemoOrderScope, seed: FormalOrderSeed
 async function legacyOrderRef(orderId: string) {
   const row = await getD1().prepare("SELECT order_code, room_type FROM demo_orders WHERE id = ? LIMIT 1").bind(orderId).first<{ order_code: string; room_type: string }>();
   return row ? { orderCode: row.order_code, roomTypeName: row.room_type } : null;
-}
-
-/**
- * The simulator is deliberately session-friendly: formal room rows are shared
- * by all browser sessions, while the simulator catalog is only a tiny fixture.
- * Reusing that fixture across test runs eventually exhausts every VACANT_CLEAN
- * room and correctly produces HANDOFF_REQUIRED, which is useful for production
- * but makes a demo kiosk look permanently broken. Allocate a case-scoped room
- * in a reserved demo range instead. It is still inserted and held by the same
- * formal CAS workflow, so the later identity/police/check-in steps remain real.
- */
-async function allocateSimulatorRoom(hotelId: string, caseId: string) {
-  const digits = caseId.replace(/\D/g, "");
-  let hash = 0;
-  for (const char of caseId) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  const seed = Number(digits.slice(-3) || hash % 1000);
-  const db = getD1();
-  for (let offset = 0; offset < 1000; offset += 1) {
-    const candidate = String(9000 + ((seed + offset) % 1000));
-    const exists = await db.prepare("SELECT 1 AS present FROM rooms WHERE hotel_id = ? AND room_number = ? LIMIT 1").bind(hotelId, candidate).first<{ present: number }>();
-    if (!exists) return candidate;
-  }
-  throw new Error("demo_room_pool_exhausted");
 }
 
 /**
@@ -414,11 +391,11 @@ function serializeDraft(row: WalkInDraftRow) {
   };
 }
 
-function roomOption(code: unknown) {
+function roomOption(code: unknown, available?: number) {
   if (typeof code !== "string") throw new Error("invalid_room_type");
   const option = ROOM_TYPE_OPTIONS.find((item) => item.code === code);
   if (!option) throw new Error("invalid_room_type");
-  return option;
+  return { ...option, available: available ?? option.available };
 }
 
 function positiveInteger(value: unknown, name: string, min: number, max: number) {
@@ -434,8 +411,16 @@ async function loadDraft(sessionId: string, draftId: unknown) {
   return row;
 }
 
-function roomTypes() {
-  return ROOM_TYPE_OPTIONS.map((item) => ({ code: item.code, name: item.name, nightly_rate: item.nightlyRate, deposit: item.deposit, available: item.available }));
+async function roomTypes(sessionId: string) {
+  const scope = await sessionScope(sessionId);
+  // Refresh metadata before counting; the sync deliberately preserves formal
+  // room status, so a held/occupied room never appears as available again.
+  await syncPmsRoomCatalog({ tenantId: scope.tenantId, hotelId: scope.hotelId, hotelCode: scope.hotelCode }).catch(() => undefined);
+  const rows = await getD1().prepare(
+    "SELECT rt.code AS code, COUNT(r.id) AS available FROM room_types rt LEFT JOIN rooms r ON r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id AND r.status = ? AND NOT EXISTS (SELECT 1 FROM reservation_rooms rr JOIN reservations res ON res.id = rr.reservation_id AND res.hotel_id = rr.hotel_id WHERE rr.hotel_id = r.hotel_id AND rr.room_id = r.id AND res.status = ?) WHERE rt.hotel_id = ? GROUP BY rt.code",
+  ).bind(ROOM_STATUS.VACANT_CLEAN, RESERVATION_STATUS.CHECKED_IN, scope.hotelId).all<{ code: string; available: number }>();
+  const counts = new Map(rows.results.map((row) => [row.code, Number(row.available) || 0]));
+  return ROOM_TYPE_OPTIONS.map((item) => ({ code: item.code, name: item.name, nightly_rate: item.nightlyRate, deposit: item.deposit, available: counts.get(item.code) ?? 0 }));
 }
 
 async function audit(sessionId: string, caseId: string | null, eventType: string, fromState: string | null, toState: string | null, detail: string) {
@@ -695,14 +680,14 @@ export async function POST(request: Request, context: RouteContext) {
       const token = await phoneToken(phone);
       const idempotencyKey = typeof body.idempotency_key === "string" && body.idempotency_key.length <= 160 ? body.idempotency_key : `walk-in-draft:${sessionId}:${token}`;
       const existing = await getD1().prepare("SELECT * FROM walk_in_drafts WHERE session_id = ? AND idempotency_key = ?").bind(sessionId, idempotencyKey).first<WalkInDraftRow>();
-      if (existing && existing.status !== "CANCELLED") return json({ ok: true, reused: true, draft: serializeDraft(existing), room_types: roomTypes() });
+      if (existing && existing.status !== "CANCELLED") return json({ ok: true, reused: true, draft: serializeDraft(existing), room_types: await roomTypes(sessionId) });
       if (existing?.status === "CANCELLED") {
         const timestamp = now();
         await getD1().prepare("UPDATE walk_in_drafts SET phone_token = ?, phone_last4 = ?, phone_masked = ?, stay_date = ?, nights = 1, room_count = 1, room_type_code = NULL, room_type_name = NULL, nightly_rate = NULL, room_amount = NULL, deposit_amount = NULL, total_amount = NULL, status = 'DRAFT', payment_id = NULL, order_id = NULL, updated_at = ? WHERE id = ? AND session_id = ? AND status = 'CANCELLED'")
           .bind(token, phone.slice(-4), `1** **** ${phone.slice(-4)}`, timestamp.slice(0, 10), timestamp, existing.id, sessionId).run();
         await audit(sessionId, null, "WALK_IN_DRAFT_REOPENED", "CANCELLED", "DRAFT", "住客重新开始现场办理；上一份未支付草稿已取消，不会创建重复订单");
         const reopened = await loadDraft(sessionId, existing.id);
-        return json({ ok: true, reused: false, draft: serializeDraft(reopened), room_types: roomTypes() });
+        return json({ ok: true, reused: false, draft: serializeDraft(reopened), room_types: await roomTypes(sessionId) });
       }
       const draftId = crypto.randomUUID();
       const timestamp = now();
@@ -710,7 +695,7 @@ export async function POST(request: Request, context: RouteContext) {
         .bind(draftId, sessionId, token, phone.slice(-4), `1** **** ${phone.slice(-4)}`, timestamp.slice(0, 10), idempotencyKey, timestamp, timestamp).run();
       await audit(sessionId, null, "WALK_IN_DRAFT_CREATED", null, "DRAFT", "已确认完整手机号并创建现场办理草稿；手机号仅保存为掩码和不可逆令牌");
       const draft = await loadDraft(sessionId, draftId);
-      return json({ ok: true, reused: false, draft: serializeDraft(draft), room_types: roomTypes() }, 201);
+      return json({ ok: true, reused: false, draft: serializeDraft(draft), room_types: await roomTypes(sessionId) }, 201);
     }
     if (action === "walk-in-cancel") {
       const draft = await loadDraft(sessionId, body.draft_id);
@@ -729,7 +714,9 @@ export async function POST(request: Request, context: RouteContext) {
     if (action === "walk-in-quote") {
       const draft = await loadDraft(sessionId, body.draft_id);
       if (!["DRAFT", "QUOTED"].includes(draft.status)) throw new Error(`invalid_draft_status:${draft.status}`);
-      const option = roomOption(body.room_type_code);
+      const availableOptions = await roomTypes(sessionId);
+      const selected = availableOptions.find((item) => item.code === body.room_type_code);
+      const option = roomOption(body.room_type_code, selected?.available ?? 0);
       const nights = positiveInteger(body.nights, "nights", 1, 30);
       const roomCount = positiveInteger(body.room_count, "room_count", 1, 4);
       if (roomCount > option.available) throw new Error("room_not_available");
@@ -737,14 +724,14 @@ export async function POST(request: Request, context: RouteContext) {
       const depositAmount = option.deposit * roomCount;
       const totalAmount = roomAmount + depositAmount;
       if (draft.status === "QUOTED" && draft.room_type_code === option.code && draft.nights === nights && draft.room_count === roomCount && draft.total_amount === totalAmount) {
-        return json({ ok: true, reused: true, draft: serializeDraft(draft), room_types: roomTypes() });
+        return json({ ok: true, reused: true, draft: serializeDraft(draft), room_types: availableOptions });
       }
       const timestamp = now();
       await getD1().prepare("UPDATE walk_in_drafts SET room_type_code = ?, room_type_name = ?, nightly_rate = ?, room_amount = ?, deposit_amount = ?, total_amount = ?, nights = ?, room_count = ?, status = 'QUOTED', updated_at = ? WHERE id = ? AND session_id = ? AND status IN ('DRAFT','QUOTED')")
         .bind(option.code, option.name, option.nightlyRate, roomAmount, depositAmount, totalAmount, nights, roomCount, timestamp, draft.id, sessionId).run();
       await audit(sessionId, null, "WALK_IN_QUOTED", "DRAFT", "QUOTED", `已生成${option.name}报价：${nights}晚、${roomCount}间；金额以后台计算为准，支付前不创建正式订单`);
       const updated = await loadDraft(sessionId, draft.id);
-      return json({ ok: true, reused: false, draft: serializeDraft(updated), room_types: roomTypes() });
+      return json({ ok: true, reused: false, draft: serializeDraft(updated), room_types: await roomTypes(sessionId) });
     }
     if (action === "walk-in-payment") {
       const draft = await loadDraft(sessionId, body.draft_id);
@@ -862,26 +849,16 @@ export async function POST(request: Request, context: RouteContext) {
       const ref = await legacyOrderRef(current.order_id);
       if (ref) {
         const scope = await sessionScope(sessionId);
-        const simulator = (process.env.PMS_PROVIDER || "simulator").toLowerCase() === "simulator";
-        // A real PMS owns the room number. In the simulator, use a fresh
-        // case-scoped demo room so old test sessions cannot consume the tiny
-        // catalog and strand every later guest at HANDOFF_REQUIRED.
-        const roomForHold = simulator
-          ? await allocateSimulatorRoom(scope.hotelId, current.id)
-          : requestedRoom;
         // The catalog is what makes "pick a sellable room" possible. It never
         // overwrites an existing room status, and a failure just means no new
         // rooms to choose from.
         await syncPmsRoomCatalog({ tenantId: scope.tenantId, hotelId: scope.hotelId, hotelCode: scope.hotelCode }).catch(() => undefined);
-        const held = await requireFormal(sessionId, current.id, "hold-room", () => holdFormalRoom({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, roomNumber: roomForHold, roomTypeName: ref.roomTypeName, requestId: `${sessionId}:${current.id}:hold` }));
+        const held = await requireFormal(sessionId, current.id, "hold-room", () => holdFormalRoom({ tenantId: scope.tenantId, hotelId: scope.hotelId, orderNo: ref.orderCode, roomNumber: requestedRoom, roomTypeName: ref.roomTypeName, requestId: `${sessionId}:${current.id}:hold` }));
         if (!held.ok) {
           const handed = await requireHandoff(sessionId, current.id, `锁定房间失败：${held.reason}，已转人工接手`);
           return json({ checkinCase: handed, handoff: handoffReply(held.reason) });
         }
-        const detail = simulator
-          ? `模拟 PMS 已分配并锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`
-          : `已锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`;
-        const updated = await transition({ sessionId, caseId: current.id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail, fields: { roomNumber: held.value.roomNumber } });
+        const updated = await transition({ sessionId, caseId: current.id, expected: "IDENTITY_VERIFIED", next: "ROOM_HELD", eventType: "ROOM_HELD", detail: `已从当前可售房态中编排并锁定 ${held.value.roomNumber} 房（房态 CAS 通过）`, fields: { roomNumber: held.value.roomNumber } });
         await projectFormal(sessionId, scope, ref.orderCode, { roomNumber: held.value.roomNumber });
         return json({ checkinCase: updated });
       }

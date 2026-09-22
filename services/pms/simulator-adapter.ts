@@ -15,10 +15,15 @@ const orders: PmsOrder[] = [
 const rooms: PmsRoom[] = [
   { roomNumber: "1208", roomTypeCode: "DLX-KING", status: ROOM_STATUS.OCCUPIED, pmsRoomId: "sim-1208" },
   { roomNumber: "1306", roomTypeCode: "DLX-KING", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1306" },
+  { roomNumber: "1307", roomTypeCode: "DLX-KING", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1307" },
+  { roomNumber: "1308", roomTypeCode: "DLX-KING", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1308" },
   { roomNumber: "1210", roomTypeCode: "DLX-TWIN", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1210" },
+  { roomNumber: "1211", roomTypeCode: "DLX-TWIN", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1211" },
   // 演示订单里卖的是三种房型，模拟酒店就必须有这三种房；少一种，那一类订单
   // 在自助终端只会一路走到 no_sellable_room 转人工。
   { roomNumber: "1108", roomTypeCode: "STD-KING", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1108" },
+  { roomNumber: "1109", roomTypeCode: "STD-KING", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1109" },
+  { roomNumber: "1110", roomTypeCode: "STD-KING", status: ROOM_STATUS.VACANT_CLEAN, pmsRoomId: "sim-1110" },
 ];
 
 function ensureContext(context: PmsAdapterContext) {
