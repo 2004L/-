@@ -101,20 +101,80 @@ export class KamraPmsAdapter implements PmsAdapter {
     }).map((row) => ({
       reservationNo: text(row, ["reservation_no", "name", "reservation", "id"]), source: text(row, ["source", "channel", "booking_source"], "Kamra"),
       status: reservationStatus(row.status), phoneLast4: input.phoneLast4 || text(row, ["phone_last4", "guest_phone_last4", "mobile_last4"]).slice(-4),
-      stayDate: text(row, ["stay_date", "arrival", "check_in", "checkin"]), nights: number(row, ["nights", "number_of_nights"], 1), roomCount: number(row, ["room_count", "rooms"], 1),
+      stayDate: text(row, ["stay_date", "arrival", "check_in", "check_in_date", "checkin"]), nights: number(row, ["nights", "number_of_nights"], 1), roomCount: number(row, ["room_count", "rooms"], 1),
       roomTypeCode: text(row, ["room_type_code", "room_type", "room_type_name"]), totalAmount: number(row, ["total_amount", "grand_total"]), depositAmount: number(row, ["deposit_amount", "deposit"]),
     }));
   }
 
   async getRooms(input: { roomTypeCode?: string; status?: (typeof ROOM_STATUS)[keyof typeof ROOM_STATUS] }, context: PmsAdapterContext): Promise<PmsRoom[]> {
     const rows = list(await this.call("kamra.api.front_desk_snapshot", {}, context));
-    return rows.map((row) => ({ roomNumber: text(row, ["room_number", "room", "number"]), roomTypeCode: text(row, ["room_type_code", "room_type", "room_type_name"]), status: roomStatus(row.status || row.housekeeping_status || row.occupancy_status), pmsRoomId: text(row, ["room_id", "name", "id"]) }))
+    return rows.map((row) => ({ roomNumber: text(row, ["room_number", "room", "number"]), roomTypeCode: text(row, ["room_type_code", "room_type", "room_type_name"]), status: roomStatus(row.status || row.occupancy_status || row.housekeeping_status), pmsRoomId: text(row, ["room_id", "name", "id"]) }))
       .filter((room) => !!room.roomNumber && (!input.roomTypeCode || room.roomTypeCode === input.roomTypeCode) && (input.status === undefined || room.status === input.status));
   }
 
-  async holdRoom() { throw new Error("kamra_write_disabled"); }
-  async confirmCheckin() { throw new Error("kamra_write_disabled"); }
-  async checkout() { throw new Error("kamra_write_disabled"); }
+  async createReservation(input: { guestName: string; phone?: string; roomTypeCode: string; checkInDate: string; checkOutDate: string; adults?: number; children?: number; idempotencyKey: string }, context: PmsAdapterContext) {
+    if (!input.idempotencyKey) throw new Error("pms_idempotency_required");
+    const result = await this.call("kamra.api.create_booking", {
+      room_type: input.roomTypeCode,
+      check_in_date: input.checkInDate,
+      check_out_date: input.checkOutDate,
+      guest_name: input.guestName,
+      phone: input.phone,
+      adults: input.adults ?? 2,
+      children: input.children ?? 0,
+      idempotency_key: input.idempotencyKey,
+    }, context) as Record<string, unknown>;
+    const reservationNo = text(result, ["name", "reservation", "reservation_no", "id"]);
+    if (!reservationNo) throw new Error("kamra_invalid_create_booking_response");
+    return { reservationNo, status: reservationStatus(result.status), receipt: `kamra-create-${reservationNo}` };
+  }
+
+  async amendStay(input: { reservationNo: string; checkInDate: string; checkOutDate: string; idempotencyKey: string }, context: PmsAdapterContext) {
+    if (!input.idempotencyKey) throw new Error("pms_idempotency_required");
+    const result = await this.call("kamra.api.amend_stay", {
+      reservation: input.reservationNo,
+      check_in_date: input.checkInDate,
+      check_out_date: input.checkOutDate,
+      idempotency_key: input.idempotencyKey,
+    }, context) as Record<string, unknown>;
+    const reservationNo = text(result, ["name", "reservation", "reservation_no", "id"], input.reservationNo);
+    return { reservationNo, status: reservationStatus(result.status), receipt: `kamra-amend-${reservationNo}` };
+  }
+
+  async moveReservation(input: { reservationNo: string; roomNumber: string; idempotencyKey: string }, context: PmsAdapterContext) {
+    if (!input.idempotencyKey) throw new Error("pms_idempotency_required");
+    const result = await this.call("kamra.api.move_reservation", {
+      reservation: input.reservationNo,
+      new_room: input.roomNumber,
+      idempotency_key: input.idempotencyKey,
+    }, context) as Record<string, unknown>;
+    const reservationNo = text(result, ["name", "reservation", "reservation_no", "id"], input.reservationNo);
+    return { reservationNo, status: reservationStatus(result.status), receipt: `kamra-move-${reservationNo}` };
+  }
+
+  async holdRoom(_input: { reservationNo: string; roomNumber: string; idempotencyKey: string }, _context: PmsAdapterContext): Promise<{ status: "held" | "conflict"; expiresAt?: string }> {
+    void _input;
+    void _context;
+    throw new Error("kamra_hold_requires_booking_quote");
+  }
+
+  async confirmCheckin(input: { reservationNo: string; roomNumber: string; idempotencyKey: string }, context: PmsAdapterContext) {
+    if (!input.idempotencyKey) throw new Error("pms_idempotency_required");
+    const result = await this.call("kamra.api.check_in", { reservation: input.reservationNo, room: input.roomNumber, idempotency_key: input.idempotencyKey }, context) as Record<string, unknown>;
+    return { status: "checked-in" as const, receipt: text(result, ["receipt", "name"], `kamra-checkin-${input.reservationNo}`) };
+  }
+
+  async checkout(input: { reservationNo: string; idempotencyKey: string }, context: PmsAdapterContext) {
+    if (!input.idempotencyKey) throw new Error("pms_idempotency_required");
+    const result = await this.call("kamra.api.check_out", { reservation: input.reservationNo, idempotency_key: input.idempotencyKey }, context) as Record<string, unknown>;
+    return { status: "checked-out" as const, receipt: text(result, ["receipt", "name"], `kamra-checkout-${input.reservationNo}`) };
+  }
+
+  async setHousekeepingStatus(input: { roomNumber: string; status: string; idempotencyKey: string }, context: PmsAdapterContext) {
+    if (!input.idempotencyKey) throw new Error("pms_idempotency_required");
+    const result = await this.call("kamra.api.set_housekeeping_status", { room: input.roomNumber, status: input.status, idempotency_key: input.idempotencyKey }, context) as Record<string, unknown>;
+    return { status: text(result, ["status"], input.status), receipt: `kamra-housekeeping-${input.roomNumber}` };
+  }
 }
 
 export const kamraPms = new KamraPmsAdapter();

@@ -259,9 +259,12 @@ export interface PmsAdapter {
   searchOrders(input: { phoneLast4?: string; reservationNo?: string }, context: PmsAdapterContext): Promise<PmsOrder[]>;
   getRooms(input: { roomTypeCode?: string; status?: RoomStatus }, context: PmsAdapterContext): Promise<PmsRoom[]>;
   holdRoom(input: { reservationNo: string; roomNumber: string; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ status: "held" | "conflict"; expiresAt?: string }>;
-  createReservation?(input: { phoneLast4: string; roomTypeCode: string; roomCount: number; totalAmount: number; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ reservationNo: string; status: ReservationStatus }>;
+  createReservation?(input: { guestName: string; phone?: string; roomTypeCode: string; checkInDate: string; checkOutDate: string; adults?: number; children?: number; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ reservationNo: string; status: ReservationStatus; receipt?: string }>;
+  amendStay?(input: { reservationNo: string; checkInDate: string; checkOutDate: string; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ reservationNo: string; status: ReservationStatus; receipt?: string }>;
+  moveReservation?(input: { reservationNo: string; roomNumber: string; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ reservationNo: string; status: ReservationStatus; receipt?: string }>;
   confirmCheckin(input: { reservationNo: string; roomNumber: string; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ status: "checked-in" | "conflict"; receipt?: string }>;
   checkout(input: { reservationNo: string; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ status: "checked-out" | "conflict"; receipt?: string }>;
+  setHousekeepingStatus?(input: { roomNumber: string; status: string; idempotencyKey: string }, context: PmsAdapterContext): Promise<{ status: string; receipt?: string }>;
 }
 
 export function redactCoreContext(value: unknown): unknown {

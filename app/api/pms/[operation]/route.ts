@@ -6,10 +6,10 @@ import { getPmsAdapter } from "@/services/pms/factory";
 
 export const runtime = "edge";
 
-type Operation = "ping" | "orders" | "rooms" | "hold" | "checkin" | "checkout";
+type Operation = "ping" | "orders" | "rooms" | "create" | "amend" | "move" | "hold" | "checkin" | "checkout" | "housekeeping";
 
-const OPERATIONS: readonly Operation[] = ["ping", "orders", "rooms", "hold", "checkin", "checkout"];
-const WRITE_OPERATIONS: readonly Operation[] = ["hold", "checkin", "checkout"];
+const OPERATIONS: readonly Operation[] = ["ping", "orders", "rooms", "create", "amend", "move", "hold", "checkin", "checkout", "housekeeping"];
+const WRITE_OPERATIONS: readonly Operation[] = ["create", "amend", "move", "hold", "checkin", "checkout", "housekeeping"];
 const TEMPORARY_API_KEY = "TEMP_PMS_API_KEY_REPLACE_ME";
 
 function config() {
@@ -20,6 +20,7 @@ function config() {
     baseUrl: process.env.PMS_BASE_URL ?? "https://pms.example.local/api",
     apiKey,
     temporaryKey: apiKey === TEMPORARY_API_KEY,
+    writesEnabled: process.env.PMS_WRITES_ENABLED === "true",
   };
 }
 
@@ -86,7 +87,44 @@ async function handle(request: NextRequest, params: Promise<{ operation: string 
   const url = new URL(request.url);
   const input = request.method === "POST" ? await request.json().catch(() => ({})) as Record<string, unknown> : {};
   if (WRITE_OPERATIONS.includes(operation)) {
-    return NextResponse.json({ ...base, ok: false, error: "pms_write_requires_formal_flow", message: "房态与预订写入由正式领域工作流执行；PMS 适配层不再直接修改内存或投影数据。" }, { status: 501 });
+    if (!c.writesEnabled) return NextResponse.json({ ...base, ok: false, error: "pms_write_disabled", message: "PMS 写操作尚未启用。" }, { status: 501 });
+    if (input.confirmation !== "CONFIRM") return NextResponse.json({ ...base, ok: false, error: "confirmation_required", message: "写操作必须显式确认。" }, { status: 409 });
+    if (typeof input.idempotency_key !== "string" || input.idempotency_key.length < 8 || input.idempotency_key.length > 160) return NextResponse.json({ ...base, ok: false, error: "pms_idempotency_required" }, { status: 400 });
+  }
+  const adapter = getPmsAdapter();
+  const context = { hotelId: auth.user.hotel_id, hotelCode: auth.user.hotel_code, requestId };
+  try {
+    if (operation === "create") {
+      if (!adapter.createReservation) throw new Error("pms_create_not_supported");
+      const result = await adapter.createReservation({ guestName: String(input.guest_name ?? ""), phone: input.phone ? String(input.phone) : undefined, roomTypeCode: String(input.room_type_code ?? ""), checkInDate: String(input.check_in_date ?? ""), checkOutDate: String(input.check_out_date ?? ""), adults: Number(input.adults ?? 2), children: Number(input.children ?? 0), idempotencyKey: String(input.idempotency_key) }, context);
+      return NextResponse.json({ ...base, operation, result });
+    }
+    if (operation === "amend") {
+      if (!adapter.amendStay) throw new Error("pms_amend_not_supported");
+      const result = await adapter.amendStay({ reservationNo: String(input.reservation_no ?? ""), checkInDate: String(input.check_in_date ?? ""), checkOutDate: String(input.check_out_date ?? ""), idempotencyKey: String(input.idempotency_key) }, context);
+      return NextResponse.json({ ...base, operation, result });
+    }
+    if (operation === "move") {
+      if (!adapter.moveReservation) throw new Error("pms_move_not_supported");
+      const result = await adapter.moveReservation({ reservationNo: String(input.reservation_no ?? ""), roomNumber: String(input.room_number ?? ""), idempotencyKey: String(input.idempotency_key) }, context);
+      return NextResponse.json({ ...base, operation, result });
+    }
+    if (operation === "checkin") {
+      const result = await adapter.confirmCheckin({ reservationNo: String(input.reservation_no ?? ""), roomNumber: String(input.room_number ?? ""), idempotencyKey: String(input.idempotency_key) }, context);
+      return NextResponse.json({ ...base, operation, result });
+    }
+    if (operation === "checkout") {
+      const result = await adapter.checkout({ reservationNo: String(input.reservation_no ?? ""), idempotencyKey: String(input.idempotency_key) }, context);
+      return NextResponse.json({ ...base, operation, result });
+    }
+    if (operation === "housekeeping") {
+      if (!adapter.setHousekeepingStatus) throw new Error("pms_housekeeping_not_supported");
+      const result = await adapter.setHousekeepingStatus({ roomNumber: String(input.room_number ?? ""), status: String(input.status ?? ""), idempotencyKey: String(input.idempotency_key) }, context);
+      return NextResponse.json({ ...base, operation, result });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "pms_write_failed";
+    return NextResponse.json({ ...base, ok: false, error: message.startsWith("kamra_") || message.startsWith("pms_") ? message : "pms_write_failed", message: "PMS 写操作失败，未修改本地投影数据。" }, { status: 502 });
   }
   if (operation === "orders") {
     const phoneLast4 = String(input.phone_last4 ?? url.searchParams.get("phone_last4") ?? "").replace(/\D/g, "").slice(-4) || undefined;
