@@ -1956,11 +1956,28 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin }:
       return;
     }
     stopListening();
-    setTerminalMode(terminalMode === "checkout" ? "choose" : "checkin");
-    setPhase("idle");
-    setUtterance("");
-    setMessage("您好，今天想办理什么？");
-  }, [onOpenAdmin, phase, terminalMode]);
+    const returnToPreviousStep = () => {
+      startNewConversation("重新开始办理");
+      setTerminalMode(terminalMode === "checkout" ? "choose" : "checkin");
+      setPhase("idle");
+      setUtterance("");
+      setMessage("您好，今天想办理什么？");
+    };
+    if (walkInDraft && ["DRAFT", "QUOTED"].includes(walkInDraft.status)) {
+      setMessage("正在取消未支付现场办理草稿，请稍候…");
+      void postDemo<{ ok: boolean }>("walk-in-cancel", { session_id: sessionId, draft_id: walkInDraft.id })
+        .then(() => {
+          setWalkInDraft(null);
+          setWalkInRoomTypes([]);
+          setWalkInPayment(null);
+          setPendingWalkInPhone(null);
+          returnToPreviousStep();
+        })
+        .catch(() => setMessage("未能取消现场办理草稿，系统保留当前状态，请重试或联系前台。"));
+      return;
+    }
+    returnToPreviousStep();
+  }, [onOpenAdmin, phase, sessionId, terminalMode, walkInDraft]);
 
   const commitCurrentAction = useCallback((source: "digital_human" | "physical") => {
     if (phase === "searching" || phase === "processing") return;

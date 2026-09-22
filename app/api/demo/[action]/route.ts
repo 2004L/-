@@ -672,7 +672,15 @@ export async function POST(request: Request, context: RouteContext) {
       const token = await phoneToken(phone);
       const idempotencyKey = typeof body.idempotency_key === "string" && body.idempotency_key.length <= 160 ? body.idempotency_key : `walk-in-draft:${sessionId}:${token}`;
       const existing = await getD1().prepare("SELECT * FROM walk_in_drafts WHERE session_id = ? AND idempotency_key = ?").bind(sessionId, idempotencyKey).first<WalkInDraftRow>();
-      if (existing) return json({ ok: true, reused: true, draft: serializeDraft(existing), room_types: roomTypes() });
+      if (existing && existing.status !== "CANCELLED") return json({ ok: true, reused: true, draft: serializeDraft(existing), room_types: roomTypes() });
+      if (existing?.status === "CANCELLED") {
+        const timestamp = now();
+        await getD1().prepare("UPDATE walk_in_drafts SET phone_token = ?, phone_last4 = ?, phone_masked = ?, stay_date = ?, nights = 1, room_count = 1, room_type_code = NULL, room_type_name = NULL, nightly_rate = NULL, room_amount = NULL, deposit_amount = NULL, total_amount = NULL, status = 'DRAFT', payment_id = NULL, order_id = NULL, updated_at = ? WHERE id = ? AND session_id = ? AND status = 'CANCELLED'")
+          .bind(token, phone.slice(-4), `1** **** ${phone.slice(-4)}`, timestamp.slice(0, 10), timestamp, existing.id, sessionId).run();
+        await audit(sessionId, null, "WALK_IN_DRAFT_REOPENED", "CANCELLED", "DRAFT", "住客重新开始现场办理；上一份未支付草稿已取消，不会创建重复订单");
+        const reopened = await loadDraft(sessionId, existing.id);
+        return json({ ok: true, reused: false, draft: serializeDraft(reopened), room_types: roomTypes() });
+      }
       const draftId = crypto.randomUUID();
       const timestamp = now();
       await getD1().prepare("INSERT INTO walk_in_drafts (id, session_id, phone_token, phone_last4, phone_masked, stay_date, nights, room_count, status, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'DRAFT', ?, ?, ?)")
@@ -680,6 +688,20 @@ export async function POST(request: Request, context: RouteContext) {
       await audit(sessionId, null, "WALK_IN_DRAFT_CREATED", null, "DRAFT", "已确认完整手机号并创建现场办理草稿；手机号仅保存为掩码和不可逆令牌");
       const draft = await loadDraft(sessionId, draftId);
       return json({ ok: true, reused: false, draft: serializeDraft(draft), room_types: roomTypes() }, 201);
+    }
+    if (action === "walk-in-cancel") {
+      const draft = await loadDraft(sessionId, body.draft_id);
+      if (["DRAFT", "QUOTED"].includes(draft.status)) {
+        const timestamp = now();
+        await getD1().prepare("UPDATE walk_in_drafts SET status = 'CANCELLED', updated_at = ? WHERE id = ? AND session_id = ? AND status IN ('DRAFT','QUOTED')")
+          .bind(timestamp, draft.id, sessionId).run();
+        await audit(sessionId, null, "WALK_IN_DRAFT_CANCELLED", draft.status, "CANCELLED", "住客点击上一步取消未支付现场办理草稿；未创建正式订单，手机号可重新办理");
+        const cancelled = await loadDraft(sessionId, draft.id);
+        return json({ ok: true, draft: serializeDraft(cancelled) });
+      }
+      if (draft.status === "AWAITING_PAYMENT") throw new Error("draft_payment_pending_cannot_cancel");
+      if (draft.status === "ORDER_CREATED") throw new Error("draft_order_created_cannot_cancel");
+      throw new Error(`draft_cannot_cancel:${draft.status}`);
     }
     if (action === "walk-in-quote") {
       const draft = await loadDraft(sessionId, body.draft_id);
