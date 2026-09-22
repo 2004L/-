@@ -12,7 +12,13 @@ function newEventId() {
   return typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 }
 
-export function DigitalHuman({ input, onInput }: { input: DigitalHumanInput; onInput: (event: DigitalHumanInputEvent) => void }) {
+export function DigitalHuman({ input, onInput, audioInputs, selectedAudioDeviceId, onAudioDeviceChange }: {
+  input: DigitalHumanInput;
+  onInput: (event: DigitalHumanInputEvent) => void;
+  audioInputs: Array<{ deviceId: string; label: string }>;
+  selectedAudioDeviceId: string;
+  onAudioDeviceChange: (deviceId: string) => void;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<"loading" | "ready" | "fallback">("loading");
@@ -63,6 +69,7 @@ export function DigitalHuman({ input, onInput }: { input: DigitalHumanInput; onI
       <button type="button" onClick={() => emit({ type: "cancel", source: "digital_human" })} disabled={!input.canBack} className="flex items-center justify-center gap-1.5 rounded-xl bg-[#f5f5f7] px-2 py-2.5 text-xs font-medium text-[#6e6e73] disabled:opacity-40"><ArrowLeft size={14} />上一步 / 后悔</button>
       <button type="button" onClick={() => emit({ type: "confirm", source: "digital_human" })} disabled={!input.canConfirm || isBusy} className="flex items-center justify-center gap-1.5 rounded-xl bg-[#34c759] px-2 py-2.5 text-xs font-medium text-white disabled:opacity-40"><Check size={14} />确认提交</button>
     </div>
+    <div className="border-t border-[#edf0f4] px-4 py-3"><label className="flex items-center justify-between gap-3 text-xs text-[#6e6e73]"><span className="shrink-0 font-medium">语音输入设备</span><select value={selectedAudioDeviceId} onChange={(event) => onAudioDeviceChange(event.target.value)} disabled={input.listening || audioInputs.length === 0} className="min-w-0 flex-1 rounded-lg border border-[#d9dfe8] bg-white px-2 py-1.5 text-xs text-[#31465d] outline-none focus:border-[#007aff] disabled:opacity-50" aria-label="数字人语音输入设备"><option value="">{audioInputs.length === 0 ? "正在检测麦克风…" : "系统默认麦克风"}</option>{audioInputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select></label><p className="mt-1 text-[11px] text-[#9a9aa1]">录音前可切换设备，选择会保存在本机</p></div>
     <div className="flex items-center justify-between px-4 pb-3 text-[10px] text-[#9a9aa1]"><span>数字人输入与传统确认共用同一办理内核</span><Volume2 size={12} /></div>
   </aside>;
 }
