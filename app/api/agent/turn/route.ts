@@ -22,6 +22,12 @@ function reconcileAgentResult(modelResult: AgentResult | null, fallbackResult: A
   if (fallbackResult.type === "clarification" && fallbackResult.requires_confirmation) {
     return { result: fallbackResult, source: "rule_fallback" };
   }
+  // A complete phone number must go through the read-first matcher even when
+  // the model interprets the same sentence as a direct walk-in request. The
+  // matcher decides whether this is an existing online booking or a new order.
+  if (fallbackResult.type === "tool_call" && fallbackResult.tool_name === "pms.search_order" && fallbackResult.arguments.phone_number) {
+    return { result: fallbackResult, source: "rule_fallback" };
+  }
   if (modelResult.type === "tool_call" && fallbackResult.type === "tool_call") {
     const conflicts = criticalFields.filter((field) => {
       const modelValue = modelResult.arguments[field];

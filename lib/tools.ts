@@ -37,7 +37,7 @@ export type Clarification = { type: "clarification"; message: string; intent: st
 export type AssistantMessage = { type: "assistant_message"; message: string };
 
 export const toolArgumentSchemas: Record<ToolName, z.ZodTypeAny> = {
-  "pms.search_order": z.object({ phone_last4: z.string().regex(/^\d{4}$/) }).strict(),
+  "pms.search_order": z.object({ phone_last4: z.string().regex(/^\d{4}$/).optional(), phone_number: z.string().regex(/^1[3-9]\d{9}$/).optional() }).strict().refine((value) => Boolean(value.phone_last4) !== Boolean(value.phone_number), { message: "phone_last4_or_phone_number_required" }),
   "pms.create_walk_in_draft": z.object({ phone_number: z.string().regex(/^1[3-9]\d{9}$/) }).strict(),
   "pms.quote_walk_in": z.object({ draft_id: z.string().min(8), room_type_code: z.enum(["STD-KING", "DLX-KING", "DLX-TWIN"]), nights: z.number().int().min(1).max(30), room_count: z.number().int().min(1).max(4) }).strict(),
   "pms.create_walk_in": z.object({ phone_last4: z.string().regex(/^\d{4}$/) }).strict(),
@@ -56,7 +56,7 @@ export const modelToolDefinitions = toolNames.map((toolName) => ({
   function: {
     name: toolName.replaceAll(".", "_"),
     description: `受控工具 ${toolName}。不得猜测身份、金额、房号或公安字段。`,
-    parameters: { type: "object", additionalProperties: false, properties: toolName === "pms.start_checkout" ? {} : toolName === "pms.search_order" || toolName === "pms.create_walk_in" ? { phone_last4: { type: "string", pattern: "^[0-9]{4}$" } } : toolName === "pms.create_walk_in_draft" ? { phone_number: { type: "string", pattern: "^1[3-9][0-9]{9}$" } } : toolName === "pms.quote_walk_in" ? { draft_id: { type: "string", minLength: 8 }, room_type_code: { type: "string", enum: ["STD-KING", "DLX-KING", "DLX-TWIN"] }, nights: { type: "integer", minimum: 1, maximum: 30 }, room_count: { type: "integer", minimum: 1, maximum: 4 } } : toolName === "payment.create" ? { draft_id: { type: "string", minLength: 8 }, method: { type: "string", enum: ["wechat", "alipay"] } } : toolName === "hotel.knowledge_search" ? { query: { type: "string", minLength: 2, maxLength: 120 } } : toolName === "hotel.policy_answer" ? { topic: { type: "string", enum: ["breakfast", "parking", "payment", "checkout"] }, query: { type: "string", minLength: 2, maxLength: 120 } } : { case_id: { type: ["string", "null"] }, expected_state: { type: "string" }, room_number: { type: "string", pattern: "^[0-9]{3,5}$" } } },
+    parameters: { type: "object", additionalProperties: false, properties: toolName === "pms.start_checkout" ? {} : toolName === "pms.search_order" ? { phone_last4: { type: "string", pattern: "^[0-9]{4}$" }, phone_number: { type: "string", pattern: "^1[3-9][0-9]{9}$" } } : toolName === "pms.create_walk_in" ? { phone_last4: { type: "string", pattern: "^[0-9]{4}$" } } : toolName === "pms.create_walk_in_draft" ? { phone_number: { type: "string", pattern: "^1[3-9][0-9]{9}$" } } : toolName === "pms.quote_walk_in" ? { draft_id: { type: "string", minLength: 8 }, room_type_code: { type: "string", enum: ["STD-KING", "DLX-KING", "DLX-TWIN"] }, nights: { type: "integer", minimum: 1, maximum: 30 }, room_count: { type: "integer", minimum: 1, maximum: 4 } } : toolName === "payment.create" ? { draft_id: { type: "string", minLength: 8 }, method: { type: "string", enum: ["wechat", "alipay"] } } : toolName === "hotel.knowledge_search" ? { query: { type: "string", minLength: 2, maxLength: 120 } } : toolName === "hotel.policy_answer" ? { topic: { type: "string", enum: ["breakfast", "parking", "payment", "checkout"] }, query: { type: "string", minLength: 2, maxLength: 120 } } : { case_id: { type: ["string", "null"] }, expected_state: { type: "string" }, room_number: { type: "string", pattern: "^[0-9]{3,5}$" } } },
   },
 }));
 
@@ -124,6 +124,12 @@ export function routeIntent(text: string, context?: { case_id?: string; pending_
   if (/(读身份证|读取身份证|身份证放|证件放)/.test(normalized)) {
     if (!context?.case_id) return { type: "clarification", message: "请先告诉我预订手机号后四位，我确认订单后再读取身份证。", intent: "identity_read", confidence: 0.94 };
     return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "device.reader.read_identity", arguments: { case_id: context.case_id, expected_state: "IDENTITY_READING" }, implementation: "simulator", response_hint: "已切换到读卡器仿真接口，读到的是演示身份 Token。" };
+  }
+  // A complete phone number is the fastest identity hint for both paths. Read
+  // first; the server decides whether it is an existing online booking or a
+  // new walk-in, so the guest does not have to declare the path in advance.
+  if (phoneNumber) {
+    return { type: "tool_call", tool_call_id: crypto.randomUUID(), tool_name: "pms.search_order", arguments: { phone_number: phoneNumber }, implementation: "business_api", response_hint: "先用完整手机号匹配线上待入住订单；没有匹配时直接准备现场办理草稿。" };
   }
   const walkIn = /(没有?预订|无预订|现场(?:预订|办理|入住)|直接(?:入住|住)|到店(?:办理|入住)|walk[- ]?in)/i.test(normalized);
   if (walkIn || context?.pending_walk_in) {

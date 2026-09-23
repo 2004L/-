@@ -143,6 +143,7 @@ type MatchResponse = {
   order?: DemoOrder;
   orders?: DemoOrder[];
   checkinCase?: CheckinCase;
+  phone_number?: string;
 };
 
 type WalkInRoomType = { code: string; name: string; nightly_rate: number; deposit: number; available: number };
@@ -1647,9 +1648,14 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin, o
         speak(checkoutMessage, voiceEnabled);
         return;
       } else if (agent.tool_name === "pms.search_order") {
-        const phoneLast4 = String(agent.arguments.phone_last4 ?? "");
-        setLast4(phoneLast4);
-        result = await postDemo<IntentResponse>("interpret", { session_id: sessionId, utterance: normalized });
+        const phoneNumber = String(agent.arguments.phone_number ?? "");
+        if (/^1[3-9]\d{9}$/.test(phoneNumber)) {
+          result = await postDemo<IntentResponse & MatchResponse>("match-phone", { session_id: sessionId, phone_number: phoneNumber });
+        } else {
+          const phoneLast4 = String(agent.arguments.phone_last4 ?? "");
+          setLast4(phoneLast4);
+          result = await postDemo<IntentResponse>("interpret", { session_id: sessionId, utterance: normalized });
+        }
         if (generation !== conversationGenerationRef.current) return;
       } else if (agent.tool_name === "pms.create_walk_in") {
         const phoneLast4 = String(agent.arguments.phone_last4 ?? "").replace(/\D/g, "").slice(-4);
@@ -1740,9 +1746,23 @@ function VoiceTerminal({ sessionId, adapter, snapshot, onRefresh, onOpenAdmin, o
         setMessage("找到多笔订单，AI 已暂停自动选择");
         speak("找到多笔订单，我不能替您猜选，请联系工作人员复核。", voiceEnabled);
       } else if (result.outcome === "not_found") {
-        setPhase("not_found");
-        setMessage(result.assistantMessage);
-        speak(result.assistantMessage, voiceEnabled);
+        const fullPhone = result.phone_number;
+        if (fullPhone) {
+          const draftResult = await postDemo<{ draft: WalkInDraft; room_types: WalkInRoomType[] }>("walk-in-draft", { session_id: sessionId, phone_number: fullPhone, idempotency_key: `walk-in-draft:${sessionId}:${fullPhone.slice(-4)}` });
+          setPendingWalkInPhone(null);
+          setWalkInDraft(draftResult.draft);
+          setWalkInRoomTypes(draftResult.room_types ?? []);
+          setWalkInPayment(null);
+          setPhase("idle");
+          const draftMessage = "未找到线上订单，已按这个完整手机号准备现场办理。请选择房型、入住晚数和房间数，我会先给您报价。";
+          recordConversation("tool", "完整手机号未命中线上订单，已转现场办理草稿");
+          setMessage(draftMessage);
+          speak(draftMessage, voiceEnabled);
+        } else {
+          setPhase("not_found");
+          setMessage(result.assistantMessage);
+          speak(result.assistantMessage, voiceEnabled);
+        }
       } else if (result.outcome === "already_checked_in" || result.outcome === "checked_out" || result.outcome === "cancelled") {
         setPhase("blocked");
         setAlternatives(result.orders ?? []);

@@ -640,6 +640,21 @@ export async function POST(request: Request, context: RouteContext) {
     if (action === "match") {
       return json(await matchOrder(sessionId, requireLast4(body.phone_last4)));
     }
+    if (action === "match-phone") {
+      const phone = requireFullPhone(body.phone_number);
+      const result = await matchOrder(sessionId, phone.slice(-4));
+      return json({
+        ...result,
+        phone_number: phone,
+        assistantMessage: result.outcome === "matched"
+          ? "已用完整手机号匹配到线上待入住订单。请放置身份证继续办理。"
+          : result.outcome === "not_found"
+            ? "完整手机号未匹配到线上待入住订单，已准备现场办理草稿，接下来请选择房型。"
+            : result.outcome === "ambiguous"
+              ? "完整手机号对应多笔线上订单，需要先选择正确订单。"
+              : undefined,
+      });
+    }
     if (action === "interpret") {
       const utterance = requireUtterance(body.utterance);
       const classified = classifyIntent(utterance);
